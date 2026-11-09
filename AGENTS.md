@@ -2168,6 +2168,11 @@ checks ownership and preview-only state, and saves a discarded tombstone without
 deletion. Ordinary workspace pagination excludes these tombstones; exact status/receipts remain
 readable and the old plan cannot create a Session. Lost replies only trigger explicit status reads.
 Unknown cleanup retains its reservation; closing tabs never deletes outputs.
+The copy tab shows one full-width record, defaulting to the server's latest updated workspace;
+there is no history sidebar or load-more list. A specific workspace entry stays bound to that ID.
+Editing, confirmation, creation and unknown outcomes retain the current record until resolved.
+Removing a preview reveals the latest remaining record; history stays in the store, never deleted
+by this presentation rule. Reopening refreshes the summary without loading all historic details.
 
 `project_merges.py` prepares frozen commits in a separate integration worktree and creates a real
 integration Session. Conflict repair starts only explicitly. Actual clean Git/ancestry verification

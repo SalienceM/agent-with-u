@@ -137,17 +137,17 @@ for (const [width, lost] of [[1280, false], [390, true]] as const) test(`discard
     await expect(page.getByRole('button', { name: '确认创建副本（不运行模型）' })).toBeDisabled();
     await page.getByRole('button', { name: '核对副本状态' }).click();
   }
-  const records = page.getByRole('navigation', { name: '分支副本记录' });
-  await expect(records).not.toContainText('待确认创建');
-  await expect(records).toContainText('已创建的副本');
+  const current = page.getByRole('region', { name: '当前分支副本' });
+  await expect(page.getByRole('navigation', { name: '分支副本记录' })).toHaveCount(0);
+  await expect(current).not.toContainText('待确认创建');
+  await expect(current).toContainText('已创建的副本');
   // 旧在途列表即使晚到，也不能让已移除的预览重新出现。
   await page.evaluate(async () => {
     const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts'); const f = (window as any).taskFixture;
     api.collaborationList = async () => ({ items: [f.stale, f.kept], nextOffset: null });
   });
   await page.getByRole('button', { name: '核对副本状态' }).click();
-  await expect(records).not.toContainText('待确认创建');
-  await records.getByRole('button', { name: '已创建的副本 · 工作区就绪' }).click();
+  await expect(current).not.toContainText('待确认创建');
   await expect(page.getByRole('button', { name: '打开副本 Session' })).toBeVisible();
   await expect(page.getByRole('button', { name: '移除预览', exact: true })).toHaveCount(0);
   const calls = await page.evaluate(() => (window as any).taskFixture.discarded);
@@ -156,6 +156,56 @@ for (const [width, lost] of [[1280, false], [390, true]] as const) test(`discard
   expect(await page.evaluate(() => (window as any).taskFixture.started)).toEqual([]);
   await page.getByRole('button', { name: '返回对话' }).click();
   await expect(page.locator('.chat-textarea')).toHaveValue('保留主会话草稿');
+});
+
+for (const width of [1280, 390]) test(`copy page shows only the latest record without a history column (${width})`, async ({ page }, testInfo) => {
+  await mount(page, width);
+  await page.evaluate(async dark => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const f = (window as any).taskFixture;
+    const base = await api.taskWorkspacePlan('parent', 'local', 'fixture', { title: '最新副本', goal: '', backendId: 'fake', runtime: {}, constraints: '', skills: [], skipPermissions: false, includePaths: [] });
+    f.plans = []; f.statusReads = []; f.listReads = [];
+    f.records = [{ ...base, id: 'latest', status: 'ready', updatedAt: 3 }, { ...base, id: 'old-preview', title: '旧创建预览', updatedAt: 2 }, { ...base, id: 'old-copy', title: '旧副本', status: 'ready', updatedAt: 1 }];
+    api.collaborationList = async (_s, _e, _kind, offset) => { f.listReads.push(offset || 0); return { items: f.records, nextOffset: 50 }; };
+    api.taskWorkspaceStatus = async (_s, _e, id) => { f.statusReads.push(id); return f.records.find((row: any) => row.id === id); };
+    const theme = { '--theme-bg-secondary': dark ? '#222' : '#fff', '--theme-text': dark ? '#eee' : '#222', '--theme-bg': dark ? '#191b20' : '#f4f6fa', '--theme-text-muted': dark ? '#b6becb' : '#687487', '--theme-border': dark ? '#424854' : '#dce1e8', '--theme-panel-solid': dark ? '#191b20' : '#fff' };
+    Object.entries(theme).forEach(([key, value]) => document.documentElement.style.setProperty(key, value));
+  }, width === 1280);
+  await page.getByRole('button', { name: '分支副本与合并', exact: true }).click();
+  const current = page.getByRole('region', { name: '当前分支副本' });
+  await expect(current.getByRole('heading', { name: '最新副本 · 工作区就绪' })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: '分支副本记录' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '更多任务' })).toHaveCount(0);
+  await expect(current).not.toContainText('旧创建预览');
+  await expect(current).not.toContainText('旧副本');
+  expect(await page.evaluate(() => (window as any).taskFixture.statusReads)).toEqual(['latest']);
+  const panelBounds = await page.getByRole('dialog', { name: '分支副本', exact: true }).boundingBox();
+  const detailBounds = await current.boundingBox();
+  expect(detailBounds!.width).toBeGreaterThan(panelBounds!.width - 5);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.screenshot({ path: testInfo.outputPath('latest-copy.png'), fullPage: true, animations: 'disabled' });
+  // 事件更新最新记录，但结果未知时继续核对原记录，不被另一条记录挤走。
+  await page.evaluate(() => {
+    const f = (window as any).taskFixture;
+    f.records.unshift({ ...f.records[0], id: 'newer', title: '新到副本', status: 'unknown', updatedAt: 4 });
+    f.callbacks.forEach((cb: any) => cb(f.records[0], 'local'));
+  });
+  await expect(current.getByRole('heading', { name: '新到副本 · 结果未知' })).toBeVisible();
+  await page.evaluate(() => {
+    const f = (window as any).taskFixture;
+    f.records.unshift({ ...f.records[0], id: 'newest', title: '下一条副本', status: 'ready', updatedAt: 5 });
+    f.callbacks.forEach((cb: any) => cb(f.records[0], 'local'));
+  });
+  await page.getByRole('button', { name: '核对副本状态' }).click();
+  await expect(current.getByRole('heading', { name: '新到副本 · 结果未知' })).toBeVisible();
+  await expect(current).not.toContainText('下一条副本');
+  await page.evaluate(() => {
+    const f = (window as any).taskFixture, row = f.records.find((r: any) => r.id === 'newer');
+    row.status = 'ready'; row.revision++;
+    f.callbacks.forEach((cb: any) => cb(row, 'local'));
+  });
+  await expect(current.getByRole('heading', { name: '下一条副本 · 工作区就绪' })).toBeVisible();
+  expect(await page.evaluate(() => { const f = (window as any).taskFixture; return { pages: f.listReads.every((offset: number) => offset === 0), records: f.records.length, created: f.created, started: f.started, discarded: f.discarded }; })).toEqual({ pages: true, records: 5, created: [], started: [], discarded: [] });
 });
 
 test('legacy nested sessions flatten without leaking collapsed descendants or cross-node parents', async ({ page }) => {

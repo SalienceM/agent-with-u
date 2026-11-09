@@ -1,4 +1,4 @@
-import { WorkflowButton, WorkflowEmptyState, workflowHeaderStyle, workflowNavStyle, workflowDialogStyle, workflowFieldStyle } from './WorkflowControls';
+import { WorkflowButton, WorkflowEmptyState, workflowHeaderStyle, workflowDialogStyle, workflowFieldStyle } from './WorkflowControls';
 import React, { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import type { TaskWorkspace, TaskRepository } from '../types/taskWorkspaces';
@@ -17,7 +17,7 @@ const field = workflowFieldStyle;
 
 export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendId, backends, onOpenSession, initialAction, workspaceId, mergeTarget, initialOperation, canCreate = true, onClose }) => {
   const [open, setOpen] = useState(!!initialAction), [revision, setRevision] = useState(0), [rows, setRows] = useState<CollaborationSummary[]>([]);
-  const [selected, setSelected] = useState(workspaceId || ''), [task, setTask] = useState<TaskWorkspace>(), [next, setNext] = useState<number | null>(null);
+  const [selected, setSelected] = useState(workspaceId || ''), [task, setTask] = useState<TaskWorkspace>();
   const [editing, setEditing] = useState(false), [busy, setBusy] = useState(false), [notice, setNotice] = useState('');
   const [repo, setRepo] = useState<TaskRepository>(), [config, setConfig] = useState<TaskWorkspace['config']>({ title: '', goal: '', backendId, runtime: {}, constraints: '', skills: [], skipPermissions: false, includePaths: [] });
   const [uncertain, setUncertain] = useState(false), [readNonce, setReadNonce] = useState(0);
@@ -49,7 +49,16 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
   useCollaborationRead(`${executor}:${session}:tasks`, revision, open && mode === 'tasks',
     () => api.collaborationList(session, executor, 'workspace'),
     result => { const items = result.items.filter(row => row.status !== 'discarded' && !discardedPreviews.current.has(row.id));
-      setRows(old => [...items, ...old.filter(row => !discardedPreviews.current.has(row.id) && !items.some(item => item.id === row.id))]); setNext(result.nextOffset); setSelected(id => id || items[0]?.id || ''); }, error => setNotice(String(error)));
+      setRows(items); }, error => setNotice(String(error)));
+  useEffect(() => {
+    // 服务端按更新时间倒序；正在确认或结果未知时保留本条，不能切走待核对操作。
+    if (!open || mode !== 'tasks' || editing || busy || uncertain
+      || task?.id === selected && ['preview', 'creating', 'unknown'].includes(task.status)) return;
+    const latest = workspaceId && !discardedPreviews.current.has(workspaceId) ? workspaceId : rows[0]?.id || '';
+    if (latest === selected) return;
+    if (selected) setNotice('');
+    setSelected(latest); setTask(undefined);
+  }, [open, mode, editing, busy, uncertain, task, selected, rows, workspaceId]);
   useCollaborationRead(`${executor}:${session}:task:${selected}:${readNonce}`, rows.find(row => row.id === selected)?.revision || 0, open && mode === 'tasks' && !!selected && !editing,
     () => api.taskWorkspaceStatus(session, executor, selected), acceptTask, error => setNotice(String(error)));
   useEffect(() => {
@@ -111,7 +120,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
     onOpenSession(shown.sessionId); setOpen(false); onClose?.();
   }, [open, editing, mode, initialAction, shown, onOpenSession, onClose]);
   return <>
-    {!initialAction && <WorkflowButton tone="quiet" icon="branch" aria-label="分支副本与合并" onClick={() => setOpen(true)} style={{ whiteSpace: 'nowrap' }}>分支副本</WorkflowButton>}
+    {!initialAction && <WorkflowButton tone="quiet" icon="branch" aria-label="分支副本与合并" onClick={() => { setRevision(n => n + 1); setOpen(true); }} style={{ whiteSpace: 'nowrap' }}>分支副本</WorkflowButton>}
     {open && <AppModalPortal><div style={{ position: 'fixed', inset: 0, zIndex: 31100, display: 'grid', placeItems: 'center', padding: 10, background: '#0007' }}>
       <div ref={panel} role="dialog" aria-modal="true" aria-label="分支副本" style={{ ...workflowDialogStyle, width: 'min(1060px, 100%)', height: 'min(86vh, 800px)', display: 'flex', flexDirection: 'column', background: 'var(--theme-panel-solid, var(--theme-bg-secondary, white))', color: 'var(--theme-text, black)', borderRadius: 16, overflow: 'hidden' }}
         onKeyDown={event => {
@@ -135,11 +144,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
           initialOperation={mergeContext.operation} fixedTarget={mergeContext.target}
           onOpenOrigin={(origin, operation) => setMergeContext({ session: origin, operation, target: origin === session ? mergeTarget : undefined })}
           onOpenSession={id => { onOpenSession?.(id); close(); }} /> : <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
-          <nav aria-label="分支副本记录" style={{ ...workflowNavStyle, display: rows.length ? 'flex' : 'none', width: 'clamp(85px, 24%, 230px)', overflow: 'auto', borderRight: '1px solid var(--theme-border)', flexShrink: 0 }}>
-            {rows.map(row => <WorkflowButton tone="quiet" key={row.id} aria-pressed={selected === row.id && !editing} disabled={busy} style={{ width: '100%', padding: 9, overflowWrap: 'anywhere' }} onClick={() => { setSelected(row.id); setEditing(false); setUncertain(false); }}>{row.title} · {statusLabel[row.status || ''] || row.status}</WorkflowButton>)}
-            {next !== null && <WorkflowButton onClick={() => void act(async () => { const identity = current.current; const result = await api.collaborationList(session, executor, 'workspace', next); if (identity === current.current) { setRows(old => [...old, ...result.items.filter(row => row.status !== 'discarded' && !discardedPreviews.current.has(row.id) && !old.some(item => item.id === row.id))]); setNext(result.nextOffset); } })}>更多任务</WorkflowButton>}
-          </nav>
-          <section style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: 20 }}>
+          <section aria-label="当前分支副本" style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: 20 }}>
             {editing && repo ? <div style={{ display: 'grid', gap: 10 }}>
               <p style={{ margin: 0, color: 'var(--theme-text-muted)' }}>从 {repo.branch || repo.head.slice(0, 12)} 创建独立分支与目录，继承当前配置。</p>
               <details><summary>复制范围</summary><p>默认带入当前修改、新文件和项目 Skills。依赖、缓存、构建产物等其他 Git 忽略文件不复制；队列、定时任务及单次授权不复制。聊天线程独立，副本不能再次派生。</p></details>

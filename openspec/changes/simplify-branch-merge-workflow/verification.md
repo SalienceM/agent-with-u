@@ -61,3 +61,14 @@
 - 前端 `npm run build`（含 TypeScript 检查）、`openspec validate simplify-branch-merge-workflow --strict` 和 `git -c core.safecrlf=false diff --check` 通过。构建仍有已有 CJS 弃用、动静态导入和大分块提示。
 
 浏览器封锁生产 WebSocket 和测试 Vite 以外网络，API 使用 fixture。本轮没有执行真实用户分支合并、Kit、发布或安装；已安装桌面版本仍需后续打包升级。
+
+## 2026-11-09 副本页单条展示
+
+移除副本页的历史侧栏和“更多任务”，默认展示服务端按更新时间倒序的首条记录，详情占满宽度。指定副本、编辑/确认/创建中及结果未知仍保持原记录；移除预览后自动显示最新剩余记录，不删除后台历史。
+
+- `node node_modules/@playwright/test/cli.js test --config .qa/latest-copy-check/playwright.config.cjs project-tasks.spec.ts project-merges.spec.ts`：41 项通过，40.1 秒，退出码 0。默认 55191 端口正被另一工作区的测试使用，因此在 `frontend/.qa/latest-copy-check/` 创建两份测试临时副本，只将固定测试 origin 改为本轮独立启动的 `127.0.0.1:55194`，没有使用或停止另一工作区的服务。临时副本与当前测试源仅 origin 不同，完成后移除。
+- 新增 1280px 深色和 390px 浅色回归，验证只读取最新记录详情、没有列表和翻页、详情占满宽度、事件更新、未知记录保持、结果核对后切换以及无创建/启动/删除副作用；原“移除预览”正常/丢回执用例改为核对自动显示剩余记录。
+- 人工复核 `.qa/latest-copy-review/desktop.png` 和 `mobile.png`：列表已移除，详情与操作完整可见，无横向溢出。
+- `node node_modules/typescript/bin/tsc --noEmit`、`npm run build` 通过，最终 Vite 构建 6.61 秒；保留已有 CJS、动静态导入和分块体积提示。`openspec validate simplify-branch-merge-workflow --strict`、`git -c core.safecrlf=false diff --check` 通过。
+
+本轮仅修改前端和相关说明，未更改后台历史、执行 Kit 或打包安装桌面程序。
