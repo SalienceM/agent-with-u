@@ -2,30 +2,38 @@
 
 ## Purpose
 
-让用户在紧凑的 Session 列表内直接识别当前分支关系，保持与普通会话一致的行高和名称层级；简短状态可进入详细说明，同时保留完整状态语义和未知边界。
+让用户需要时从主 Session 右键检查同项目各分支的真实关系，同时保持普通 Session 列表简洁；只读检查保留完整状态、核对时间和未知边界，不在后台持续读取。
 
 ## ADDED Requirements
 
-### Requirement: Consistent single row density
+### Requirement: Quiet session list
 
-系统 SHALL 将分支状态与名称、Backend 标签排列在同一行，使用现有 Session 密度和主题。状态不得新增第二行或独立箭头，不得使行高超过同密度下普通 Session 的行高；名称过长时省略而非换行。
+系统 SHALL 不在 Session 列表常驻展示当前分支状态或其按钮，也不因列表挂载、时间经过、聚焦、Session 更新或重连触发状态查询。列表 SHALL 保持普通行密度和选择行为。
 
-#### Scenario: Mixed list at desktop and narrow widths
-- **WHEN** 普通 Session、主 Session 和副本在桌面或窄屏列表同时展示
-- **THEN** 三者采用一致行高，状态与 Backend 标签垂直对齐，长名称不造成换行或水平溢出
+#### Scenario: Browse without checking
+- **WHEN** 用户查看、选择或返回 Session 列表而未显式检查
+- **THEN** 不显示最新、待同步、核对中等当前分支状态，不调用状态查询
 
-### Requirement: Compact status with complete meaning
+### Requirement: Main session manual check
 
-系统 SHALL 显示简短状态标签，包括最新、已同步、待合并、待同步、双向更新、未提交和待核对；详细计数、复合状态、比较对象和核对时间 SHALL 通过悬停和无障碍描述保留。紧凑显示不得将离线、未提交或未知状态变成最新。状态按钮 SHALL 提供 hover/focus 反馈并支持键盘激活，普通行点击仍选择 Session。
+主 Session 的右键菜单 SHALL 提供“检查分支状态”，仅点击后在只读窗口一次检查并展示主项和所有普通副本的完整状态及核对时间。副本、整合、评审项不重复显示该菜单项；窗口 SHALL 支持手动重新检查和关闭，不自动预览或执行合并。
 
-#### Scenario: Quiet synchronized status
-- **WHEN** 主 Session 最新或副本已同步
-- **THEN** 显示同其他元信息标签协调的“最新”或“已同步”，不重复整句说明占用额外空间
+#### Scenario: Inspect the whole project
+- **WHEN** 用户从主 Session 右键启动检查
+- **THEN** 在原确定节点分页读取整个项目，显示待合并、待同步、已同步、未提交或未知状态，旧合并成功不覆盖当前结果
 
-#### Scenario: Incomplete or compound status
-- **WHEN** 有未提交内容、双方更新、部分未知或节点离线
-- **THEN** 短标签保持待处理或待核对含义，完整说明可访问，且不显示最新
+#### Scenario: Explicit refresh and close
+- **WHEN** 用户重新检查或关闭窗口
+- **THEN** 前者执行新只读核对，后者停止接收结果；时间经过、窗口返回和重连不自动读取
 
-#### Scenario: Navigate independently from selection
-- **WHEN** 用户点击普通行或用键盘激活状态标签
-- **THEN** 前者仅选择 Session，后者打开原分支详情而不触发选择、预览或合并写入
+### Requirement: Manual check boundaries
+
+检查 SHALL 保留分页主干/成员一致性、完整性、过期与当前身份核对；未知、离线或成员活动中不得显示全项目最新。相关变更和断线仅使当前结果失效，迟到回复不得写入其他 Session/节点/用户。窗口 SHALL 支持键盘焦点约束和 Escape 关闭。
+
+#### Scenario: Changed or unavailable snapshot
+- **WHEN** 分页中成员变化、节点不支持、断线、忙碌或有未知成员
+- **THEN** 显示相应待核对说明而不推断最新，需用户显式重新检查，不回退节点
+
+#### Scenario: Late result after closing
+- **WHEN** 查询结束前窗口已关闭或身份/目标改变
+- **THEN** 不展示旧结果、不重新打开窗口、不启动额外查询

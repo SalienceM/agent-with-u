@@ -2251,19 +2251,18 @@ reads clear read errors without discarding write intents or other operation feed
 The merge-request header names both source and target branches. Overview and changed-file views
 share the same operation; switching views performs no new read or write. File actions open the exact
 source/target workspace, not a claim of a frozen diff. Prepare and Apply retain separate confirmations.
-The Sidebar separately projects current branch relationships through `branchStatus=1` and
-`projectBranchStatus`: paged ordinary task members, current Git ahead/behind and dirty/busy state,
-without commit-log reads. `useSessionBranchStatus` never derives latest from historical merge
-receipts. It checks complete membership and a consistent main tip across pages before summarizing
-the parent. Unknown/offline/busy members cannot produce a global latest badge. Status reads are
-independent of list hydration, capped at two projects, coalesced on relevant events, refreshed on
-return/reconnect and every 60 seconds while visible. Hidden views stop reads; old identity/node
-responses are ignored. Managed writes and confirmed chat-task exit emit `branch_changed` after
-the write/registry boundary. Status is a single-line compact button beside the Backend badge,
-using the ordinary Session row density. Short labels retain full status in the tooltip and accessible
-name/description. Ordinary row selection stays separate; activating the status button
-opens the existing merge UI without creating a plan or executing a write. External changes are
-sampled, not filesystem-watched, and the tooltip records the comparison and checked time.
+Current branch relationships use `branchStatus=1` and `projectBranchStatus`: paged ordinary task
+members, current Git ahead/behind and dirty/busy state, without commit-log reads. The Sidebar has
+no resident status or background status reads. Only a main Session's context-menu action
+“检查分支状态” mounts `SessionBranchStatusDialog`; opening and explicit recheck read once.
+`useSessionBranchStatus` checks complete membership and a consistent main tip across pages,
+never derives latest from historical receipts, and rejects unknown/offline/busy global success.
+In-flight reads remain capped at two across remounts; old owner/node/closed-window results are
+ignored. Relevant events and disconnect invalidate results but do not schedule reads; focus,
+reconnect and elapsed time never refresh automatically. The window shows the checked time,
+full names/branches/statuses and keyboard close/focus handling. Managed writes and confirmed
+chat exit still emit `branch_changed` after the actual boundary. Checking never creates a merge
+plan or executes a write; external Git changes are found by the next explicit check.
 Successful receipts are historical: their old target HEAD/file count/test evidence cannot assert
 that the current branch is synchronized. `workflow.comparison` reads current immutable tips with
 bounded Git counts and rechecks repository/HEAD/branch before returning; unknown remains unknown.

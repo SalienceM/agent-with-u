@@ -54,165 +54,148 @@ async function mount(page: Page, width = 1280, projects = 1) {
   }, { projects });
 }
 
-for (const width of [1280, 390]) test(`session badges reflect current siblings rather than merge history (${width})`, async ({ page }, testInfo) => {
-  await mount(page, width);
-  await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：1 个分支待合并', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：待合并', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: '功能 C 的当前分支状态：待同步', exact: true })).toBeVisible();
-  await page.screenshot({ path: testInfo.outputPath('session-branch-badges.png'), fullPage: true });
-  await page.evaluate(() => {
-    const f = (window as any).branchFixture;
-    f.tips.root0[1].ahead = 0; f.tips.root0[1].behind = 0;
-    f.tips.root0[2].ahead = 2;
-    f.mergeEvents.forEach((cb: any) => cb({ sourceSessionId: 'b0', targetSessionId: 'root0' }, 'relay:fixture'));
-  });
-  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：已同步', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: '功能 C 的当前分支状态：待合并 · 待同步', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: '功能 C 的当前分支状态：待合并 · 待同步', exact: true })).toHaveText('双向更新');
-  await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：1 个分支待合并', exact: true })).toBeVisible();
-  await page.evaluate(() => {
-    const f = (window as any).branchFixture; f.tips.root0[1].dirty = true;
-    f.sessionEvents.forEach((cb: any) => cb({ type: 'branch_changed', sessionId: 'b0', execKey: 'relay:fixture' }));
-  });
-  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：有未提交改动', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：有未提交改动', exact: true })).toHaveText('未提交');
-  await page.getByRole('button', { name: '功能 C 的当前分支状态：待合并 · 待同步', exact: true }).click();
-  await expect(page.getByRole('dialog')).toBeVisible();
-  expect(await page.evaluate(() => (window as any).branchFixture.actions)).toEqual([]);
-  expect(await page.evaluate(() => (window as any).branchFixture.reads.every((read: any[]) => read[1] === 'relay:fixture'))).toBe(true);
-});
-
-for (const width of [1280, 390]) for (const theme of ['dark', 'light']) {
-  test(`compact branch badges preserve ordinary row density (${width}, ${theme})`, async ({ page }, testInfo) => {
-    await mount(page, width);
-    await expect(page.getByRole('button', { name: /项目 A 的当前分支状态/ })).toBeVisible();
-    await page.evaluate(({ theme }) => {
-      const f = (window as any).branchFixture;
-      const names = ['AgentWithU-维护', 'AgentWithU-维护 · Charlie', 'AgentWithU-维护 · Bravo — 很长的任务名称'];
-      f.sessions.slice(0, 3).forEach((s: any, i: number) => { s.title = names[i]; });
-      f.sessions[0].pinned = true; f.sessions[0].codexThreadAttached = true;
-      f.tips.root0.forEach((tip: any, i: number) => { tip.ahead = 0; tip.behind = 0; tip.title = names[i]; });
-      f.sessions = [...f.sessions, { id: 'ordinary', title: '普通会话 · 设计讨论', execKey: 'relay:fixture', backendId: 'fake', updatedAt: 1, messageCount: 0 }];
-      if (theme === 'light') {
-        Object.entries({ '--theme-bg': '#ffffff', '--theme-bg-secondary': '#f6f8fa', '--theme-bg-tertiary': '#eaeef2', '--theme-sidebar-bg': '#f6f8fa', '--theme-sidebar-solid': '#f6f8fa', '--theme-text': '#1f2328', '--theme-text-muted': '#656d76', '--theme-border': '#d0d7de', '--theme-accent': '#0969da', '--theme-accent-bg': '#0969da1a' })
-          .forEach(([key, value]) => document.documentElement.style.setProperty(key, value));
-        document.body.style.background = '#fff';
-      }
-      window.dispatchEvent(new Event('focus'));
-    }, { theme });
-    const latest = page.getByRole('button', { name: 'AgentWithU-维护 的当前分支状态：最新 · 分支均已合入', exact: true });
-    const child = page.getByRole('button', { name: 'AgentWithU-维护 · Charlie 的当前分支状态：已同步', exact: true });
-    await expect(latest).toHaveText('最新'); await expect(child).toHaveText('已同步');
-    await expect(page.getByText('普通会话 · 设计讨论', { exact: true })).toBeVisible();
-    await expect(child).toHaveAccessibleDescription(/相对 AgentWithU-维护.*核对于/);
-    const geometry = await page.evaluate(() => {
-      const rowFor = (text: string) => [...document.querySelectorAll<HTMLElement>('[aria-haspopup="menu"]')].find(row => row.title.startsWith(text))!;
-      const baseline = rowFor('普通会话 · 设计讨论').getBoundingClientRect();
-      return [...document.querySelectorAll<HTMLButtonElement>('.awu-session-branch-status')].map(button => {
-        const badge = button.getBoundingClientRect(), row = button.closest<HTMLElement>('[aria-haspopup="menu"]')!, rect = row.getBoundingClientRect();
-        const backend = [...button.parentElement!.children].find(el => el.getAttribute('title') === 'official-codex')!.getBoundingClientRect();
-        return { height: rect.height, baseline: baseline.height, aligned: Math.abs(badge.y + badge.height / 2 - backend.y - backend.height / 2),
-          badgeHeight: badge.height, backendHeight: backend.height, overflow: row.scrollWidth > row.clientWidth };
-      });
-    });
-    expect(geometry).toHaveLength(3);
-    for (const row of geometry) {
-      expect(row.height).toBe(row.baseline); expect(row.height).toBe(width > 768 ? 28 : 36);
-      expect(row.aligned).toBeLessThanOrEqual(1); expect(row.badgeHeight).toBe(row.backendHeight); expect(row.overflow).toBe(false);
-    }
-    await page.screenshot({ path: testInfo.outputPath('compact-session-status.png'), fullPage: true });
-    await page.getByText('AgentWithU-维护 · Charlie', { exact: true }).click();
-    expect(await page.evaluate(() => (window as any).branchFixture.selections)).toEqual(['b0']);
-    await expect(page.getByRole('dialog')).toHaveCount(0);
-    await child.focus();
-    await expect(child).toBeFocused();
-    expect(await child.evaluate(el => getComputedStyle(el).outlineStyle)).toBe('solid');
-    await page.keyboard.press('Enter');
-    await expect(page.getByRole('dialog')).toBeVisible();
-    expect(await page.evaluate(() => (window as any).branchFixture.selections)).toEqual(['b0']);
-    expect(await page.evaluate(() => (window as any).branchFixture.actions)).toEqual([]);
-  });
+async function openCheck(page: Page, title = '项目 A') {
+  await page.getByText(title, { exact: true }).click({ button: 'right' });
+  await page.getByRole('menuitem', { name: '检查分支状态', exact: true }).click();
+  return page.getByRole('dialog', { name: '分支状态', exact: true });
 }
 
-test('offline, unsupported and partial pages never retain a latest badge', async ({ page }) => {
-  await mount(page);
-  await expect(page.getByRole('button', { name: /项目 A 的当前分支状态：1 个分支待合并/ })).toBeVisible();
+for (const width of [1280, 390]) test(`list stays quiet until a main Session check (${width})`, async ({ page }, testInfo) => {
+  await page.clock.install();
+  await mount(page, width);
+  await expect(page.getByText('功能 B', { exact: true })).toBeVisible();
+  await page.getByText('功能 B', { exact: true }).click();
+  expect(await page.evaluate(() => (window as any).branchFixture.selections)).toEqual(['b0']);
+  await page.clock.fastForward(180000);
   await page.evaluate(() => {
-    const f = (window as any).branchFixture;
-    f.tips.root0.forEach((tip: any) => { tip.ahead = 0; tip.behind = 0; });
-    f.sessionEvents.forEach((cb: any) => cb({ type: 'branch_changed', sessionId: 'root0', execKey: 'relay:fixture' }));
+    const f = (window as any).branchFixture; window.dispatchEvent(new Event('focus'));
+    f.sessionEvents.forEach((cb: any) => cb({ type: 'branch_changed', sessionId: 'b0', execKey: 'relay:fixture' }));
+    f.mergeEvents.forEach((cb: any) => cb({ sourceSessionId: 'b0', targetSessionId: 'root0' }, 'relay:fixture'));
+    f.connections.forEach((cb: any) => { cb(false); cb(true); });
   });
-  await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：最新 · 分支均已合入', exact: true })).toBeVisible();
-  await page.evaluate(() => { const f = (window as any).branchFixture; f.online = false; f.connections.forEach((cb: any) => cb(false)); });
-  await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：离线 · 待核对', exact: true })).toBeVisible();
-  await page.evaluate(() => { const f = (window as any).branchFixture; f.online = true; f.paging = true; f.changedPage = true; f.connections.forEach((cb: any) => cb(true)); });
-  await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：状态待核对', exact: true })).toBeVisible();
-  await page.evaluate(() => { const f = (window as any).branchFixture; f.supported = false; window.dispatchEvent(new Event('focus')); });
-  await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：状态不可用', exact: true })).toBeVisible();
+  await page.clock.runFor(300);
+  expect(await page.evaluate(() => (window as any).branchFixture.reads)).toEqual([]);
+  await expect(page.getByRole('button', { name: /当前分支状态/ })).toHaveCount(0);
+  await expect(page.getByText(/核对中|已同步|待合并|待同步/)).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath('session-list-on-demand.png'), fullPage: true });
+  await page.getByText('功能 B', { exact: true }).click({ button: 'right' });
+  await expect(page.getByRole('menuitem', { name: '检查分支状态', exact: true })).toHaveCount(0);
+  await page.keyboard.press('Escape');
+  await page.getByText('项目 A', { exact: true }).click({ button: 'right' });
+  await expect(page.getByRole('menuitem', { name: '检查分支状态', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).branchFixture.reads)).toEqual([]);
 });
 
-test('events coalesce, hidden view stops reads and late results cannot restore stale labels', async ({ page }) => {
-  await mount(page);
-  await expect(page.getByRole('button', { name: /功能 B 的当前分支状态：待合并/ })).toBeVisible();
-  const before = await page.evaluate(() => (window as any).branchFixture.reads.length);
+for (const width of [1280, 390]) test(`manual check shows current project and supports keyboard close (${width})`, async ({ page }, testInfo) => {
+  await mount(page, width, 2);
+  if (width === 390) await page.evaluate(() => {
+    Object.entries({ '--theme-panel-solid': '#fff', '--theme-bg': '#fff', '--theme-bg-secondary': '#f6f8fa', '--theme-text': '#1f2328', '--theme-text-muted': '#656d76', '--theme-border': '#d0d7de' })
+      .forEach(([key, value]) => document.documentElement.style.setProperty(key, value));
+  });
+  const dialog = await openCheck(page);
+  await expect(dialog.getByText('1 个分支待合并', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('待合并', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('待同步', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('feature-b', { exact: true })).toBeVisible();
+  await expect(dialog).not.toContainText('旧整合空间');
+  expect(await page.evaluate(() => (window as any).branchFixture.reads)).toEqual([['root0', 'relay:fixture', 0]]);
+  await page.screenshot({ path: testInfo.outputPath('manual-branch-check.png'), fullPage: true });
   await page.evaluate(() => {
     const f = (window as any).branchFixture;
-    for (let i = 0; i < 20; i++) f.sessionEvents.forEach((cb: any) => cb({ type: 'branch_changed', sessionId: 'b0', execKey: 'relay:fixture' }));
+    f.tips.root0[1].ahead = 0; f.tips.root0[2].ahead = 2;
   });
-  await expect.poll(() => page.evaluate(() => (window as any).branchFixture.reads.length)).toBe(before + 1);
+  await dialog.getByRole('button', { name: '重新检查', exact: true }).click();
+  await expect(dialog.getByText('已同步', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('待合并 · 待同步', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('1 个分支待合并', { exact: true })).toBeVisible();
+  await page.evaluate(() => { (window as any).branchFixture.tips.root0[1].dirty = true; });
+  await dialog.getByRole('button', { name: '重新检查', exact: true }).click();
+  await expect(dialog.getByText('有未提交改动', { exact: true })).toBeVisible();
+  const close = dialog.getByRole('button', { name: '关闭分支状态' });
+  await close.focus(); await page.keyboard.press('Tab');
+  await expect(dialog.getByRole('button', { name: '重新检查', exact: true })).toBeFocused();
+  await page.keyboard.press('Shift+Tab'); await expect(close).toBeFocused();
+  await page.keyboard.press('Escape'); await expect(dialog).toHaveCount(0);
+  await expect(page.locator('[aria-haspopup="menu"]').filter({ hasText: '项目 A' })).toBeFocused();
+  expect(await page.evaluate(() => (window as any).branchFixture.actions)).toEqual([]);
+  expect(await page.evaluate(() => (window as any).branchFixture.selections)).toEqual([]);
+});
+
+test('events, elapsed time and reconnect never schedule another read', async ({ page }) => {
+  await page.clock.install(); await mount(page);
+  const dialog = await openCheck(page);
+  await expect(dialog.getByText('1 个分支待合并', { exact: true })).toBeVisible();
+  await page.clock.fastForward(180000); await page.clock.runFor(100);
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  expect(await page.evaluate(() => (window as any).branchFixture.reads.length)).toBe(1);
   await page.evaluate(() => {
-    const f = (window as any).branchFixture; f.hold = true;
+    const f = (window as any).branchFixture;
     f.sessionEvents.forEach((cb: any) => cb({ type: 'branch_changed', sessionId: 'b0', execKey: 'relay:fixture' }));
   });
-  await expect.poll(() => page.evaluate(() => (window as any).branchFixture.releases.length)).toBe(1);
-  await page.evaluate(() => { const f = (window as any).branchFixture; f.collapsed = true; f.render(); });
-  const hiddenReads = await page.evaluate(() => (window as any).branchFixture.reads.length);
-  await page.evaluate(() => { const f = (window as any).branchFixture; f.releases.splice(0).forEach((resolve: any) => resolve()); window.dispatchEvent(new Event('focus')); });
-  expect(await page.evaluate(() => (window as any).branchFixture.reads.length)).toBe(hiddenReads);
-  await page.evaluate(() => { const f = (window as any).branchFixture; f.hold = false; f.tips.root0[1].ahead = 0; f.collapsed = false; f.render(); });
-  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：已同步', exact: true })).toBeVisible();
+  await expect(dialog).toContainText('项目已变化');
+  await expect(dialog.getByText('1 个分支待合并', { exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).branchFixture.reads.length)).toBe(1);
+  await dialog.getByRole('button', { name: '重新检查', exact: true }).click();
+  await expect(dialog.getByText('待合并', { exact: true })).toBeVisible();
+  await page.evaluate(() => { const f = (window as any).branchFixture; f.online = false; f.connections.forEach((cb: any) => cb(false)); });
+  await expect(dialog).toContainText('原节点离线');
+  await page.evaluate(() => { const f = (window as any).branchFixture; f.online = true; f.connections.forEach((cb: any) => cb(true)); });
+  await page.clock.runFor(300);
+  expect(await page.evaluate(() => (window as any).branchFixture.reads.length)).toBe(2);
+  await dialog.getByRole('button', { name: '重新检查', exact: true }).click();
+  await expect(dialog.getByText('待同步', { exact: true })).toBeVisible();
+  await dialog.getByRole('button', { name: '关闭分支状态' }).click();
+  await page.clock.fastForward(180000); await page.clock.runFor(300);
+  expect(await page.evaluate(() => (window as any).branchFixture.reads.length)).toBe(3);
 });
 
-test('project reads are capped at two and unknown sibling prevents global latest', async ({ page }) => {
-  await mount(page, 1280, 3);
-  await expect(page.getByRole('button', { name: /其他项目 2 的当前分支状态：1 个分支待合并/ })).toBeVisible();
-  expect(await page.evaluate(() => (window as any).branchFixture.max)).toBeLessThanOrEqual(2);
+test('unsupported, changed pages and unknown or busy members cannot claim latest', async ({ page }) => {
+  await mount(page);
+  await page.evaluate(() => { (window as any).branchFixture.supported = false; });
+  const dialog = await openCheck(page);
+  await expect(dialog).toContainText('原节点尚不支持');
+  expect(await page.evaluate(() => (window as any).branchFixture.reads)).toEqual([]);
+  await page.evaluate(() => { const f = (window as any).branchFixture; f.supported = true; f.paging = true; f.changedPage = true; });
+  await dialog.getByRole('button', { name: '重新检查', exact: true }).click();
+  await expect(dialog).toContainText('分页期间主干或成员已变化');
+  await expect(dialog.getByText('最新 · 分支均已合入', { exact: true })).toHaveCount(0);
   await page.evaluate(() => {
-    const f = (window as any).branchFixture;
+    const f = (window as any).branchFixture; f.changedPage = false;
     f.tips.root0[1].ahead = 0; f.tips.root0[2].state = 'unknown';
-    f.sessionEvents.forEach((cb: any) => cb({ type: 'branch_changed', sessionId: 'root0', execKey: 'relay:fixture' }));
   });
-  await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：部分分支待核对', exact: true })).toBeVisible();
+  await dialog.getByRole('button', { name: '重新检查', exact: true }).click();
+  await expect(dialog.getByText('部分分支待核对', { exact: true })).toBeVisible();
+  await expect(dialog.getByRole('listitem')).toHaveCount(3);
+  await page.evaluate(() => {
+    const f = (window as any).branchFixture; f.tips.root0[2].state = 'known'; f.tips.root0[2].busy = true;
+  });
+  await dialog.getByRole('button', { name: '重新检查', exact: true }).click();
+  await expect(dialog.getByText('运行/编辑中 · 待核对', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('最新 · 分支均已合入', { exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).branchFixture.actions)).toEqual([]);
 });
 
-test('external changes refresh at a low frequency only while visible', async ({ page }) => {
-  await page.clock.install();
+test('late results after closing cannot replace a check for another executor', async ({ page }) => {
   await mount(page);
-  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：待合并', exact: true })).toBeVisible();
-  await page.evaluate(() => { (window as any).branchFixture.tips.root0[1].ahead = 0; });
-  await page.clock.fastForward(60000); await page.clock.runFor(250);
-  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：已同步', exact: true })).toBeVisible();
-  await page.evaluate(() => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' }); document.dispatchEvent(new Event('visibilitychange')); });
-  const before = await page.evaluate(() => (window as any).branchFixture.reads.length);
-  await page.clock.fastForward(120000); await page.clock.runFor(250);
-  expect(await page.evaluate(() => (window as any).branchFixture.reads.length)).toBe(before);
-  await page.evaluate(() => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' }); document.dispatchEvent(new Event('visibilitychange')); });
-  await page.clock.runFor(250);
-  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：已同步', exact: true })).toBeVisible();
-});
-
-test('late response from an earlier executor cannot overwrite the current project', async ({ page }) => {
-  await mount(page);
-  await expect(page.getByRole('button', { name: '功能 B 的当前分支状态：待合并', exact: true })).toBeVisible();
-  await page.evaluate(() => { const f = (window as any).branchFixture; f.hold = true; window.dispatchEvent(new Event('focus')); });
+  await page.evaluate(() => { (window as any).branchFixture.hold = true; });
+  const dialog = await openCheck(page);
   await expect.poll(() => page.evaluate(() => (window as any).branchFixture.releases.length)).toBe(1);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
   await page.evaluate(() => {
-    const f = (window as any).branchFixture; f.hold = false; f.sessions.forEach((s: any) => { s.execKey = 'relay:other'; }); f.tips.root0[1].ahead = 0;
+    const f = (window as any).branchFixture; f.hold = false;
+    f.sessions = f.sessions.map((s: any) => ({ ...s, execKey: 'relay:other', ...(s.id === 'root0' ? { title: '其他节点项目' } : {}) }));
+    f.tips.root0.forEach((tip: any) => { tip.ahead = 0; tip.behind = 0; });
+    f.tips.root0[0].title = '其他节点项目';
     window.dispatchEvent(new Event('focus'));
   });
-  await expect.poll(() => page.evaluate(() => (window as any).branchFixture.reads.some((r: any[]) => r[1] === 'relay:other'))).toBe(true);
-  await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：最新 · 分支均已合入', exact: true })).toBeVisible();
-  await page.evaluate(() => { (window as any).branchFixture.releases.splice(0).forEach((resolve: any) => resolve()); });
-  await expect(page.getByRole('button', { name: '项目 A 的当前分支状态：最新 · 分支均已合入', exact: true })).toBeVisible();
+  await expect(page.getByText('其他节点项目', { exact: true })).toBeVisible();
+  await openCheck(page, '其他节点项目');
+  await expect(dialog.getByText('最新 · 分支均已合入', { exact: true })).toBeVisible();
+  await page.evaluate(() => (window as any).branchFixture.releases.splice(0).forEach((resolve: any) => resolve()));
+  await expect(dialog.getByText('最新 · 分支均已合入', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).branchFixture.reads.at(-1)[1])).toBe('relay:other');
+  expect(await page.evaluate(() => (window as any).branchFixture.max)).toBeLessThanOrEqual(2);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
 });
