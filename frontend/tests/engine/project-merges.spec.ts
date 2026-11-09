@@ -1,6 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 
-async function mount(page: Page, width = 1200, dark = false, fixedTarget = false) {
+async function mount(page: Page, width = 1200, dark = false, fixedTarget = false, managed = false) {
   await page.setViewportSize({ width, height: 900 });
   await page.routeWebSocket(/.*/, socket => socket.close());
   await page.route('**/*', route => {
@@ -10,7 +10,7 @@ async function mount(page: Page, width = 1200, dark = false, fixedTarget = false
     return route.continue();
   });
   await page.goto('/');
-  await page.evaluate(async ({ dark, fixedTarget }) => {
+  await page.evaluate(async ({ dark, fixedTarget, managed }) => {
     const { React, createRoot, ProjectTasksPanel, ChatInput, api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
     document.documentElement.style.setProperty('--theme-bg-secondary', dark ? '#222' : '#fff');
     document.documentElement.style.setProperty('--theme-text', dark ? '#eee' : '#222');
@@ -23,7 +23,7 @@ async function mount(page: Page, width = 1200, dark = false, fixedTarget = false
     const repo = { root: 'C:/test/main', commonDir: 'C:/test/main/.git', repositoryId: 'repo', head: 'a'.repeat(40), branch: 'main', fingerprint: 'repo', dirty: [] };
     api.collaborationList = async (_s, _e, kind) => ({ items: kind === 'merge' && f.row ? [f.row] : [], nextOffset: null });
     api.projectMergeDiscover = async () => ({ items: [{ id: 'one', title: '需求', workingDir: 'C:/test/one' }, { id: 'two', title: '需求', workingDir: 'C:/test/two' }], truncated: false });
-    api.projectMergeCapabilities = async () => ({ mergeWorkflow: f.supported ? 1 : 0, branchSync: f.supported ? 1 : 0, branchGraph: 1 });
+    api.projectMergeCapabilities = async () => ({ mergeWorkflow: f.supported ? 1 : 0, mergeRepair: managed ? 1 : 0, branchSync: f.supported ? 1 : 0, branchGraph: 1 });
     api.onExecutorConnectionStatus = (_e, callback) => { f.connection = callback; callback(f.online); return () => {}; };
     api.collaborationRequestStatus = async session => { f.receiptScopes.push(session); return { status: f.receipt }; };
     api.projectMergeOperations = async () => ({ items: [...(f.row ? [{ ...f.row, originSessionId: f.row.sourceSessionId, sourceSessionId: f.row.source.sessionId, targetSessionId: f.row.target.sessionId, sourceHead: f.row.source.head, targetHead: f.row.target.head }] : []), ...f.extra], nextOffset: null });
@@ -47,11 +47,40 @@ async function mount(page: Page, width = 1200, dark = false, fixedTarget = false
     api.onTaskWorkspaceUpdated = () => () => {};
     api.listSessionSkillCommands = async () => ({ status: 'ok', commands: [] } as any);
     api.followupSuggestionSettings = async () => ({ version: 1, enabled: false });
+    if (managed) {
+      const preview = api.projectMergePreview;
+      api.projectMergePreview = async (...args) => {
+        const value = await preview(...args);
+        value.source = { ...value.source, title: '功能 B', branch: 'feature-b' };
+        value.target = { ...value.target, title: '主线 A', branch: 'main' };
+        return value;
+      };
+      const m = Object.assign(f, { repairReads: 0, grants: [] as any[], answers: [] as any[], permission: null as any, questions: [] as any[],
+        streamEvents: new Set<any>(), permissionEvents: new Set<any>(), connections: new Set<any>() });
+      api.onExecutorConnectionStatus = (_e, callback) => { m.connections.add(callback); callback(f.online); m.connection = connected => m.connections.forEach(cb => cb(connected)); return () => { m.connections.delete(callback); }; };
+      api.onSessionConnectionStatus = (_s, callback) => { callback(true); return () => {}; };
+      api.onStreamDelta = callback => { m.streamEvents.add(callback); return () => { m.streamEvents.delete(callback); }; };
+      api.onPermissionRequest = callback => { m.permissionEvents.add(callback); return () => { m.permissionEvents.delete(callback); }; };
+      const action = api.projectMergeAction;
+      api.projectMergeAction = async (...args) => {
+        const result = await action(...args);
+        if (args[2] === 'Prepare') result.repair = { status: 'idle', canStart: true };
+        if (args[2] === 'Start') result.repair = { status: 'running', canStart: false };
+        result.revision++;
+        f.callbacks.forEach(cb => cb(result, 'local'));
+        return result;
+      };
+      api.projectMergeRepairRead = async () => { m.repairReads++; return { operationId: f.row.id, sessionId: 'integration', revision: f.row.revision,
+        repair: f.row.repair || { status: 'idle', canStart: true }, messages: [{ id: 'output', role: 'assistant', content: '保留双方成果；正在核对冲突。' }], truncated: false, permission: m.permission }; };
+      api.projectMergeRepairPermission = async (...args) => { m.grants.push(args); m.permission = null; };
+      api.userInteractionList = async () => ({ items: m.questions } as any);
+      api.userInteractionRespond = async (session, executor, id, value) => { m.answers.push({ session, executor, id, value }); return { ...m.questions[0], revision: 2, status: 'answered', answers: value.kind === 'answers' ? value.answers : {} }; };
+    }
     createRoot(document.getElementById('root')!).render(React.createElement(React.Fragment, null,
       React.createElement(ProjectTasksPanel, { session: 'main', sessionTitle: fixedTarget ? 'AgentWithU-维护 · Bravo' : 'AgentWithU-维护', sessionRole: fixedTarget ? '分支' : '主干', executor: 'local', backendId: 'fake', backends: [], mergeTarget: fixedTarget ? 'two' : undefined, onOpenSession: (id: string) => f.opened.push(id) }),
       React.createElement(ChatInput, { sessionId: 'main', historyKey: 'main', isStreaming: false, activeBackendId: 'fake', backends: [], onSend: () => {}, onAbort: () => {} })));
     (window as any).mergeFixture = f;
-  }, { dark, fixedTarget });
+  }, { dark, fixedTarget, managed });
 }
 
 for (const [width, dark] of [[1280, false], [390, true]] as const) test(`merge conflict and lost receipt retain draft (${width}, dark=${dark})`, async ({ page }, testInfo) => {
@@ -511,6 +540,7 @@ for (const [width, dark] of [[1280, false], [390, true]] as const) test(`branch 
       f.graphReads++; f.graphScope = [session, executor];
       return { version: 1, snapshot: 'one', checkedAt: 1000, root: 'C:/test/main', repositoryId: 'repo', limit: 80, hasMore: false, omittedBranches: 0,
         branches: [{ sessionId: 'two', title: '主项目', main: true, state: 'known', head: sha('d'), branch: 'main', ahead: 0, behind: 0 },
+          { sessionId: 'charlie', title: 'AgentWithU-维护 · Charlie', main: false, state: 'known', head: sha('b'), branch: 'feature/checkout', ahead: 0, behind: 2 },
           { sessionId: 'main', title: 'AgentWithU-维护 · Bravo', main: false, state: 'known', head: sha('b'), branch: 'feature/payment', ahead: 0, behind: 2 }],
         commits: [['d', ['c', 'b'], '合并支付功能'], ['b', ['a'], '新增支付流程'], ['c', ['a'], '主干修复登录'], ['a', [], '项目基线']].map(([h, parents, message]) => ({ hash: sha(h as string), parents: (parents as string[]).map(sha), author: 'Developer', date: '2026-11-08T12:00:00+08:00', message: message as string })) };
     };
@@ -519,16 +549,20 @@ for (const [width, dark] of [[1280, false], [390, true]] as const) test(`branch 
   });
   await page.getByRole('button', { name: '分支副本与合并' }).click();
   expect(await page.evaluate(() => (window as any).mergeFixture.graphReads)).toBe(0);
-  await page.getByRole('button', { name: '分支图', exact: true }).click();
+  await page.getByRole('button', { name: '分支', exact: true }).click();
   await expect(page.getByLabel('分支状态')).toContainText('领先 0 · 落后 2');
+  await expect(page.locator('path[data-edge]')).toHaveCount(0);
+  await expect(page.getByRole('table', { name: '提交记录' })).toContainText('AgentWithU-维护 · Bravo');
+  await expect(page.getByRole('table', { name: '提交记录' })).toContainText('AgentWithU-维护 · Charlie');
+  await page.screenshot({ path: testInfo.outputPath('branch-overview.png'), fullPage: true, animations: 'disabled' });
+  await page.getByRole('button', { name: '查看提交拓扑', exact: true }).click();
   await expect(page.locator('path[data-edge]')).toHaveCount(4);
   const merged = 'd'.repeat(40), side = 'b'.repeat(40);
   await expect(page.locator(`[data-node="${side}"] text`).filter({ hasText: 'Bravo' })).toBeVisible();
   await expect(page.locator(`path[data-edge="${side}:${merged}"]`)).toHaveCount(1);
-  await expect(page.getByRole('button', { name: '刷新分支图' })).toBeInViewport();
-  await expect(page.getByRole('button', { name: '提交 aaaaaaaa 项目基线', exact: true })).toBeInViewport();
+  await expect(page.getByRole('button', { name: '刷新分支' })).toBeInViewport();
+  await expect(page.getByRole('button', { name: '提交 aaaaaaaa 项目基线', exact: true })).toBeVisible();
   expect(await page.getByRole('table', { name: '提交记录' }).evaluate(el => getComputedStyle(el).color)).toBe(dark ? 'rgb(238, 238, 238)' : 'rgb(34, 34, 34)');
-  await page.screenshot({ path: testInfo.outputPath('branch-overview.png'), fullPage: true });
   await page.getByRole('button', { name: 'bbbbbbbb', exact: true }).click();
   await expect(page.locator(`[data-node="${side}"]`)).toHaveAttribute('aria-pressed', 'true');
   await page.getByRole('button', { name: 'payment.ts · +1 −0' }).click();
@@ -537,7 +571,7 @@ for (const [width, dark] of [[1280, false], [390, true]] as const) test(`branch 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   expect(await page.evaluate(() => { const f = (window as any).mergeFixture; return [f.graphReads, f.actions, f.previews]; })).toEqual([1, [], 0]);
   await page.screenshot({ path: testInfo.outputPath('branch-graph.png'), fullPage: true });
-  await page.getByLabel('分支状态').getByRole('button', { name: '合并与同步', exact: true }).click();
+  await page.getByRole('button', { name: '查看合并请求', exact: true }).click();
   await expect(page.getByRole('button', { name: '同步主干到此分支', exact: true })).toBeVisible();
   expect(await page.evaluate(() => { const f = (window as any).mergeFixture; return [f.actions, f.previews, f.graphScope]; })).toEqual([[], 0, ['main', 'local']]);
 });
@@ -550,10 +584,159 @@ test('branch graph reports unsupported and read failures without a fallback node
     api.projectBranchGraph = async () => { throw Error('offline graph'); };
   });
   await page.getByRole('button', { name: '分支副本与合并' }).click();
-  await page.getByRole('button', { name: '分支图', exact: true }).click();
+  await page.getByRole('button', { name: '分支', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('此节点尚不支持分支图');
   await page.evaluate(async () => { const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts'); api.projectMergeCapabilities = async () => ({ branchGraph: 1 }); });
-  await page.getByRole('button', { name: '刷新分支图' }).click();
+  await page.getByRole('button', { name: '刷新分支' }).click();
   await expect(page.getByRole('alert')).toContainText('offline graph');
   await expect(page.getByRole('table', { name: '提交记录' })).toHaveCount(0);
+});
+
+
+test('in-flight inspection absorbs covered revisions and file tab does not reload or write', async ({ page }) => {
+  await mount(page, 1280, true, true);
+  await page.evaluate(async () => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const f = (window as any).mergeFixture;
+    await api.projectMergePreview('main', 'local', 'main', 'two', 'coalesced');
+    f.previews = 0; f.inspectReads = 0; f.statusReads = 0;
+    const inspect = api.projectMergeInspect;
+    api.projectMergeStatus = async () => { f.statusReads++; return f.row; };
+    api.projectMergeInspect = async (...args) => {
+      f.inspectReads++;
+      await new Promise<void>(resolve => { f.finishInspection = resolve; });
+      return inspect(...args);
+    };
+  });
+  await page.getByRole('button', { name: '分支副本与合并' }).click();
+  await page.getByRole('button', { name: '合并与同步', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).mergeFixture.inspectReads)).toBe(1);
+  await expect(page.getByRole('region', { name: '连续合并流程' }).getByRole('heading')).toContainText('需求');
+  await page.evaluate(() => {
+    const f = (window as any).mergeFixture;
+    f.row.revision = 2;
+    for (let i = 0; i < 10; i++) f.callbacks.forEach((cb: any) => cb(f.row, 'local'));
+  });
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await page.evaluate(() => (window as any).mergeFixture.finishInspection());
+  await expect(page.getByRole('button', { name: '确认准备独立整合空间' })).toBeEnabled();
+  await page.getByRole('button', { name: '变更文件（1）', exact: true }).click();
+  await expect(page.getByRole('region', { name: '合并变更文件' })).toContainText('same.txt');
+  await expect(page.getByRole('button', { name: '确认准备独立整合空间' })).toBeHidden();
+  await page.getByRole('button', { name: '概览', exact: true }).click();
+  await expect(page.getByRole('button', { name: '确认准备独立整合空间' })).toBeEnabled();
+  expect(await page.evaluate(() => {
+    const f = (window as any).mergeFixture;
+    return { inspect: f.inspectReads, status: f.statusReads, actions: f.actions, previews: f.previews };
+  })).toEqual({ inspect: 1, status: 0, actions: [], previews: 0 });
+});
+
+async function openManaged(page: Page, width = 1280) {
+  await mount(page, width, true, false, true);
+  await page.getByRole('button', { name: '分支副本与合并' }).click();
+  await page.getByRole('button', { name: '合并记录', exact: true }).click();
+  await page.getByRole('button', { name: '发现项目会话' }).click();
+  await page.getByLabel('来源会话', { exact: true }).selectOption('one');
+  await page.getByLabel('目标会话', { exact: true }).selectOption('two');
+  await page.getByRole('button', { name: '预览汇合计划' }).click();
+  await page.getByRole('button', { name: '确认准备合并', exact: true }).click();
+  await expect(page.getByRole('button', { name: '开始修复与验证', exact: true })).toBeEnabled();
+}
+
+for (const width of [1280, 390]) test(`managed repair stays in the request with progress and approval (${width})`, async ({ page }, testInfo) => {
+  await openManaged(page, width);
+  await expect(page.getByRole('button', { name: '打开处理空间', exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).mergeFixture.actions)).toEqual(['Prepare']);
+  await page.getByRole('button', { name: '开始修复与验证', exact: true }).click();
+  await expect(page.getByRole('region', { name: '合并修复', exact: true })).toContainText('正在修复并生成候选提交');
+  await page.evaluate(() => {
+    const f = (window as any).mergeFixture;
+    f.streamEvents.forEach((cb: any) => cb({ executor: 'other', sessionId: 'integration', type: 'text_delta', text: '不应显示的其他节点内容' }));
+    f.streamEvents.forEach((cb: any) => cb({ executor: 'local', sessionId: 'integration', type: 'text_delta', text: '正在合并双方修改并提交候选' }));
+    f.permission = { sessionId: 'integration', messageId: 'm', requestId: 'permission-1', allowSkip: true, tools: [{ name: 'Bash', status: 'pending', input: JSON.stringify({ command: 'git commit -m resolve' }) }] };
+    f.permissionEvents.forEach((cb: any) => cb({ executor: 'local', sessionId: 'integration' }));
+  });
+  await expect(page.getByLabel('当前修复进度')).toContainText('正在合并双方修改并提交候选');
+  await expect(page.getByRole('dialog')).not.toContainText('不应显示的其他节点内容');
+  const repair = page.getByRole('region', { name: '合并修复', exact: true });
+  await expect(repair).toContainText('git commit -m resolve');
+  await expect(repair.getByRole('button', { name: /跳过后续/ })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath('managed-repair.png'), fullPage: true });
+  await repair.getByRole('button', { name: /允许一次/ }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('managed-approval.png'), fullPage: true });
+  await repair.getByRole('button', { name: /允许.*次|允许执行|允许$/, exact: false }).click();
+  expect(await page.evaluate(() => (window as any).mergeFixture.grants)).toEqual([['main', 'local', expect.any(String), 'permission-1', true]]);
+  await page.evaluate(() => {
+    const f = (window as any).mergeFixture;
+    f.row = { ...f.row, revision: f.row.revision + 1, status: 'candidate', candidate: 'b'.repeat(40), repair: { status: 'ready', canStart: true }, verification: { status: 'git_verified', head: 'b'.repeat(40), notice: '已核对' } };
+    f.callbacks.forEach((cb: any) => cb(f.row, 'local'));
+  });
+  await expect(page.getByRole('button', { name: '确认快进应用到目标' })).toBeEnabled();
+  expect(await page.evaluate(() => { const f = (window as any).mergeFixture; return { actions: f.actions, opened: f.opened, previews: f.previews }; })).toEqual({ actions: ['Prepare', 'Start'], opened: [], previews: 1 });
+  const overflow = await page.getByRole('dialog').evaluate(element => element.scrollWidth > element.clientWidth + 1);
+  expect(overflow).toBe(false);
+});
+
+test('managed repair answers native questions and retries only explicitly without a new request', async ({ page }) => {
+  await openManaged(page);
+  await page.evaluate(() => {
+    const f = (window as any).mergeFixture;
+    f.questions = [{ id: 'question-1', sessionId: 'integration', messageId: 'm', revision: 1, kind: 'question', status: 'pending', title: '确认冲突处理', detail: '', canSkip: false, deadline: 0,
+      questions: [{ id: 'strategy', header: '保留方式', question: '如何组合双方内容？', options: [{ id: 'both', label: '保留双方', description: '' }], required: true, allowOther: false, multiple: false, secret: false }] }];
+    f.row = { ...f.row, revision: f.row.revision + 1, repair: { status: 'failed', canStart: true, notice: '上次验证未完成' }, startRequestId: 'old' };
+    f.callbacks.forEach((cb: any) => cb(f.row, 'local'));
+  });
+  await page.getByRole('button', { name: '刷新修复记录' }).click();
+  await expect(page.getByRole('button', { name: '继续修复与验证' })).toBeEnabled();
+  // 重新挂载问答区以模拟重新打开请求，读取原生未回答问题。
+  await page.getByRole('button', { name: '变更文件（1）', exact: true }).click();
+  await page.getByRole('button', { name: '概览', exact: true }).click();
+  await expect(page.getByRole('region', { name: '原生交互', exact: true })).toContainText('如何组合双方内容');
+  await page.getByLabel('保留双方', { exact: true }).check();
+  await page.getByRole('button', { name: '提交答案', exact: true }).click();
+  expect(await page.evaluate(() => (window as any).mergeFixture.answers)).toEqual([{ session: 'integration', executor: 'local', id: 'question-1', value: { kind: 'answers', answers: { strategy: ['both'] } } }]);
+  expect(await page.evaluate(() => (window as any).mergeFixture.actions)).toEqual(['Prepare']);
+  await page.getByRole('button', { name: '继续修复与验证' }).click();
+  expect(await page.evaluate(() => (window as any).mergeFixture.actions)).toEqual(['Prepare', 'Start']);
+  await page.evaluate(() => { const f = (window as any).mergeFixture; f.connection(false); f.connection(true); });
+  await expect(page.getByRole('region', { name: '合并修复', exact: true })).toContainText('正在修复并生成候选提交');
+  expect(await page.evaluate(() => (window as any).mergeFixture.actions)).toEqual(['Prepare', 'Start']);
+});
+
+test('managed repair streams do not trigger Git inspection and hidden details do not reload', async ({ page }) => {
+  await openManaged(page);
+  await page.getByRole('button', { name: '开始修复与验证' }).click();
+  await expect(page.getByRole('region', { name: '合并修复', exact: true })).toContainText('正在修复并生成候选提交');
+  const before = await page.evaluate(() => (window as any).mergeFixture.reads);
+  await page.evaluate(() => { const f = (window as any).mergeFixture; for (let i = 0; i < 100; i++) f.streamEvents.forEach((cb: any) => cb({ executor: 'local', sessionId: 'integration', type: 'text_delta', text: 'x'.repeat(500) })); });
+  await expect(page.getByLabel('当前修复进度')).toHaveText('x'.repeat(12000));
+  expect(await page.evaluate(() => (window as any).mergeFixture.reads)).toBe(before);
+  await page.getByRole('button', { name: '变更文件（1）', exact: true }).click();
+  const reads = await page.evaluate(() => (window as any).mergeFixture.repairReads);
+  await page.evaluate(() => { const f = (window as any).mergeFixture; f.permissionEvents.forEach((cb: any) => cb({ executor: 'local', sessionId: 'integration' })); });
+  expect(await page.evaluate(() => (window as any).mergeFixture.repairReads)).toBe(reads);
+});
+
+test('managed clean candidate reaches merge confirmation without offering a repair task', async ({ page }) => {
+  await mount(page, 1280, false, true, true);
+  await page.evaluate(() => { const f = (window as any).mergeFixture; f.conflict = false; f.canVerify = true; });
+  await page.getByRole('button', { name: '分支副本与合并' }).click();
+  await page.getByRole('button', { name: '合并与同步', exact: true }).click();
+  await page.getByRole('button', { name: '预览合并到主 Session' }).click();
+  await page.getByRole('button', { name: '确认准备合并', exact: true }).click();
+  await expect(page.getByRole('button', { name: '确认快进应用到目标' })).toBeEnabled();
+  await expect(page.getByRole('region', { name: '合并修复', exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).mergeFixture.actions)).toEqual(['Prepare', 'Verify']);
+});
+
+test('managed related entry displays repair history without repair or approval controls', async ({ page }) => {
+  await openManaged(page);
+  await page.evaluate(() => {
+    const f = (window as any).mergeFixture;
+    f.row = { ...f.row, revision: f.row.revision + 1, sourceSessionId: 'one' };
+    f.callbacks.forEach((cb: any) => cb(f.row, 'local'));
+  });
+  await expect(page.getByRole('dialog')).toContainText('关联记录 · 只读');
+  await expect(page.getByRole('button', { name: '开始修复与验证', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: '原生交互', exact: true })).toHaveCount(0);
 });

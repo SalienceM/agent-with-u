@@ -65,6 +65,20 @@ class ProjectWriteGate:
             result.append({'sessionId': '', 'code': 'activity', 'reason': '仍有应用文件/Git 写入未完成'})
         return result[:50]
 
+    def _project_branch_changed(self, working_dir: str) -> None:
+        """写入实际结束后只发送失效提示，不在写入路径计算 Git 状态。"""
+        try:
+            root = canonical_path(working_dir)
+        except (ValueError, OSError):
+            return
+        for row in self._session_store.list():
+            if row.get('ownerId', 'local') != self._current_owner_id() or not row.get('workingDir'): continue
+            try:
+                if canonical_path(row['workingDir']) == root:
+                    self._emit_session_updated({'type': 'branch_changed', 'sessionId': row['id']})
+            except (ValueError, OSError):
+                continue
+
     async def _project_guarded_call(self, working_dir: str, operation: Any) -> Any:
         try:
             self._project_check_write(working_dir=working_dir)
@@ -79,6 +93,7 @@ class ProjectWriteGate:
             if not done.cancelled():
                 state['external'].pop(key, None)
                 done.exception()
+                self._project_branch_changed(working_dir)
         task.add_done_callback(finished)
         return await asyncio.shield(task)
 

@@ -4900,11 +4900,24 @@ export const api = {
   async projectBranchGraph(session: string, executor: string, limit = 80): Promise<import('./types/taskWorkspaces').ProjectBranchGraphData> {
     return collaborationCall(executor, 'projectBranchGraph', [session, limit], 30000);
   },
-  async projectMergeCapabilities(session: string, executor: string): Promise<{ mergeWorkflow?: number; branchGraph?: number; branchSync?: number }> {
-    const result = await collaborationCall<{ mergeWorkflow?: number; branchGraph?: number; branchSync?: number }>(executor, 'sessionCollaborationCapabilities', [session]);
+  async projectMergeCapabilities(session: string, executor: string): Promise<{ mergeWorkflow?: number; mergeRepair?: number; branchGraph?: number; branchStatus?: number; branchSync?: number }> {
+    const result = await collaborationCall<{ mergeWorkflow?: number; mergeRepair?: number; branchGraph?: number; branchStatus?: number; branchSync?: number }>(executor, 'sessionCollaborationCapabilities', [session]);
     if (result.mergeWorkflow === 1) { mergeWorkflowNodes.add(executor); reportProjectBuffers(true); }
     else mergeWorkflowNodes.delete(executor);
     return result;
+  },
+  async projectBranchStatus(session: string, executor: string, offset = 0): Promise<import('./types/taskWorkspaces').SessionBranchStatusPage> {
+    return collaborationCall(executor, 'projectBranchStatus', [session, offset, 24], 30000);
+  },
+  async projectMergeRepairRead(session: string, executor: string, id: string): Promise<import('./types/taskWorkspaces').MergeRepairSnapshot> {
+    const value = await collaborationCall<import('./types/taskWorkspaces').MergeRepairSnapshot>(executor, 'projectMergeRepairRead', [session, id]);
+    if (value.operationId !== id || !value.sessionId) throw new Error('修复关联不匹配');
+    // 服务端已核对关联及所有权，原生交互继续使用该确定节点，不能路由回退。
+    sessionExec.set(value.sessionId, executor); persistSessionExec();
+    return value;
+  },
+  async projectMergeRepairPermission(session: string, executor: string, id: string, request: string, granted: boolean): Promise<void> {
+    await collaborationCall(executor, 'projectMergeRepairPermission', [session, id, request, granted]);
   },
   async projectMergeOperations(session: string, executor: string, source = '', target = '', offset = 0): Promise<{ items: import('./types/taskWorkspaces').MergeSummary[]; nextOffset: number | null }> {
     return collaborationCall(executor, 'projectMergeOperations', [session, source, target, offset, 30]);

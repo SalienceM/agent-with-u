@@ -20,6 +20,7 @@ interface Props {
   request: PermissionRequestData;
   onDismiss: () => void;
   onSkipRest: () => void;
+  onGrant?: (granted: boolean) => Promise<void>;
 }
 
 const TOOL_ICON: Record<string, string> = {
@@ -54,7 +55,7 @@ function tryParseCommand(name: string, input?: string): string | null {
   } catch { return null; }
 }
 
-export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest }) => {
+export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest, onGrant }) => {
   const [expandedTool, setExpandedTool] = useState<number | null>(0); // 默认展开第一个
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -62,7 +63,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
   const isPreExecution = request.tools.some(t => t.status === 'pending');
   const isWorkspace = request.tools.some(t => t.name === 'awu_workspace');
   const isCurrentWorkspace = isWorkspace && request.allowSkip === true;
-  const canSkip = request.allowSkip !== false && (!isWorkspace || isCurrentWorkspace);
+  const canSkip = !onGrant && request.allowSkip !== false && (!isWorkspace || isCurrentWorkspace);
   const title = isCurrentWorkspace ? '📝 确认当前 Session 写入'
     : isWorkspace ? '🌐 确认工作区操作' : isPreExecution ? '🔒 需要确认执行' : '🔄 继续执行？';
   const description = isWorkspace
@@ -74,7 +75,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
   const handleGrant = async (granted: boolean) => {
     setLoading(true);
     setError('');
-    try { await api.grantPermission(request.sessionId, granted, false, request.requestId); }
+    try { if (onGrant) await onGrant(granted); else await api.grantPermission(request.sessionId, granted, false, request.requestId); }
     catch (e) { setError(e instanceof Error ? e.message : '确认未送达，请重试'); setLoading(false); return; }
     onDismiss();
   };
@@ -120,7 +121,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
             <div
               key={tc.id || i}
               style={{
-                background: 'var(--theme-bg-tertiary, #fff)',
+                background: 'var(--theme-bg-tertiary, var(--theme-bg-secondary, #fff))',
                 borderRadius: 8,
                 marginBottom: 6,
                 border: '1px solid var(--theme-border, rgba(0,0,0,0.1))',
@@ -196,7 +197,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
                     <pre style={{
                       margin: 0, fontSize: 12,
                       color: 'var(--theme-text, #1f2328)',
-                      background: 'var(--theme-code-bg, #f6f8fa)',
+                      background: 'var(--theme-code-bg, var(--theme-bg, #f6f8fa))',
                       borderRadius: 4, padding: '8px 10px',
                       whiteSpace: 'pre-wrap', wordBreak: 'break-all',
                       maxHeight: 300, overflow: 'auto', fontFamily: 'monospace',
@@ -207,7 +208,7 @@ export const PermissionGate: React.FC<Props> = ({ request, onDismiss, onSkipRest
                     <pre style={{
                       margin: 0, fontSize: 11,
                       color: 'var(--theme-text, #1f2328)',
-                      background: 'var(--theme-code-bg, #f6f8fa)',
+                      background: 'var(--theme-code-bg, var(--theme-bg, #f6f8fa))',
                       borderRadius: 4, padding: '8px 10px',
                       whiteSpace: 'pre-wrap', wordBreak: 'break-all',
                       maxHeight: 300, overflow: 'auto', fontFamily: 'monospace',

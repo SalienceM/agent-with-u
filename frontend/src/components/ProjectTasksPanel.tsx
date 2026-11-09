@@ -152,8 +152,8 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
           <WorkflowButton tone="quiet" icon="close" aria-label="返回对话" title="关闭" onClick={close} style={{ minHeight: 36, width: 36, padding: 0 }} />
           <p style={{ width: '100%', margin: 0, color: 'var(--theme-text-muted, #687487)' }}>从当前项目开启新对话，目录和分支自动分配。</p>
         </header> : <header style={workflowHeaderStyle}><strong style={{ flex: 1, fontWeight: 600, whiteSpace: 'nowrap' }}>分支与合并</strong>
-          <WorkflowButton tone="quiet" aria-pressed={mode === 'tasks'} onClick={() => setMode('tasks')}>副本</WorkflowButton><WorkflowButton tone="quiet" aria-label={mergeTarget ? '合并与同步' : '合并记录'} title={mergeTarget ? '合并与同步' : '合并记录'} aria-pressed={mode === 'merge'} onClick={() => setMode('merge')}>合并</WorkflowButton>
-          <WorkflowButton tone="quiet" aria-pressed={mode === 'graph'} onClick={() => setMode('graph')}>分支图</WorkflowButton>
+          <WorkflowButton tone="quiet" aria-pressed={mode === 'tasks'} onClick={() => setMode('tasks')}>副本</WorkflowButton><WorkflowButton tone="quiet" aria-label={mergeTarget ? '合并与同步' : '合并记录'} title={mergeTarget ? '合并与同步' : '合并记录'} aria-pressed={mode === 'merge'} onClick={() => setMode('merge')}>合并请求</WorkflowButton>
+          <WorkflowButton tone="quiet" aria-pressed={mode === 'graph'} onClick={() => setMode('graph')}>分支</WorkflowButton>
           {mode === 'tasks' && <>{canCreate && <WorkflowButton tone="primary" icon="plus" disabled={busy} onClick={newTask}>新建分支副本</WorkflowButton>}
           <WorkflowButton onClick={checkStatus}>核对副本状态</WorkflowButton></>}
           <WorkflowButton onClick={close}>返回对话</WorkflowButton>

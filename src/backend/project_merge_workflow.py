@@ -60,6 +60,10 @@ class ProjectMergeWorkflow(ProjectBranchGraph):
     async def _rpc_projectMergeInspect(self, session: str, operation: str) -> str:
         scope, row = self._merge_readable(session, operation)
         value = await self._merge_workflow_view(row)
+        if row.get('integration'):
+            value['repair'] = self._merge_repair_view(scope, value)
+            if value['repair']['status'] in {'running', 'unknown'}:
+                value['workflow']['canAutoVerify'] = False
         current_scope, current = self._merge_readable(session, operation)
         if scope != current_scope or current['revision'] != row['revision']:
             raise CollaborationError('读取期间合并已变化，请重新核对原操作')
@@ -70,16 +74,29 @@ class ProjectMergeWorkflow(ProjectBranchGraph):
         sides: dict[str, dict] = {}
         actuals: dict[str, dict] = {}
         diagnostics: list[dict] = []
+
+        async def inspect_side(saved: dict) -> dict:
+            session = self._collaboration_session(saved['sessionId'])
+            if canonical_path(session.working_dir) != canonical_path(saved['root']):
+                raise CollaborationError('Session 工作目录已变化')
+            actual = await asyncio.to_thread(lambda: TaskGit(saved['root']).inspect())
+            self._require_session_access(saved['sessionId'])
+            if canonical_path(self._collaboration_session(saved['sessionId']).working_dir) != canonical_path(saved['root']):
+                raise CollaborationError('读取期间 Session 工作目录已变化')
+            return actual
+
+        # 最多三个独立工作区并行读取；每个仍执行完整 Git/权限核对，不缓存验收结果。
+        names = [side for side in ('source', 'target', 'integration') if row.get(side)]
+        inspections = dict(zip(names, await asyncio.gather(
+            *(inspect_side(row[side]) for side in names), return_exceptions=True)))
         for side in ('source', 'target', 'integration'):
             saved = row.get(side)
             if not saved: continue
             item = {'sessionId': saved['sessionId'], 'root': saved['root'], 'state': 'unknown',
                     'dirty': [], 'activity': [], 'fresh': None}
             try:
-                session = self._collaboration_session(saved['sessionId'])
-                if canonical_path(session.working_dir) != canonical_path(saved['root']):
-                    raise CollaborationError('Session 工作目录已变化')
-                actual = await asyncio.to_thread(lambda: TaskGit(saved['root']).inspect())
+                actual = inspections[side]
+                if isinstance(actual, BaseException): raise actual
                 self._require_session_access(saved['sessionId'])
                 if canonical_path(self._collaboration_session(saved['sessionId']).working_dir) != canonical_path(saved['root']):
                     raise CollaborationError('读取期间 Session 工作目录已变化')

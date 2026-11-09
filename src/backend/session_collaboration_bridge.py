@@ -124,7 +124,7 @@ class SessionCollaborationBridge(SessionScheduleBridge, KitDelegationFeedback, C
     def _rpc_sessionCollaborationCapabilities(self, session_id: str) -> str:
         scope = self._collaboration_scope(session_id)
         return json.dumps({'version': 1, 'executorId': scope.executor,
-                           'sessionId': session_id, 'records': True, 'mergeWorkflow': 1, 'branchGraph': 1, 'branchSync': 1}, ensure_ascii=False)
+                           'sessionId': session_id, 'records': True, 'mergeWorkflow': 1, 'mergeRepair': 1, 'branchGraph': 1, 'branchStatus': 1, 'branchSync': 1}, ensure_ascii=False)
 
     async def _rpc_sessionCollaborationList(self, session_id: str, kind: str, offset: int = 0,
                                            limit: int = 50, search: str = '') -> str:

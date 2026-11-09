@@ -96,7 +96,7 @@ const InteractionCard: React.FC<{ row: UserInteraction; scope: string; respond: 
   </details>;
 };
 
-export const UserInteractionsPanel: React.FC<{ sessionId: string; runtimeKey?: string; compact?: boolean }> = ({ sessionId, runtimeKey = '', compact = false }) => {
+export const UserInteractionsPanel: React.FC<{ sessionId: string; runtimeKey?: string; compact?: boolean; executor?: string }> = ({ sessionId, runtimeKey = '', compact = false, executor: explicitExecutor }) => {
   const [rows, setRows] = useState<UserInteraction[]>([]);
   const [notice, setNotice] = useState('');
   const [capabilityNotice, setCapabilityNotice] = useState('');
@@ -104,7 +104,7 @@ export const UserInteractionsPanel: React.FC<{ sessionId: string; runtimeKey?: s
   const [reload, setReload] = useState(0);
   const [owner, setOwner] = useState(getCurrentUserProfile().userId);
   const [open, setOpen] = useState(false);
-  const executor = getSessionExecKey(sessionId) || '';
+  const executor = explicitExecutor || getSessionExecKey(sessionId) || '';
   const scope = JSON.stringify([owner, executor, sessionId]);
   const region = useRef<HTMLElement>(null);
   const pendingIds = rows.filter(row => row.status === 'pending').map(row => row.id).join(':');
@@ -152,7 +152,7 @@ export const UserInteractionsPanel: React.FC<{ sessionId: string; runtimeKey?: s
     <WorkflowButton tone="quiet" icon="refresh" onClick={() => setReload(value => value + 1)}>核对问答状态</WorkflowButton>
     {rows.map(row => <InteractionCard key={`${scope}:${row.id}`} scope={scope} row={row} respond={async (id, value) => {
       const updated = await api.userInteractionRespond(sessionId, executor, id, value);
-      if (getCurrentUserProfile().userId === owner && (getSessionExecKey(sessionId) || '') === executor) setRows(old => mergeInteractions(old, [updated]));
+      if (getCurrentUserProfile().userId === owner && (explicitExecutor || getSessionExecKey(sessionId) || '') === executor) setRows(old => mergeInteractions(old, [updated]));
     }} />)}
   </section>;
   return compact ? <WorkflowPopover label="交互状态" title={pendingCount ? '待回答' : '交互'} icon="question" badge={pendingCount || undefined}

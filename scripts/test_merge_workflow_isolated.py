@@ -24,7 +24,9 @@ def main() -> int:
             os.environ['GIT_CONFIG_NOSYSTEM'] = '1'
             tempfile.tempdir = str(root / 't')
             os.chdir(project); sys.path.insert(0, str(project))
-            names = sys.argv[1:] or ['tests.test_task_workspaces.TaskWorkspaceTests', 'tests.test_project_merges.ProjectMergeTests']
+            names = sys.argv[1:] or ['tests.test_task_workspaces.TaskWorkspaceTests', 'tests.test_project_merges.ProjectMergeTests',
+                                    'tests.test_merge_read_concurrency.MergeReadConcurrencyTests', 'tests.test_merge_request_repair.MergeRequestRepairTests',
+                                    'tests.test_session_branch_status.SessionBranchStatusTests']
             suite = unittest.defaultTestLoader.loadTestsFromNames(names)
             return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
         finally:
