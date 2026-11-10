@@ -17,6 +17,7 @@ import { InteractionBadge } from './UserInteractionsPanel';
 import { taskSessionTree, projectTaskSessions } from '../utils/taskSessionTree';
 import { SessionBranchDialog } from './SessionBranchDialog';
 import { SessionBranchStatusDialog } from './SessionBranchStatusDialog';
+import { ProjectTransferDialog } from './ProjectTransferDialog';
 
 interface Session extends SessionViewMetadata {
   id: string;
@@ -106,6 +107,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
   const [branchDialog, setBranchDialog] = useState<{ session: Session; action: 'create' | 'manage' | 'merge' } | null>(null);
   const [branchStatus, setBranchStatus] = useState<{ session: Session; anchor?: HTMLElement } | null>(null);
+  const [projectTransfer, setProjectTransfer] = useState<{ session: Session; mode: 'project' | 'return'; anchor?: HTMLElement } | null>(null);
   const [sessionToDestroy, setSessionToDestroy] = useState<Session | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteResult, setDeleteResult] = useState<SessionDeletionResult | null>(null);
@@ -1187,6 +1189,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         session={branchDialog.session} action={branchDialog.action} onClose={() => setBranchDialog(null)} onOpenSession={onSelectSession} />}
       {branchStatus && <SessionBranchStatusDialog key={`${branchStatus.session.execKey || 'local'}:${branchStatus.session.id}`}
         session={branchStatus.session} focusTarget={branchStatus.anchor} onClose={() => setBranchStatus(null)} />}
+      {projectTransfer && <ProjectTransferDialog key={`${projectTransfer.session.execKey || 'local'}:${projectTransfer.session.id}:${projectTransfer.mode}`}
+        session={projectTransfer.session} mode={projectTransfer.mode} focusTarget={projectTransfer.anchor} onClose={() => setProjectTransfer(null)} onOpenSession={onSelectSession} />}
       {sessionContextMenu && (
         <AppModalPortal>
         <div
@@ -1210,6 +1214,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           {sessionContextMenu.session.relationKind === 'task' && sessionContextMenu.session.parentSessionId && <>
             <button type="button" role="menuitem" aria-label="合并到主 Session" className="awu-session-context-item" onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'merge' }); setSessionContextMenu(null); }}><span aria-hidden="true" className="awu-session-context-icon">⇄</span><span>合并到主 Session</span></button>
             <button type="button" role="menuitem" className="awu-session-context-item" onClick={() => { const parent = sessionContextMenu.session.parentSessionId!; setSessionContextMenu(null); onSelectSession(parent); }}>打开主 Session</button>
+          </>}
+          {sessionContextMenu.session.workingDir && sessionContextMenu.session.codexConnectionMode !== 'ssh' && !['review', 'integration'].includes(sessionContextMenu.session.relationKind || '') && <>
+            {!sessionContextMenu.session.parentSessionId && <button type="button" role="menuitem" className="awu-session-context-item" onClick={() => {
+              setProjectTransfer({ session: sessionContextMenu.session, mode: 'project', anchor: sessionContextMenu.anchor }); setSessionContextMenu(null);
+            }}><span aria-hidden="true" className="awu-session-context-icon">↗</span><span>发送项目到节点</span></button>}
+            <button type="button" role="menuitem" className="awu-session-context-item" onClick={() => {
+              setProjectTransfer({ session: sessionContextMenu.session, mode: 'return', anchor: sessionContextMenu.anchor }); setSessionContextMenu(null);
+            }}><span aria-hidden="true" className="awu-session-context-icon">↩</span><span>回传项目成果</span></button>
           </>}
           {!['review', 'task', 'integration'].includes(sessionContextMenu.session.relationKind || '') && <button type="button" role="menuitem" className="awu-session-context-item"
             onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: sessionContextMenu.session.codexConnectionMode === 'ssh' ? 'merge' : 'manage' }); setSessionContextMenu(null); }}><span aria-hidden="true" className="awu-session-context-icon">⑂</span><span>分支与合并</span></button>}

@@ -4861,6 +4861,40 @@ export const api = {
     interactionCallbacks.add(callback);
     return () => { interactionCallbacks.delete(callback); };
   },
+  projectTransferIdentity(): string { return `${relayIdentityEpoch}:${getCurrentUserProfile().userId}`; },
+  projectTransferExecutors(): ExecutorInfo[] { return getAssignableExecutors(); },
+  async projectTransferCapabilities(executor: string, session = ''): Promise<import('./types/projectTransfers').ProjectTransferCapability> {
+    const result = await collaborationCall<import('./types/projectTransfers').ProjectTransferCapability>(executor, 'projectTransferCapabilities', [session]);
+    if (!result || result.version !== 1) throw new Error('所选节点尚不支持项目交接，请更新该节点');
+    return result;
+  },
+  async projectTransferExport(session: string, executor: string, request: string, target: string, mode: 'project' | 'return'): Promise<import('./types/projectTransfers').ProjectTransferRecord> {
+    return collaborationCall(executor, 'projectTransferExport', [session, request, target, mode], 120000);
+  },
+  async projectTransferPlan(executor: string, request: string, descriptor: import('./types/projectTransfers').ProjectTransferDescriptor, title: string, backend: string): Promise<import('./types/projectTransfers').ProjectTransferRecord> {
+    return collaborationCall(executor, 'projectTransferPlan', [request, JSON.stringify(descriptor), title, backend], 30000);
+  },
+  async projectTransferAccept(executor: string, id: string, request: string, fingerprint: string): Promise<import('./types/projectTransfers').ProjectTransferRecord> {
+    return collaborationCall(executor, 'projectTransferAccept', [id, request, fingerprint]);
+  },
+  async projectTransferRead(executor: string, id: string, offset: number): Promise<{ offset: number; data: string; nextOffset: number }> {
+    return collaborationCall(executor, 'projectTransferRead', [id, offset]);
+  },
+  async projectTransferChunk(executor: string, id: string, request: string, offset: number, data: string): Promise<{ offset: number }> {
+    return collaborationCall(executor, 'projectTransferChunk', [id, request, offset, data]);
+  },
+  async projectTransferFinish(executor: string, id: string, request: string): Promise<import('./types/projectTransfers').ProjectTransferRecord> {
+    return collaborationCall(executor, 'projectTransferFinish', [id, request], 120000);
+  },
+  async projectTransferStatus(executor: string, id: string): Promise<import('./types/projectTransfers').ProjectTransferRecord> {
+    return collaborationCall(executor, 'projectTransferStatus', [id]);
+  },
+  async projectTransferFind(executor: string, exportId: string): Promise<import('./types/projectTransfers').ProjectTransferRecord | null> {
+    return collaborationCall(executor, 'projectTransferFind', [exportId]);
+  },
+  async projectTransferList(executor: string, session: string): Promise<{ items: { id: string; status: string }[] }> {
+    return collaborationCall(executor, 'projectTransferList', [session]);
+  },
   async taskWorkspaceInspect(session: string, executor: string): Promise<import('./types/taskWorkspaces').TaskRepository & { status: string; notice: string; preparation?: string }> {
     return collaborationCall(executor, 'taskWorkspaceInspect', [session]);
   },
