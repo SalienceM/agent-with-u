@@ -18,6 +18,7 @@ import { taskSessionTree, projectTaskSessions } from '../utils/taskSessionTree';
 import { SessionBranchDialog } from './SessionBranchDialog';
 import { SessionBranchStatusDialog } from './SessionBranchStatusDialog';
 import { ProjectTransferDialog } from './ProjectTransferDialog';
+import { SessionGitDialog } from './SessionGitDialog';
 
 interface Session extends SessionViewMetadata {
   id: string;
@@ -108,6 +109,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [branchDialog, setBranchDialog] = useState<{ session: Session; action: 'create' | 'manage' | 'merge' } | null>(null);
   const [branchStatus, setBranchStatus] = useState<{ session: Session; anchor?: HTMLElement } | null>(null);
   const [projectTransfer, setProjectTransfer] = useState<{ session: Session; mode: 'project' | 'return'; anchor?: HTMLElement } | null>(null);
+  const [gitDialog, setGitDialog] = useState<{ session: Session; anchor?: HTMLElement } | null>(null);
+  const branchParents = useMemo(() => new Set(sessions.filter(session => session.relationKind === 'task' && session.parentSessionId)
+    .map(session => `${session.execKey || 'local'}:${session.parentSessionId}`)), [sessions]);
+  const contextHasBranches = !!sessionContextMenu && branchParents.has(`${sessionContextMenu.session.execKey || 'local'}:${sessionContextMenu.session.id}`);
   const [sessionToDestroy, setSessionToDestroy] = useState<Session | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteResult, setDeleteResult] = useState<SessionDeletionResult | null>(null);
@@ -460,6 +465,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     completedDeletions.current.clear(); deletionBusy.current = false;
     setSessionToDelete(null); setSessionToDestroy(null); setSessionContextMenu(null);
     setBranchDialog(null);
+    setGitDialog(null);
     setExpandedSessionFamilies(new Set());
     setDeleteResult(null); setDestroyResult(null); setDeleting(false); setDestroying(false); setFavoriteError('');
   }), []);
@@ -1191,6 +1197,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         session={branchStatus.session} focusTarget={branchStatus.anchor} onClose={() => setBranchStatus(null)} />}
       {projectTransfer && <ProjectTransferDialog key={`${projectTransfer.session.execKey || 'local'}:${projectTransfer.session.id}:${projectTransfer.mode}`}
         session={projectTransfer.session} mode={projectTransfer.mode} focusTarget={projectTransfer.anchor} onClose={() => setProjectTransfer(null)} onOpenSession={onSelectSession} />}
+      {gitDialog && <SessionGitDialog key={`${gitDialog.session.execKey}:${gitDialog.session.id}`} session={gitDialog.session}
+        focusTarget={gitDialog.anchor} onClose={() => setGitDialog(null)} />}
       {sessionContextMenu && (
         <AppModalPortal>
         <div
@@ -1207,7 +1215,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           </div>
           {!sessionContextMenu.session.parentSessionId && !sessionContextMenu.session.relationKind && !sessionContextMenu.session.workspaceId && sessionContextMenu.session.codexConnectionMode !== 'ssh' && <button type="button" role="menuitem" className="awu-session-context-item"
             onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'create' }); setSessionContextMenu(null); }}><span className="awu-session-context-icon">⑂</span><span>新建分支副本</span></button>}
-          {!sessionContextMenu.session.parentSessionId && !sessionContextMenu.session.relationKind && sessionContextMenu.session.workingDir && <button type="button" role="menuitem" className="awu-session-context-item"
+          {contextHasBranches && !sessionContextMenu.session.parentSessionId && !sessionContextMenu.session.relationKind && sessionContextMenu.session.workingDir && <button type="button" role="menuitem" className="awu-session-context-item"
             onClick={() => { setBranchStatus({ session: sessionContextMenu.session, anchor: sessionContextMenu.anchor }); setSessionContextMenu(null); }}>
             <span aria-hidden="true" className="awu-session-context-icon">⑂</span><span>检查分支状态</span>
           </button>}
@@ -1223,10 +1231,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
               setProjectTransfer({ session: sessionContextMenu.session, mode: 'return', anchor: sessionContextMenu.anchor }); setSessionContextMenu(null);
             }}><span aria-hidden="true" className="awu-session-context-icon">↩</span><span>回传项目成果</span></button>
           </>}
-          {!['review', 'task', 'integration'].includes(sessionContextMenu.session.relationKind || '') && <button type="button" role="menuitem" className="awu-session-context-item"
+          {contextHasBranches && !['review', 'task', 'integration'].includes(sessionContextMenu.session.relationKind || '') && <button type="button" role="menuitem" className="awu-session-context-item"
             onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: sessionContextMenu.session.codexConnectionMode === 'ssh' ? 'merge' : 'manage' }); setSessionContextMenu(null); }}><span aria-hidden="true" className="awu-session-context-icon">⑂</span><span>分支与合并</span></button>}
           {sessionContextMenu.session.relationKind === 'integration' && <button type="button" role="menuitem" className="awu-session-context-item"
             onClick={() => { setBranchDialog({ session: sessionContextMenu.session, action: 'merge' }); setSessionContextMenu(null); }}>返回合并记录</button>}
+          {sessionContextMenu.session.workingDir && sessionContextMenu.session.codexConnectionMode !== 'ssh' && <button type="button" role="menuitem" className="awu-session-context-item"
+            onClick={() => { setGitDialog({ session: sessionContextMenu.session, anchor: sessionContextMenu.anchor }); setSessionContextMenu(null); }}>
+            <span aria-hidden="true" className="awu-session-context-icon">⑂</span><span>Git 工作区</span>
+          </button>}
           {onRequestViewMode && <>
             {(['chat', 'engine'] as const).map(mode => <button key={mode} type="button" className="awu-session-context-item" role="menuitem"
               onClick={() => { const target = sessionContextMenu.session; setSessionContextMenu(null); onRequestViewMode(target.id, mode); }}>
