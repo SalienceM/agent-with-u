@@ -1024,6 +1024,15 @@ struct SyncScanResult {
 }
 
 mod sync_scan_rules;
+mod directory_transfer_scan;
+
+#[tauri::command]
+async fn dir_sync_transfer_scan(dir: String, scope: String, directory: bool, ignore: Vec<String>, include_git: bool) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let files = directory_transfer_scan::scan(&dir, &scope, directory, &ignore, include_git)?;
+        Ok(serde_json::json!({ "version": 1, "files": files }))
+    }).await.map_err(|e| e.to_string())?
+}
 
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -1065,7 +1074,7 @@ fn sync_is_ignored(rel: &str, patterns: &[String], include_git: bool) -> bool {
     let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
     // Git 元数据默认不进入离线副本；只有文件面板的显式高级开关可放行。
     // 放行后不再让普通 ignore 规则二次拦截，保证迁移模式语义明确。
-    if segs.contains(&".git") {
+    if segs.iter().any(|p| p.eq_ignore_ascii_case(".git")) {
         return !include_git;
     }
     for pat in patterns {
@@ -1975,6 +1984,7 @@ pub fn run() {
             set_desktop_config,
             install_staged_update,
             dir_sync_scan,
+            dir_sync_transfer_scan,
             dir_sync_scan_scoped,
             dir_sync_read_file,
             local_documents::local_document_bind,

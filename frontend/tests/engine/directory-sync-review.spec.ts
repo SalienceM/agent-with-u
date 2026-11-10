@@ -99,6 +99,38 @@ async function compare(page: Page) {
 }
 async function open(page: Page) { await compare(page); await page.getByRole('button', { name: /^审阅差异 \d+/ }).click(); return page.getByRole('dialog', { name: '目录同步审阅' }); }
 
+test('file panel exposes checked upload and mirror without requiring comparison', async ({ page }) => {
+  await mount(page);
+  await page.evaluate(async () => {
+    const { api, getCurrentUserProfile } = await import('/src/api.ts');
+    api.directoryTransferCall = async (_executor, method, args) => {
+      const f = (window as any).reviewFixture;
+      f.calls.push({ method: 'transfer-' + method });
+      const workspace = { ownerId: getCurrentUserProfile().userId, executorInstance: 'fixture-executor', sessionId: 'review-fixture', workingDir: '/fixture-only', workspaceRevision: 'a'.repeat(64) };
+      if (method === 'Config') return { version: 1, workspace, ignore: [] };
+      if (method === 'Plan') {
+        const req = JSON.parse(args[2] as string);
+        return { version: 1, id: 'preview', workspace, state: 'preview', scope: req.scope, mirror: req.mirror, uploaded: [], deleted: [], entries: [
+          ...Object.entries(req.source).map(([path, meta]: any) => ({ path, ...meta, action: 'add' })),
+          ...(req.mirror ? [{ path: 'obsolete.txt', hash: 'a'.repeat(64), size: 5, action: 'delete' }] : []),
+        ] };
+      }
+      if (method === 'Cancel') return {};
+      throw Error('Unexpected write');
+    };
+  });
+  await page.getByRole('button', { name: '更多文件工具', exact: true }).click();
+  await page.getByRole('button', { name: '本机副本与同步', exact: true }).click();
+  await page.getByRole('button', { name: '上传变化 / 镜像同步', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: '上传到执行端', exact: true })).toContainText('新增 9');
+  await page.getByLabel('传输模式', { exact: true }).selectOption('mirror');
+  await expect(page.getByLabel('待删除文件')).toContainText('obsolete.txt');
+  await page.getByRole('button', { name: '取消', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: '上传到执行端', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('searchbox', { name: '搜索工作区文件' })).toBeFocused();
+  expect(await page.evaluate(() => (window as any).reviewFixture.calls.filter((c: any) => ['transfer-Chunk', 'transfer-Commit', 'manifest'].includes(c.method)))).toEqual([]);
+});
+
 for (const width of [1366, 390]) test(`editable scan scope prunes comparison and persists at ${width}px`, async ({ page }, info) => {
   await mount(page, width); await compare(page);
   const count = () => page.evaluate(() => (window as any).reviewFixture.calls.filter((c: any) => ['manifest', 'local-scan'].includes(c.method)).length);

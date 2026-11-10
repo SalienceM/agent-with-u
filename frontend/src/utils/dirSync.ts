@@ -117,6 +117,8 @@ export interface LocalFs {
   documentAdapter?(): Promise<LocalDocumentAdapter>;
   reviewAdapter?(scopeKey: string): Promise<ReviewAdapter>;
   scan(ignore: string[], includeGit?: boolean, options?: ScanOptions): Promise<Manifest>;
+  /** 完整源清单；旧桌面端不能回落至可能漏读的 scan。 */
+  transferScan?(scope: string, directory: boolean, ignore: string[], includeGit: boolean): Promise<Manifest>;
   /** 列出某相对目录的直接子项(懒加载逐层浏览用,不递归、不算哈希)。 */
   listDir(rel: string): Promise<LocalEntry[]>;
   readFile(rel: string): Promise<string>; // base64
@@ -174,6 +176,13 @@ export class TauriLocalFs implements LocalFs {
   }
   id(): string {
     return `tauri:${this.dir}`;
+  }
+  async transferScan(scope: string, directory: boolean, ignore: string[], includeGit: boolean): Promise<Manifest> {
+    const result = await tauriInvoke<{ version: number; files: Manifest }>('dir_sync_transfer_scan', {
+      dir: this.dir, scope, directory, ignore, includeGit,
+    });
+    if (result.version !== 1 || !result.files) throw new Error('请更新桌面端以支持完整传输检查');
+    return result.files;
   }
   documentAdapter(): Promise<LocalDocumentAdapter> { return TauriDocumentAdapter.connect(this.dir, tauriInvoke); }
   async reviewAdapter(scopeKey: string): Promise<ReviewAdapter> {
