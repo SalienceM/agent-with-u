@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 from . import paths
 
-KINDS = frozenset({'role', 'roleSession', 'roleBinding', 'review', 'report', 'snapshot', 'reference', 'workspace', 'merge', 'interaction', 'kitDelegation'})
+KINDS = frozenset({'role', 'roleSession', 'roleBinding', 'review', 'report', 'snapshot', 'reference', 'workspace', 'merge', 'interaction', 'kitDelegation', 'projectTransfer'})
 SUMMARY_FIELDS = frozenset({'title', 'name', 'status', 'sessionId', 'sourceSessionId', 'parentSessionId',
                             'roleId', 'batchId', 'workspaceId', 'relationKind', 'archived', 'counts',
                             'backendId', 'phase', 'requestId', 'messageId', 'enabled'})

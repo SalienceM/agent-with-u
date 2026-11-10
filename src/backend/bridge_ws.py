@@ -2024,7 +2024,8 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         observation_methods = {'ping', 'sessionWorkbenchCapabilities', 'loadSessionMeta', 'listSessions',
             'sessionScheduleList', 'sessionScheduleGet', 'sessionSchedulePreview',
             'sessionScheduleRequestStatus', 'sessionScheduleOccurrences', 'sessionScheduleOutput'}
-        collaboration_independent = {'sessionCollaborationList', 'sessionCollaborationGet', 'sessionCollaborationRequestStatus',
+        collaboration_independent = {'projectTransferCapabilities', 'projectTransferExport', 'projectTransferFinish', 'projectTransferStatus', 'projectTransferList', 'projectTransferPlan',
+            'sessionCollaborationList', 'sessionCollaborationGet', 'sessionCollaborationRequestStatus',
             'reviewStatus', 'reviewTargets', 'reviewSnapshot', 'reviewSummarize', 'userInteractionList', 'userInteractionRespond',
             'taskWorkspaceInspect', 'taskWorkspacePlan', 'taskWorkspaceStatus', 'projectBufferReply', 'projectBufferState',
             'projectBranchGraph', 'projectBranchStatus', 'projectMergeDiscover', 'projectMergeOperations', 'projectMergeInspect', 'projectMergePreview', 'projectMergeVerify', 'projectMergeStatus', 'projectMergeRepairRead', 'projectMergeRepairPermission', 'taskWorkspaceCleanupPlan', 'projectBufferStatus'}

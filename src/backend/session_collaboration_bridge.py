@@ -13,12 +13,13 @@ from .followup_suggestions import FollowupSuggestions
 from .session_roles import SessionRoles
 from .role_reviews import RoleReviews
 from .task_workspaces import TaskWorkspaces
+from .project_transfers import ProjectTransfers
 from .project_write_gate import ProjectWriteGate
 from .project_merges import ProjectMerges
 from .session_schedule_bridge import SessionScheduleBridge
 
 
-class SessionCollaborationBridge(SessionScheduleBridge, KitDelegationFeedback, ComposerSubmissionBridge, FollowupSuggestions, SessionRoles, RoleReviews, TaskWorkspaces, ProjectWriteGate, ProjectMerges):
+class SessionCollaborationBridge(SessionScheduleBridge, KitDelegationFeedback, ComposerSubmissionBridge, FollowupSuggestions, SessionRoles, RoleReviews, TaskWorkspaces, ProjectTransfers, ProjectWriteGate, ProjectMerges):
     def _declare_interaction_client(self, version: Any) -> None:
         # 这里只声明呈现能力，不授予任何执行权限；断开时由 transport 删除 meta。
         client = self._current_request_client()
