@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import queue
+import threading
 from types import SimpleNamespace
 import unittest
 
@@ -11,6 +12,67 @@ from src.backend.deepseek_harness_sdk import MAX_NOTIFICATIONS, NotificationBudg
 
 
 class HarnessByteBudgetTests(unittest.TestCase):
+    def test_reader_absorbs_short_burst_without_dropping_or_reordering_frames(self) -> None:
+        client = self.client()
+        total = MAX_NOTIFICATIONS * 3
+        source = io.TextIOWrapper(io.BytesIO(b''.join(encode_frame({"method": "fixture", "params": {"index": i}})
+                                                  for i in range(total))), encoding="utf-8")
+        client._proc = SimpleNamespace(stdout=source)
+        full = threading.Event()
+        put = client._notifications.put_sized
+
+        def observed_put(note, size, **kwargs):
+            if client._notifications.full():
+                full.set()
+            return put(note, size, **kwargs)
+
+        client._notifications.put_sized = observed_put
+        reader = threading.Thread(target=client._reader_loop)
+        reader.start()
+        try:
+            self.assertTrue(full.wait(1), "fixture must actually reach the queue bound")
+            self.assertLessEqual(client._notifications.qsize(), MAX_NOTIFICATIONS)
+            observed = [client.next_owned_notification(timeout=1).payload["index"] for _ in range(total)]
+            self.assertEqual(observed, list(range(total)))
+            reader.join(1)
+            self.assertFalse(reader.is_alive())
+            from src.backend.harness_image_errors import harness_error_details
+            self.assertEqual(harness_error_details(client.fatal)["errorCode"], "transport_closed")
+            self.assertEqual(client._notifications.pending_bytes, 0)
+        finally:
+            reader.join(2)
+            client._proc = None
+            source.close()
+
+    def test_byte_budget_backpressure_unblocks_only_when_capacity_is_freed(self) -> None:
+        pending = NotificationBudgetQueue()
+        first, second, third = object(), object(), object()
+        pending.put_sized(first, MAX_FRAME_BYTES)
+        pending.put_sized(second, MAX_FRAME_BYTES)
+        started, finished = threading.Event(), threading.Event()
+        errors = []
+
+        def publish():
+            started.set()
+            try:
+                pending.put_sized(third, MAX_FRAME_BYTES, timeout=1)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        producer = threading.Thread(target=publish)
+        producer.start()
+        self.assertTrue(started.wait(1))
+        self.assertFalse(finished.wait(.02))
+        self.assertIs(pending.get_nowait(), first)
+        producer.join(2)
+        self.assertFalse(errors)
+        self.assertTrue(finished.is_set())
+        self.assertEqual(pending.pending_bytes, MAX_PENDING_BYTES)
+        self.assertIs(pending.get_nowait(), second)
+        self.assertIs(pending.get_nowait(), third)
+
     def client(self):
         return create_client(config=create_harness_config(), owner=SimpleNamespace())
 
@@ -101,7 +163,7 @@ class HarnessByteBudgetTests(unittest.TestCase):
         small = {"method": "fixture", "params": {}}
         client._handle_message(small, frame_bytes=MAX_FRAME_BYTES)
         client._handle_message(small, frame_bytes=MAX_FRAME_BYTES)
-        with self.assertRaisesRegex(RuntimeError, "队列溢出"):
+        with self.assertRaisesRegex(RuntimeError, "event_overflow"):
             client._handle_message(small, frame_bytes=1)
         self.assertEqual(client._notifications.pending_bytes, MAX_PENDING_BYTES)
         self.assertEqual(client._notifications.qsize(), 2)

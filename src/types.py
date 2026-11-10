@@ -174,6 +174,8 @@ class ChatMessage:
     tool_calls: Optional[list[ToolCallInfo]] = None
     thinking_blocks: Optional[list[ThinkingBlock]] = None
     streaming: bool = False
+    # 运行诊断独立于模型正文，避免半截 Markdown 吞掉错误；done 只代表流已结束。
+    error: Optional[str] = None
     # Follow-up delivery semantics.  Kept on the message (not the backend)
     # because it is part of the visible Session history.
     delivery_mode: Optional[str] = None  # steer | redirect
@@ -184,6 +186,8 @@ class ChatMessage:
     def has_visible_payload(self) -> bool:
         """正文之外，思考、工具和附件也都属于可展示的有效回复。"""
         if isinstance(self.content, str) and self.content.strip():
+            return True
+        if isinstance(self.error, str) and self.error.strip():
             return True
         if any(
             isinstance(block.content, str) and block.content.strip()
@@ -210,6 +214,8 @@ class ChatMessage:
             d["textAttachments"] = [attachment.to_dict() for attachment in self.text_attachments]
         if self.backend_id:
             d["backendId"] = self.backend_id
+        if self.error:
+            d["error"] = self.error
         if self.usage:
             d["usage"] = self.usage
         if self.tool_calls:

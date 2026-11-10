@@ -74,6 +74,7 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  error?: string;
   timestamp: number;
   images?: ImageAttachment[];
   textAttachments?: TextAttachment[];
@@ -338,6 +339,7 @@ export function useChat(
     const cachedHistory = sessionHistoryCache.get(sessionId);
     const hasStreamContent = hasVisibleMessagePayload({
       content: globalState.text,
+      error: globalState.error,
       thinking: globalState.thinking,
       toolCalls: globalState.toolCalls,
       contentBlocks: globalState.contentBlocks,
@@ -409,6 +411,7 @@ export function useChat(
             restored.thinking = loadedStreaming.thinking || '';
             restored.toolCalls = loadedStreaming.toolCalls ? [...loadedStreaming.toolCalls] : [];
             restored.contentBlocks = loadedStreaming.contentBlocks ? [...loadedStreaming.contentBlocks] : [];
+            restored.error = loadedStreaming.error;
             restored.streamStart = loadedStreaming.timestamp
               ? loadedStreaming.timestamp * 1000
               : Date.now();
@@ -429,6 +432,7 @@ export function useChat(
         const stillStreaming = !!(latest.isStreaming && latest.messageId);
         const latestHasContent = hasVisibleMessagePayload({
           content: latest.text,
+          error: latest.error,
           thinking: latest.thinking,
           toolCalls: latest.toolCalls,
           contentBlocks: latest.contentBlocks,
@@ -517,6 +521,7 @@ export function useChat(
           state.thinking = assistant.thinking || '';
           state.toolCalls = assistant.toolCalls || [];
           state.contentBlocks = assistant.contentBlocks || [];
+          state.error = assistant.error;
         }
         isStreamingRef.current = !!assistant;
         setIsStreaming(!!assistant);
@@ -693,6 +698,7 @@ export function useChat(
         // 立即快照，避免异步执行时 state 已被下一个 delta 修改
         const snap = {
           text: state.text,
+          error: state.error,
           thinking: state.thinking,
           isStreaming: state.isStreaming,
           toolCalls: [...state.toolCalls],
@@ -715,6 +721,7 @@ export function useChat(
             //    这关闭的是「消息切换/瞬切刚好碰上模型起新一条」的那个空窗。
             const hasContent = hasVisibleMessagePayload({
               content: snap.text,
+              error: snap.error,
               thinking: snap.thinking,
               toolCalls: snap.toolCalls,
               contentBlocks: snap.contentBlocks,
@@ -724,6 +731,7 @@ export function useChat(
               id: mid,
               role: 'assistant',
               content: snap.text,
+              error: snap.error,
               timestamp: Date.now() / 1000,
               streaming: snap.isStreaming,
               thinking: snap.thinking || undefined,
@@ -755,12 +763,14 @@ export function useChat(
           flushNow();
 
           const finalText = state.text;
+          const finalError = state.error || undefined;
           const finalThinking = state.thinking || undefined;
           const finalToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
           const finalBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
           const finalElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
           const hasFinalPayload = hasVisibleMessagePayload({
             content: finalText,
+            error: finalError,
             thinking: finalThinking,
             toolCalls: finalToolCalls,
             contentBlocks: finalBlocks,
@@ -789,6 +799,7 @@ export function useChat(
                   id: mid,
                   role: 'assistant',
                   content: finalText,
+                  error: finalError,
                   thinking: finalThinking,
                   toolCalls: finalToolCalls,
                   contentBlocks: finalBlocks,
@@ -806,6 +817,7 @@ export function useChat(
               return {
                 ...m,
                 content: finalText,
+                error: finalError,
                 thinking: finalThinking,
                 toolCalls: finalToolCalls,
                 contentBlocks: finalBlocks,
@@ -827,12 +839,14 @@ export function useChat(
           // error 只是本轮中的诊断帧。远端 Codex / Relay 可能报告一次可恢复
           // 的传输错误后继续同一个 turn；只有随后明确到达的 done 才是终态。
           const errText = state.text;
+          const errError = state.error || undefined;
           const errThinking = state.thinking || undefined;
           const errToolCalls = state.toolCalls.length > 0 ? [...state.toolCalls] : undefined;
           const errBlocks = state.contentBlocks.length > 0 ? [...state.contentBlocks] : undefined;
           const errElapsed = state.streamStart ? Date.now() - state.streamStart : undefined;
           const hasErrorPayload = hasVisibleMessagePayload({
             content: errText,
+            error: errError,
             thinking: errThinking,
             toolCalls: errToolCalls,
             contentBlocks: errBlocks,
@@ -849,6 +863,7 @@ export function useChat(
                   id: mid,
                   role: 'assistant',
                   content: errText,
+                  error: errError,
                   thinking: errThinking,
                   toolCalls: errToolCalls,
                   contentBlocks: errBlocks,
@@ -865,6 +880,7 @@ export function useChat(
                 ? {
                     ...m,
                     content: errText,
+                    error: errError,
                     thinking: errThinking,
                     toolCalls: errToolCalls,
                     contentBlocks: errBlocks,

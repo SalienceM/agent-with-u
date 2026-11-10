@@ -15,6 +15,7 @@ interface ThinkingLikeBlock {
  */
 export function hasVisibleMessagePayload(message: {
   content?: unknown;
+  error?: unknown;
   thinking?: unknown;
   thinkingBlocks?: ThinkingLikeBlock[] | null;
   toolCalls?: unknown[] | null;
@@ -26,7 +27,7 @@ export function hasVisibleMessagePayload(message: {
     typeof value === 'string' && value.trim().length > 0
   );
 
-  if (hasText(message.content) || hasText(message.thinking)) return true;
+  if (hasText(message.content) || hasText(message.thinking) || hasText(message.error)) return true;
   if (message.thinkingBlocks?.some((block) => hasText(block?.content))) return true;
   if ((message.toolCalls?.length || 0) > 0) return true;
   if ((message.images?.length || 0) > 0) return true;
@@ -41,6 +42,7 @@ export function shouldKeepChatMessage(message: {
   role?: unknown;
   streaming?: unknown;
   content?: unknown;
+  error?: unknown;
   thinking?: unknown;
   thinkingBlocks?: ThinkingLikeBlock[] | null;
   toolCalls?: unknown[] | null;

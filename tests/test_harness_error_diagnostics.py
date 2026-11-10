@@ -9,6 +9,15 @@ from src.backend.deepseek_harness_images import ImagePolicyError
 
 
 class HarnessErrorDiagnosticsTests(unittest.TestCase):
+    def test_projection_and_backpressure_failures_keep_distinct_safe_reasons(self) -> None:
+        for message, code in (("Harness 实时流有缺帧", "stream_gap"),
+                              ("Harness 实时与已提交内容不一致", "stream_mismatch"),
+                              ("Harness 异步消费背压超出限额", "stream_backpressure")):
+            error = RuntimeError(message)
+            self.assertEqual(harness_error_details(error, stage="projection")["errorCode"], code)
+            self.assertIn("流式事件处理", harness_error_text(error, stage="projection"))
+        self.assertEqual(harness_error_details(RuntimeError("PRIVATE Harness 实时流有缺帧"))["errorCode"], "unknown")
+
     def test_text_failure_never_blames_images_or_echoes_exception(self) -> None:
         marker = "PRIVATE_PAYLOAD https://private.invalid/?token=secret HTTP 401 timeout"
         error = RuntimeError(marker)

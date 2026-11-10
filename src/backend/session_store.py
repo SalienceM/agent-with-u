@@ -364,6 +364,7 @@ class SessionStore:
                     usage=m.get("usage"),
                     tool_calls=tool_calls,
                     thinking_blocks=thinking_blocks,
+                    error=m.get("error") if isinstance(m.get("error"), str) else None,
                     streaming=False,
                     delivery_mode=(
                         m.get("deliveryMode")

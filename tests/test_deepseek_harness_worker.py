@@ -194,6 +194,9 @@ class OwnedSdkTests(unittest.TestCase):
                 while client.fatal is None and time.monotonic() < deadline:
                     time.sleep(.01)
                 self.assertIsNotNone(client.fatal)
+                if scenario == "flood":
+                    from src.backend.harness_image_errors import harness_error_details
+                    self.assertEqual(harness_error_details(client.fatal)["errorCode"], "event_overflow")
                 self.assertLessEqual(client._notifications.qsize(), MAX_NOTIFICATIONS)
                 client.close()
                 self.assertTrue(self.owner.confirmed, f"exit={self.owner.process.returncode}, receipt={self.owner.receipt.exists()}, reader={client._reader_thread.is_alive()}, stderr={client._stderr_thread.is_alive()}")

@@ -23,6 +23,7 @@ _STAGES = {
     "initialize": "运行时初始化", "handshake": "AWU 桥握手", "configure": "工具与权限配置",
     "resume": "历史恢复", "image_admission": "图片准入", "submit": "请求提交",
     "execution": "模型与工具执行", "wait": "等待本轮结束", "unknown": "未知",
+    "projection": "流式事件处理",
 }
 _ERRORS = {
     "unknown": ("unknown", "未取得可分类的错误；请查看本轮调用诊断。"),
@@ -35,6 +36,11 @@ _ERRORS = {
     "timeout": ("timeout", "等待超时；请根据失败阶段核对运行时或服务响应。"),
     "transport_closed": ("network", "与 Harness 运行时的连接已关闭；请核对运行时是否正常启动和退出。"),
     "protocol_error": ("protocol", "运行时协议或事件不完整；请核对配套运行时与 AWU 版本。"),
+    "event_overflow": ("protocol", "运行时事件积压超过接收容量，等待消化后仍未恢复；本轮已中断，已收到的内容保留。"),
+    "stream_gap": ("protocol", "流式输出缺帧，无法确认回复完整；已收到的内容保留。"),
+    "stream_mismatch": ("protocol", "实时输出与原生保存内容不一致，无法确认回复完整；已收到的内容保留。"),
+    "stream_backpressure": ("protocol", "流式事件处理持续堵塞，本轮已中断；已收到的内容保留。"),
+    "usage_invalid": ("protocol", "运行时用量数据不符合协议，本轮未正常完成。"),
     "rpc_error": ("protocol", "运行时拒绝了本阶段请求；请核对运行配置和配套版本。"),
     "auth": ("auth", "模型服务认证或访问权限检查失败；请核对所选 Backend 的凭据和账号权限。"),
     "not_found": ("provider", "模型服务接口未找到；请核对 Base URL 的 Messages API 路径与模型名。"),
@@ -69,6 +75,19 @@ _LOCAL_CODES = {
     "Harness turn/end 缺少有效结束原因": "protocol_error",
     "Harness 本轮收到重复终态": "protocol_error", "Harness 根事件序列无效": "protocol_error",
     "Harness 进程树退出未确认，活动保护保留": "exit_unknown",
+    "Harness 实时流有缺帧": "stream_gap",
+    "Harness 实时与已提交内容不一致": "stream_mismatch",
+    "Harness 工具增量与原生参数不一致": "stream_mismatch",
+    "Harness 异步消费背压超出限额": "stream_backpressure",
+    "Harness 用量计数无效": "usage_invalid",
+    "Harness 用量子计数无效": "usage_invalid",
+    "Harness 用量总计与子项不一致": "usage_invalid",
+    "Harness 本轮事件数量超限": "event_overflow",
+    "Harness 实时帧缺少 start": "protocol_error",
+    "Harness chunk 类型未知": "protocol_error",
+    "Harness chunk 缺失": "protocol_error",
+    "Harness 收到旧运行的实时帧": "protocol_error",
+    "Harness 收到其他 Session 的事件": "protocol_error",
 }
 
 

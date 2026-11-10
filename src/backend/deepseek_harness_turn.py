@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 from copy import deepcopy
 import queue
 import threading
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -334,7 +336,7 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
             } | {"allowed": allowed}, response_model=Empty, timeout_seconds=5)
 
         def event(note: dict) -> None:
-            nonlocal projection
+            nonlocal projection, failure_stage
             if note["method"] == "awu/submitting":
                 try:
                     submission("submitting")
@@ -369,7 +371,11 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
                         worker.request_stop()
                 task.add_done_callback(settled)
             elif projection:
-                projection.observe(note)
+                try:
+                    projection.observe(note)
+                except Exception:
+                    failure_stage = "projection"
+                    raise
 
         worker.start(work)
         result = await worker.consume(event)
@@ -394,6 +400,9 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
                    "runtime_failed" if receipt_received else "receipt_unknown" if prompt_attempted
                    else exc.reason if isinstance(exc, ImagePolicyError) else "preflight_rejected")
         details = harness_error_details(exc, stage=failure_stage)
+        # 即使未开启正文采集也能追查失败；仅记录安全类别与本轮关联，不存原始响应/思考/凭据。
+        print("[HarnessTurn] " + json.dumps({"sessionId": session_id, "messageId": message_id,
+              **details}, ensure_ascii=False), file=sys.stderr, flush=True)
         emit("diagnostic", diagnostic={"phase": "backend_error", **details})
         trace_response("harness-failure", details, "安全错误类别与失败阶段；不包含原始异常、凭据或路径。")
         # RuntimeError 等内建异常也可能包装上游正文；只允许受控类别／精确常量。

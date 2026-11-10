@@ -16,6 +16,7 @@ import { ScopedStreamStates } from '../utils/scopedStreamStates';
 export interface StreamState {
   messageId: string | null;
   text: string;
+  error?: string;
   thinking: string;
   toolCalls: ToolCall[];
   contentBlocks: ContentBlock[];
@@ -28,6 +29,7 @@ function createEmptyState(): StreamState {
   return {
     messageId: null,
     text: '',
+    error: '',
     thinking: '',
     toolCalls: [],
     contentBlocks: [],
@@ -46,6 +48,7 @@ export function restoreStreamState(session: string, value: unknown, executor?: s
   if (!row || typeof row !== 'object' || Object.keys(row).some(key => !Object.keys(createEmptyState()).includes(key))
     || !(row.messageId === null || typeof row.messageId === 'string') || typeof row.text !== 'string'
     || typeof row.thinking !== 'string' || !Array.isArray(row.toolCalls) || !Array.isArray(row.contentBlocks)
+    || (row.error !== undefined && typeof row.error !== 'string')
     || typeof row.isStreaming !== 'boolean' || !Number.isFinite(row.streamStart)
     || JSON.stringify(row).length > 4 * 1024 * 1024) throw new Error('无效的流恢复状态');
   const restored = structuredClone(row); streamStates.set(session, restored, executor); return restored;
@@ -99,6 +102,7 @@ export function resetStreamAccumulators(sessionId: string): void {
   const state = streamStates.get(sessionId);
   if (state) {
     state.text = '';
+    state.error = '';
     state.thinking = '';
     state.toolCalls = [];
     state.contentBlocks = [];
@@ -117,6 +121,7 @@ export function initStreamMessage(sessionId: string, messageId: string): void {
   const state = getStreamState(sessionId);
   state.messageId = messageId;
   state.text = '';
+  state.error = '';
   state.thinking = '';
   state.toolCalls = [];
   state.contentBlocks = [];
@@ -136,6 +141,7 @@ export function processStreamDelta(sessionId: string, delta: any): {
   if (state.messageId !== mid && delta.type !== 'done') {
     state.messageId = mid;
     state.text = '';
+    state.error = '';
     state.thinking = '';
     state.toolCalls = [];
     state.contentBlocks = [];
@@ -297,6 +303,7 @@ export function processStreamDelta(sessionId: string, delta: any): {
     }
 
     case 'done': {
+      if (state.messageId === mid && typeof delta.error === 'string' && delta.error) state.error = delta.error;
       const now = Date.now();
       state.toolCalls = state.toolCalls.map((tc) => {
         if (tc.status === 'running' && tc.startTime) {
@@ -318,8 +325,8 @@ export function processStreamDelta(sessionId: string, delta: any): {
       // 可恢复的网络错误，随后仍在同一 turn 中继续输出；只有显式 done 才能
       // 释放主链路并触发下一条序列任务。
       state.isStreaming = true;
-      const errorMsg = delta.error || '未知错误';
-      appendText(`\n\n**错误**: ${errorMsg}`);
+      // 诊断不能拼进模型的 Markdown，未闭合代码块/表格会吞掉提示。
+      state.error = typeof delta.error === 'string' && delta.error ? delta.error : '未知错误';
       break;
     }
   }
@@ -332,6 +339,7 @@ export function buildStreamingMessage(state: StreamState, baseMessage: ChatMessa
   return {
     ...baseMessage,
     content: state.text,
+    error: state.error || undefined,
     thinking: state.thinking || undefined,
     toolCalls: state.toolCalls.length > 0 ? state.toolCalls : undefined,
     contentBlocks: state.contentBlocks.length > 0 ? state.contentBlocks : undefined,

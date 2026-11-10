@@ -18029,6 +18029,7 @@ except urllib.error.URLError as e:
                     return
                 if delta.type == "error":
                     iter_failed = True
+                    assistant_msg.error = delta.error or "本轮运行出现错误，回复可能不完整。"
                 if delta.type == "text_delta" and delta.text:
                     iter_text.append(delta.text)
                     # 流式正文同时镜像到内存 Session。切换会话或其他客户端
@@ -18278,6 +18279,10 @@ except urllib.error.URLError as e:
                 stop_reason = result.get("stopReason", "end_turn")
                 if not retry_state["without_session"] and (iter_failed or result.get("success") is False or stop_reason in {"error", "aborted", "cancelled", "interrupted"}):
                     success = False
+                    if not assistant_msg.error:
+                        assistant_msg.error = (result.get("error") if isinstance(result.get("error"), str)
+                                               and result["error"] else "本轮运行未正常完成，已保留收到的内容。")
+                        self._emit_delta(StreamDelta(session.id, message_id, "error", error=assistant_msg.error))
 
                 if retry_state["without_session"] and retry_count < max_retry:
                     retry_count += 1
@@ -18287,6 +18292,7 @@ except urllib.error.URLError as e:
                 elif retry_state["without_session"]:
                     # 已超过最大重试次数，报告错误
                     print(f"[bridge_ws] Resume 失败且已达到最大重试次数", file=sys.stderr, flush=True)
+                    assistant_msg.error = "无法恢复之前的对话会话，已尝试使用历史记录重试"
                     self._emit_delta(StreamDelta(
                         session.id, message_id, "error",
                         error="无法恢复之前的对话会话，已尝试使用历史记录重试",
@@ -18333,6 +18339,7 @@ except urllib.error.URLError as e:
                 if getattr(getattr(backend, "config", None), "type", None) == BackendType.DEEPSEEK_HARNESS:
                     from .harness_image_errors import harness_error_text
                     error_text = harness_error_text(e)
+                assistant_msg.error = error_text or "本轮运行出现错误，回复可能不完整。"
                 self._emit_delta(StreamDelta(session.id, message_id, "error", error=error_text))
                 success = False
                 break
@@ -18371,7 +18378,8 @@ except urllib.error.URLError as e:
             self._finalize_or_remove_assistant(session, assistant_msg)
 
             # ★ 无论成功失败都发 done，确保前端不会卡在 streaming 状态
-            self._emit_delta(StreamDelta(session.id, message_id, "done", usage=final_usage if success else None))
+            self._emit_delta(StreamDelta(session.id, message_id, "done", error=assistant_msg.error,
+                                         usage=final_usage if success else None))
         finally:
             # ★ 确保 skip_rest 标志始终被清除，即使异常路径也不泄漏
             self._clear_skip_permission(session.id)

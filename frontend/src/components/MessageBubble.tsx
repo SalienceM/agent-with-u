@@ -1792,6 +1792,14 @@ function MessageBubbleInner({
           </>
         )}
 
+        {!isUser && message.error && (
+          <div role="alert" style={{ marginTop: 10, padding: '8px 10px', borderRadius: 6,
+            border: '1px solid var(--theme-error, #f85149)', color: 'var(--theme-error, #f85149)',
+            whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', userSelect: 'text' }}>
+            <strong>本轮错误提示</strong>{'\n'}{message.error}
+          </div>
+        )}
+
         {/* ★ 工具输出图片直出：不依赖模型转述，直接在消息体内渲染 */}
         {!isUser && !message.streaming && message.toolCalls && (() => {
           const allToolImages: Array<{ src: string; alt: string }> = [];
@@ -1894,6 +1902,7 @@ function bubblePropsEqual(prev: Props, next: Props): boolean {
   return (
     prev.message.id        === next.message.id        &&
     prev.message.content   === next.message.content   &&
+    prev.message.error     === next.message.error     &&
     prev.message.contentBlocks === next.message.contentBlocks &&
     prev.message.images    === next.message.images    &&
     prev.message.textAttachments === next.message.textAttachments &&

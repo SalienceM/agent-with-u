@@ -28,6 +28,23 @@ class _ErrorOnlyBackend:
         return {}
 
 
+class _PartialErrorBackend:
+    def __init__(self, result_only=False, raises=False):
+        self.result_only, self.raises = result_only, raises
+        self.calls = 0
+
+    async def send_message(self, **kwargs):
+        self.calls += 1
+        kwargs['on_delta'](StreamDelta(kwargs['session_id'], kwargs['message_id'], 'text_delta',
+                                      text='```sql\nCANCE'))
+        if self.raises:
+            raise RuntimeError('connection closed')
+        if not self.result_only:
+            kwargs['on_delta'](StreamDelta(kwargs['session_id'], kwargs['message_id'], 'error',
+                                          error='connection closed'))
+        return {'success': False, 'stopReason': 'error', 'error': 'connection closed'}
+
+
 class _RecoveringBackend:
     def __init__(self):
         self.calls = 0
@@ -119,14 +136,38 @@ class EmptyAssistantStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.last_result)
 
     async def test_error_then_done_is_not_queue_success(self):
-        await self._run_empty_backend(_ErrorOnlyBackend())
+        session, emitted = await self._run_empty_backend(_ErrorOnlyBackend())
         self.assertFalse(self.last_result)
+        self.assertEqual(session.messages[-1].error, 'rate limited')
+        self.assertEqual(emitted[-1].error, 'rate limited')
+        self.assertEqual(session.messages[-1].content, '')
+
+    async def test_partial_failure_survives_reload_without_replaying_or_changing_text(self):
+        for result_only, raises in ((False, False), (True, False), (False, True)):
+            with self.subTest(result_only=result_only, raises=raises):
+                backend = _PartialErrorBackend(result_only, raises)
+                session, emitted = await self._run_empty_backend(backend)
+                self.assertFalse(self.last_result)
+                self.assertEqual(backend.calls, 1)
+                self.assertEqual(session.messages[-1].content, '```sql\nCANCE')
+                self.assertEqual(session.messages[-1].error, 'connection closed')
+                self.assertEqual(emitted[-1].type, 'done')
+                self.assertEqual(emitted[-1].error, 'connection closed')
+                self.assertFalse(session.messages[-1].streaming)
+                with tempfile.TemporaryDirectory() as directory:
+                    store = SessionStore.__new__(SessionStore)
+                    store._dir = Path(directory)
+                    (store._dir / 'session.json').write_text(json.dumps(session.to_dict()), encoding='utf-8')
+                    restored = store.load('session')
+                    self.assertEqual(restored.messages[-1].error, 'connection closed')
+                    self.assertEqual(restored.messages[-1].content, '```sql\nCANCE')
 
     async def test_successful_resume_retry_does_not_pause_sequence(self):
         backend = _RecoveringBackend()
-        await self._run_empty_backend(backend)
+        session, emitted = await self._run_empty_backend(backend)
         self.assertEqual(backend.calls, 2)
         self.assertTrue(self.last_result)
+        self.assertFalse(emitted[-1].error)
 
 
 if __name__ == "__main__":

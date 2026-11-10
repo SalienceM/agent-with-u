@@ -35,8 +35,21 @@ class NotificationBudgetQueue(queue.Queue):
         super().__init__(maxsize=MAX_NOTIFICATIONS)
         self._pending_bytes = 0
 
-    def put_sized(self, notification: Any, frame_bytes: int) -> None:
-        self.put_nowait(_QueuedNotification(notification, frame_bytes))
+    def put_sized(self, notification: Any, frame_bytes: int, *, timeout: float = 0) -> None:
+        # DSH 可在一个调度片中突发很多小帧。暂时满队列应向 pipe 施加背压，
+        # 而非立刻结束正常流；条数/字节/等待时间仍同时有界。
+        if not 0 < frame_bytes <= MAX_FRAME_BYTES:
+            raise queue.Full
+        deadline = time.monotonic() + timeout
+        with self.not_full:
+            while self._qsize() >= self.maxsize or self._pending_bytes + frame_bytes > MAX_PENDING_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Full
+                self.not_full.wait(remaining)
+            self._put(_QueuedNotification(notification, frame_bytes))
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
 
     @property
     def pending_bytes(self) -> int:
@@ -264,8 +277,11 @@ def create_client(*, config: Any, owner: SyncOwner, launch_args: tuple[str, ...]
                     if not isinstance(message, dict):
                         raise RuntimeError("Harness 协议帧不是对象")
                     self._handle_message(message, frame_bytes=len(line))
-            except BaseException:
-                self._fail_waiters(SdkProtocolError("Harness 协议读取失败"))
+            except BaseException as exc:
+                from .harness_image_errors import HarnessRuntimeError
+                # 保留本地受控原因，不能把上游异常正文带进诊断。
+                self._fail_waiters(exc if isinstance(exc, HarnessRuntimeError)
+                                   else SdkProtocolError("Harness 协议读取失败"))
             finally:
                 self._fail_waiters(TransportClosedError("Harness 协议连接已关闭"))
 
@@ -288,9 +304,10 @@ def create_client(*, config: Any, owner: SyncOwner, launch_args: tuple[str, ...]
                     raise RuntimeError("Harness 通知缺少 params")
                 try:
                     self._notifications.put_sized(Notification(method=method, payload=payload),
-                        frame_bytes if frame_bytes is not None else len(encode_frame(message)))
+                        frame_bytes if frame_bytes is not None else len(encode_frame(message)), timeout=.5)
                 except queue.Full as exc:
-                    raise RuntimeError("Harness 事件队列溢出，运行失败") from exc
+                    from .harness_image_errors import HarnessRuntimeError
+                    raise HarnessRuntimeError("event_overflow") from exc
             else:
                 super()._handle_message(message)
 

@@ -20,6 +20,8 @@ test('finalized metadata-only assistant messages are removed', () => {
 });
 
 test('waiting, tool-only, thinking-only and attachment-only messages remain visible', () => {
+  assert.equal(shouldKeepChatMessage({ role: 'assistant', content: '', streaming: false,
+    error: 'Harness transport closed' }), true);
   assert.equal(shouldKeepChatMessage({
     role: 'assistant', content: '', streaming: true,
   }), true);
