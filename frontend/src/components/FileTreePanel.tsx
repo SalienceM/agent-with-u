@@ -30,6 +30,7 @@ import { StructuredFilePreview, type StructuredPreviewPayload } from './Structur
 import { MarkdownPreview } from './MarkdownPreview';
 import { AppModalPortal, WorkbenchInteractionContext } from './AppModalPortal';
 import { FileDeleteConfirmation } from './FileDeleteConfirmation';
+import { useFileTreeSelection } from '../hooks/useFileTreeSelection';
 import { useWindowWriteBlocked } from '../hooks/useWindowWriteBlocked';
 import type { ProvOpenResult } from '../types/prov';
 import {
@@ -705,8 +706,15 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   }, [transferKey, documentOwner]);
   const transfer = React.useSyncExternalStore(fileTransfers.subscribe, getTransferSnapshot);
   const [contextMenu, setContextMenu] = useState<FileContextMenu | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<{ node: TNode; scope: string; owner: string } | null>(null);
+  const canSelectForDelete = (node: TNode) => !!node.remote && !!node.rel && !isGitMetadataPath(node.rel);
+  const selectionDisabled = !sessionOnline || windowFrozen || !!transfer || !isVisible || !filesVisible;
+  const fileSelection = useFileTreeSelection<TNode>(treeScrollRef, canSelectForDelete, selectionDisabled);
+  useEffect(() => fileSelection.clear(), [searchQuery, onlyDifferent, fileSelection.clear]);
+  const [deleteTarget, setDeleteTarget] = useState<{ nodes: TNode[]; batch: boolean; scope: string; owner: string } | null>(null);
   const deleteTargetRef = useRef(deleteTarget);
+  const connectionOnlineRef = useRef(sessionOnline);
+  const deleteAvailableRef = useRef(false);
+  deleteAvailableRef.current = sessionOnline && !windowFrozen && isVisible && filesVisible;
   const cancelRemoteDelete = useCallback(() => { deleteTargetRef.current = null; setDeleteTarget(null); }, []);
   useEffect(() => {
     if (!isVisible || !filesVisible || !sessionOnline || windowFrozen) cancelRemoteDelete();
@@ -735,11 +743,16 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   useEffect(() => () => onAttentionChange?.(null), [onAttentionChange]);
 
   useEffect(() => {
+    const updateConnection = (online: boolean) => {
+      // 网络事件可先于 React 提交到达，批量下一项必须立即看到断线。
+      connectionOnlineRef.current = online;
+      setSessionOnline(online);
+    };
     if (!sessionId) {
-      setSessionOnline(api.isConnected());
-      return api.onConnectionStatus(setSessionOnline);
+      updateConnection(api.isConnected());
+      return api.onConnectionStatus(updateConnection);
     }
-    return api.onSessionConnectionStatus(sessionId, setSessionOnline);
+    return api.onSessionConnectionStatus(sessionId, updateConnection);
   }, [sessionId]);
 
   useEffect(() => {
@@ -1873,32 +1886,59 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     setBaseline(next);
   }, [localFs, workingDir, baselineLocalId]);
 
-  const deleteRemoteEntry = useCallback((node: TNode) => {
+  const requestRemoteDelete = (nodes: TNode[], batch = false) => {
     setContextMenu(null);
-    if (!node.remote || !node.rel || !workingDir || !sessionOnline || windowFrozen || fileTransfers.active(transferKey)) return;
-    const target = { node: { ...node }, scope: previewScope, owner: getCurrentUserProfile().userId };
+    if (!workingDir || !deleteAvailableRef.current || !connectionOnlineRef.current || fileTransfers.active(transferKey)) return;
+    const unique = new Map(nodes.filter(canSelectForDelete).map(node => [node.rel, node]));
+    // 目录已包含子项，冻结确认清单时去重，避免删完父目录后再删同一批子项。
+    const roots = [...unique.values()].filter(node => {
+      const parts = node.rel.split('/');
+      return !parts.slice(0, -1).some((_, index) => unique.get(parts.slice(0, index + 1).join('/'))?.isDir);
+    }).map(node => ({ ...node }));
+    if (!roots.length) return;
+    const target = { nodes: roots, batch, scope: previewScope, owner: getCurrentUserProfile().userId };
     deleteTargetRef.current = target;
     setDeleteTarget(target);
-  }, [workingDir, sessionOnline, windowFrozen, transferKey, previewScope]);
+  };
+  const deleteRemoteEntry = (node: TNode) => requestRemoteDelete([node]);
 
-  const confirmRemoteDelete = useCallback(async () => {
+  const confirmRemoteDelete = async () => {
     const target = deleteTargetRef.current;
     cancelRemoteDelete(); // 同一次确认只可消费一次，双击不能重复发送删除。
     if (!target || !mountedRef.current || target.scope !== previewScopeRef.current
       || target.owner !== getCurrentUserProfile().userId || !isVisible || !filesVisible
-      || !sessionOnline || windowFrozen || fileTransfers.active(transferKey)) return;
-    const node = target.node;
+      || !sessionOnline || !connectionOnlineRef.current || windowFrozen || fileTransfers.active(transferKey)) return;
     const current = () => mountedRef.current && target.scope === previewScopeRef.current
       && target.owner === getCurrentUserProfile().userId;
-    const job = fileTransfers.start(transferKey, (execLabel || execKey || '执行端') + ' · ' + (sessionId || workingDir), 'delete', node.rel);
+    const job = fileTransfers.start(transferKey, (execLabel || execKey || '执行端') + ' · ' + (sessionId || workingDir), 'delete', target.nodes[0].rel);
     if (!job) return;
+    const deleted: TNode[] = [];
+    let attempted = 0, failure = '';
     try {
-      const result = await api.syncDeleteEntry(workingDir, node.rel, node.isDir, execKey);
-      if (result.status !== 'ok') throw new Error(result.message || '删除失败');
-      const message = '已删除执行端：' + node.rel + '；本地副本保留，请重新比对后决定是否同步。';
-      fileTransfers.finish(job, message);
-      if (!current()) return;
-      const contains = (path: string) => path === node.rel || path.startsWith(node.rel + '/');
+      for (const node of target.nodes) {
+        if (!current() || !deleteAvailableRef.current || !connectionOnlineRef.current) throw new Error('会话、连接或操作权限已变化，已停止后续删除');
+        attempted++;
+        fileTransfers.progress(job, { ...job.progress, rel: node.rel, fileIndex: attempted, fileCount: target.nodes.length });
+        const result = await api.syncDeleteEntry(workingDir, node.rel, node.isDir, execKey);
+        if (result.status !== 'ok') throw new Error(`${node.rel}：${result.message || '删除失败'}`);
+        deleted.push(node);
+      }
+    } catch (error: any) {
+      failure = '删除失败或结果未确认：' + (error?.message || String(error)) + '。请刷新目录核实。';
+    }
+    const message = failure
+      ? `${target.batch ? `已删除 ${deleted.length}/${target.nodes.length} 项；未执行 ${target.nodes.length - attempted} 项。` : ''}${failure}`
+      : target.batch ? `已删除执行端 ${deleted.length} 项；本机副本保留。`
+        : '已删除执行端：' + target.nodes[0].rel + '；本地副本保留，请重新比对后决定是否同步。';
+    fileTransfers.finish(job, message, !!failure);
+    if (!current()) return;
+    if (deleted.length) {
+      const deletedPaths = new Map(deleted.map(node => [node.rel, node]));
+      const contains = (path: string) => {
+        if (deletedPaths.has(path)) return true;
+        const parts = path.split('/');
+        return parts.slice(0, -1).some((_, index) => deletedPaths.get(parts.slice(0, index + 1).join('/'))?.isDir);
+      };
       setRemoteManifest(current => current ? Object.fromEntries(Object.entries(current).filter(([path]) => !contains(path))) : null);
       setChildren(current => Object.fromEntries(Object.entries(current)
         .filter(([path]) => !contains(path))
@@ -1906,14 +1946,11 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
       setSelected(current => current && contains(current) ? null : current);
       setPreview(current => current && current.source === 'remote' && contains(current.rel) ? null : current);
       setSearchResults(current => current.filter(entry => !contains(entry.rel)));
-      setMsg({ kind: 'ok', text: message });
+      fileSelection.remove(contains);
       void gitRefreshRef.current?.();
-    } catch (error: any) {
-      const message = '删除失败或结果未确认：' + (error?.message || String(error)) + '。请刷新目录核实。';
-      if (current()) setMsg({ kind: 'err', text: message });
-      fileTransfers.finish(job, message, true);
     }
-  }, [workingDir, execKey, execLabel, sessionId, sessionOnline, transferKey, windowFrozen, isVisible, filesVisible, cancelRemoteDelete]);
+    setMsg({ kind: failure ? 'err' : 'ok', text: message });
+  };
 
   // 收集某节点下所有文件 rel(比对模式用远端清单;否则递归 listDirectory)
   const collectFiles = useCallback(async (node: TNode): Promise<string[]> => {
@@ -2714,6 +2751,12 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     return '📄';
   };
 
+  const selectionCheckbox = (node: TNode) => fileSelection.enabled && <input type="checkbox"
+    aria-label={`选择 ${node.rel}`} checked={fileSelection.checked.has(node.rel)}
+    disabled={selectionDisabled || !canSelectForDelete(node)}
+    style={{ flexShrink: 0, margin: '0 4px 0 0', accentColor: 'var(--theme-accent, #58a6ff)' }}
+    onChange={() => {}} onClick={event => { event.stopPropagation(); fileSelection.select(node, event.shiftKey); }} />;
+
   const renderDir = (rel: string, depth: number): React.ReactNode => {
     const nodes = mergedChildren(rel).filter((node) => {
       if (!onlyDifferent) return true;
@@ -2770,11 +2813,14 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
             ref={(element) => {
               if (element) rowRefs.current.set(n.rel, element);
               else rowRefs.current.delete(n.rel);
+              fileSelection.bind(n, element);
             }}
+            data-file-select={n.rel}
             tabIndex={-1}
-            className={`ftp-row${selected === n.rel ? ' ftp-sel' : ''}${focusFlash === n.rel ? ' ftp-focus-reveal' : ''}`}
+            className={`ftp-row${selected === n.rel ? ' ftp-sel' : ''}${focusFlash === n.rel ? ' ftp-focus-reveal' : ''}${fileSelection.checked.has(n.rel) ? ' ftp-checked' : ''}`}
             style={rowStyle}
-            onClick={() => {
+            onClick={event => {
+              if (fileSelection.enabled) { fileSelection.select(n, event.shiftKey); return; }
               setSelected(n.rel);
               if (n.typeConflict) {
                 setMsg({ kind: 'err', text: `${n.rel} 在一端是文件、另一端是目录，请先手动处理类型冲突` });
@@ -2782,7 +2828,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
                 n.isDir ? toggle(n) : openPreview(n);
               }
             }}
-            onDoubleClick={() => { if (!n.isDir && !n.typeConflict) openPreview(n); }}
+            onDoubleClick={() => { if (!fileSelection.enabled && !n.isDir && !n.typeConflict) openPreview(n); }}
             onContextMenu={(event) => {
               event.preventDefault();
               event.stopPropagation();
@@ -2799,8 +2845,11 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
                 ? `${n.name}\n${freshnessTooltip(freshness)}`
                 : st ? `${n.name} · ${STATUS_LABEL[st]}` : n.name}
           >
+            {selectionCheckbox(n)}
             {Array.from({ length: depth }).map((_, i) => <span key={i} style={guideStyle} />)}
-            <span style={chevronStyle}>{n.isDir ? (open ? '▾' : '▸') : ''}</span>
+            {fileSelection.enabled && n.isDir ? <button style={{ ...actBtnStyle, width: 14 }} aria-label={`${open ? '折叠' : '展开'} ${n.rel}`}
+              onClick={event => { event.stopPropagation(); toggle(n); }}>{open ? '▾' : '▸'}</button>
+              : <span style={chevronStyle}>{n.isDir ? (open ? '▾' : '▸') : ''}</span>}
             <span style={{ ...iconStyle, ...(st === 'cloud' ? { opacity: 0.85 } : {}) }}>{fileIcon(n, st)}</span>
             <span style={{ ...nameStyle, ...(st === 'cloud' ? { color: 'var(--theme-text-muted)' } : dotColor ? { color: dotColor } : {}) }}>{n.name}</span>
             {!n.isDir && n.sizeKnown && (
@@ -2899,6 +2948,8 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
         }
         .ftp-row:hover { background: var(--theme-bg-tertiary, rgba(255,255,255,0.05)); }
         .ftp-row.ftp-sel { background: var(--theme-accent-bg, rgba(9,105,218,0.12)); box-shadow: inset 2px 0 0 var(--theme-accent, #0969da); }
+        .ftp-row.ftp-checked { background: var(--theme-accent-bg, rgba(9,105,218,.22)); box-shadow: inset 2px 0 0 var(--theme-accent, #58a6ff); }
+        .ftp-selecting .ftp-act { display: none; }
         .ftp-row.ftp-focus-reveal { animation: ftp-focus-pulse .55s ease-in-out 2; }
         .ftp-row:focus { outline: 1px solid color-mix(in srgb, var(--theme-accent, #0969da) 42%, transparent); outline-offset: -1px; }
         .ftp-freshness {
@@ -2948,15 +2999,18 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
           title={gitPresentation.detail} onClick={event => openTool('git', event.currentTarget)}>{gitPresentation.label}</button>}
         {onlyDifferent && <button className="awu-wb-control" style={compactFilterButtonStyle} title="清除仅不同筛选"
           onClick={() => setOnlyDifferent(false)}>仅不同 {differentPaths.size} ×</button>}
+        <button className="awu-wb-control" style={compactFilterButtonStyle} aria-label={fileSelection.enabled ? '退出多选' : '多选文件'}
+          aria-pressed={fileSelection.enabled} title="勾选、Shift 连选或拖动框选" disabled={!!transfer}
+          onClick={fileSelection.toggle}>{fileSelection.enabled ? '完成' : '多选'}</button>
         <button className="awu-wb-control" style={compactIconButtonStyle} aria-label="刷新文件目录" title="刷新文件目录"
-          onClick={() => void runPanelAction('刷新目录中…', refreshAll)}>↻</button>
+          onClick={() => { fileSelection.clear(); void runPanelAction('刷新目录中…', refreshAll); }}>↻</button>
         <button className="awu-wb-control" style={compactIconButtonStyle} aria-label="更多文件工具" title="更多文件工具"
           onClick={event => openTool('more', event.currentTarget)}>•••</button>
       </div>
 
       {deleteTarget && deleteTarget.scope === previewScope && <FileDeleteConfirmation
-        path={deleteTarget.node.rel} workingDir={workingDir} executor={execLabel || execKey || '当前执行端'}
-        isDirectory={deleteTarget.node.isDir} onCancel={cancelRemoteDelete} onConfirm={() => void confirmRemoteDelete()} />}
+        entries={deleteTarget.nodes} batch={deleteTarget.batch} workingDir={workingDir} executor={execLabel || execKey || '当前执行端'}
+        onCancel={cancelRemoteDelete} onConfirm={() => void confirmRemoteDelete()} />}
 
       {draftRecoveryOpen && <Suspense fallback={null}><DocumentDraftRecovery owner={documentOwner}
         onClose={() => setDraftRecoveryOpen(false)} onExport={exportGeneratedText} /></Suspense>}
@@ -2989,6 +3043,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
               const result = searchResults[searchSelectedIndex];
               if (result) {
                 event.preventDefault();
+                if (fileSelection.enabled) { fileSelection.select(result, event.shiftKey); return; }
                 setSelected(result.rel);
                 void openPreview(result);
               }
@@ -3163,8 +3218,24 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
           </div>)}</div>}
       </div>}</WorkbenchPopover>
 
+      {fileSelection.enabled && <div role="toolbar" aria-label="文件批量操作" style={{ display: 'flex', alignItems: 'center', gap: 6,
+        flexWrap: 'wrap', padding: '5px 8px', flexShrink: 0, borderBottom: '1px solid var(--theme-border)', fontSize: 11 }}>
+        <span style={{ flex: 1 }} aria-live="polite">已选 {fileSelection.checked.size} 项</span>
+        <button style={compactFilterButtonStyle} disabled={selectionDisabled} onClick={fileSelection.selectAll} title="选择已展开、已显示的执行端条目">全选已显示</button>
+        <button style={compactFilterButtonStyle} disabled={selectionDisabled || !fileSelection.checked.size} onClick={fileSelection.clear}>清空</button>
+        <button style={{ ...compactFilterButtonStyle, color: '#f85149' }} aria-label="删除选中项" disabled={selectionDisabled || !fileSelection.checked.size}
+          onClick={() => requestRemoteDelete([...fileSelection.checked.values()], true)}>删除</button>
+      </div>}
+
       {/* ★ 文件树滚动区 */}
-      <div className="ftp-tree-scroll" ref={treeScrollRef} onScroll={event => { savedScrollTop.current = event.currentTarget.scrollTop; }} style={treeScrollStyle}>
+      <div className={`ftp-tree-scroll${fileSelection.enabled ? ' ftp-selecting' : ''}`} ref={treeScrollRef} {...fileSelection.handlers}
+        onKeyDown={event => {
+          if (!fileSelection.enabled || (event.target as HTMLElement).closest('input:not([type="checkbox"]),button,textarea')) return;
+          if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') { event.preventDefault(); fileSelection.selectAll(); }
+          if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); fileSelection.toggle(); }
+          if (event.key === 'Delete') { event.preventDefault(); requestRemoteDelete([...fileSelection.checked.values()], true); }
+        }}
+        onScroll={event => { savedScrollTop.current = event.currentTarget.scrollTop; }} style={treeScrollStyle}>
         {searchQuery.trim() ? (
           <div role="listbox" aria-label="文件搜索结果">
             {searchLoading && searchResults.length === 0 ? (
@@ -3180,14 +3251,17 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
                   ref={(element) => {
                     if (element) searchResultRefs.current.set(index, element);
                     else searchResultRefs.current.delete(index);
+                    fileSelection.bind(result, element);
                   }}
+                  data-file-select={result.rel}
                   role="option"
-                  aria-selected={index === searchSelectedIndex}
-                  className={`ftp-row${index === searchSelectedIndex ? ' ftp-sel' : ''}`}
+                  aria-selected={fileSelection.enabled ? fileSelection.checked.has(result.rel) : index === searchSelectedIndex}
+                  className={`ftp-row${index === searchSelectedIndex ? ' ftp-sel' : ''}${fileSelection.checked.has(result.rel) ? ' ftp-checked' : ''}`}
                   style={fileSearchResultStyle}
                   title={`${result.rel}\nEnter / 点击打开`}
                   onMouseEnter={() => setSearchSelectedIndex(index)}
-                  onClick={() => {
+                  onClick={event => {
+                    if (fileSelection.enabled) { fileSelection.select(result, event.shiftKey); return; }
                     setSearchSelectedIndex(index);
                     setSelected(result.rel);
                     void openPreview(result);
@@ -3202,6 +3276,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
                     });
                   }}
                 >
+                  {selectionCheckbox(result)}
                   <span style={iconStyle}>{fileIcon(result, st)}</span>
                   <span style={{ minWidth: 0, flex: 1 }}>
                     <span style={fileSearchNameStyle}>
@@ -3227,6 +3302,8 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
             })}
           </div>
         ) : renderDir('', 0)}
+        {fileSelection.box && <div aria-hidden="true" style={{ position: 'absolute', ...fileSelection.box, pointerEvents: 'none',
+          border: '1px solid var(--theme-accent, #58a6ff)', background: 'var(--theme-accent-bg, #58a6ff25)', boxSizing: 'border-box', zIndex: 2 }} />}
       </div>
 
       {visibleFeedback && <>
@@ -4437,7 +4514,7 @@ const actBtnStyle: React.CSSProperties = {
 // ── 文件树容器 & stash 样式 ───────────────────────────────────
 
 const treeScrollStyle: React.CSSProperties = {
-  flex: 1, overflow: 'auto', minHeight: 0,
+  flex: 1, overflow: 'auto', minHeight: 0, position: 'relative',
   padding: '2px 0',
 };
 
