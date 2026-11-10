@@ -77,6 +77,22 @@ class DependencyTests(unittest.TestCase):
 
 
 class IsolationTests(unittest.TestCase):
+    def test_failure_diagnostics_preserve_bounded_cause_without_probe_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            log = root / "home/.agent-with-u/backend.log"
+            log.parent.mkdir(parents=True)
+            token = "-fixture-private-probe-token"
+            log.write_text("old-output" * smoke.LIMIT + f"\nstartup failed: --auth-token={token}\n", encoding="utf-8")
+            probe = SimpleNamespace(proc=SimpleNamespace(returncode=2),
+                                    tails=[bytearray(), bytearray(f"token={token}".encode())])
+            result = smoke.failure_diagnostics(probe, root, token)
+            self.assertEqual(2, result["exitCode"])
+            self.assertIn("startup failed", result["entryLogTail"])
+            self.assertLessEqual(len(result["entryLogTail"]), 4000)
+            self.assertNotIn(token, json.dumps(result))
+            self.assertIn("[probe-token]", result["entryLogTail"])
+
     def test_isolation_and_root_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -140,6 +156,38 @@ class IsolationTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_token_beginning_with_dash_is_passed_as_a_value(self) -> None:
+        from src.ws_main import parse_args
+        token = "-fixture-probe-token"
+        async def start(command: list[str], env: dict[str, str], cwd: Path) -> None:
+            if "--agentwithu-package-check" in command:
+                return
+            # 冻结入口在正常参数解析前移除这个探针标记。
+            with patch.object(sys, "argv", [arg for arg in command if arg != "--agentwithu-package-probe"]):
+                try:
+                    args = parse_args()
+                except SystemExit as error:
+                    raise AssertionError("startup argument parsing failed") from error
+            self.assertEqual(token, args.auth_token)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "backend.exe"
+            binary.write_bytes(b"test-fixture")
+            component = SimpleNamespace(
+                proc=SimpleNamespace(returncode=0, wait=AsyncMock(return_value=0)),
+                readers=[], tails=[bytearray(b'{"ok":true,"version":"fixture"}'), bytearray()],
+                start=AsyncMock(side_effect=start), stop=AsyncMock(return_value=True))
+            startup = SimpleNamespace(proc=SimpleNamespace(returncode=None),
+                readers=[], tails=[bytearray(), bytearray()],
+                start=AsyncMock(side_effect=start), stop=AsyncMock(return_value=True))
+            with patch.object(smoke, "ProbeProcess", side_effect=[component, startup]), \
+                    patch.object(smoke.secrets, "token_urlsafe", return_value=token), \
+                    patch.object(smoke, "wait_ping", new_callable=AsyncMock) as ping:
+                result = await smoke.verify(binary)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(token, ping.call_args.args[2])
+            self.assertNotIn(token, json.dumps(result))
+
     async def test_real_child_cannot_write_production_home(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()

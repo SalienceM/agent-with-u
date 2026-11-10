@@ -170,6 +170,36 @@ async def wait_ping(probe: ProbeProcess, port: int, token: str, deadline: float)
     raise RuntimeError("startup-timeout")
 
 
+def failure_diagnostics(probe: ProbeProcess, root: Path, token: str) -> dict[str, Any]:
+    """临时探针目录删除前保留有界诊断；认证值不能进入构建日志。"""
+    details: dict[str, Any] = {"exitCode": getattr(probe.proc, "returncode", None)}
+
+    def retain(key: str, raw: bytes | bytearray) -> None:
+        text = raw.decode("utf-8", errors="replace")
+        if token:
+            text = text.replace(token, "[probe-token]")
+        if text.strip():
+            details[key] = text[-4000:]
+
+    for key, raw in zip(("stdoutTail", "stderrTail"), probe.tails):
+        retain(key, raw)
+    # 冻结桌面入口先重定向 stdout/stderr，argparse 错误也只会出现在这个隔离日志。
+    for key, relative in (
+        ("entryLogTail", "home/.agent-with-u/backend.log"),
+        ("backendLogTail", "appdata/AgentWithU/logs/backend.log" if os.name == "nt"
+         else "home/.agent-with-u/logs/backend.log"),
+    ):
+        path = root / relative
+        try:
+            with path.open("rb") as source:
+                source.seek(0, os.SEEK_END)
+                source.seek(max(0, source.tell() - LIMIT))
+                retain(key, source.read(LIMIT))
+        except OSError:
+            pass
+    return details
+
+
 async def verify(binary: Path, *, web: bool = False, timeout: float = 60) -> dict[str, Any]:
     report: dict[str, Any] = {"ok": False, "path": str(binary), "platform": sys.platform,
                               "stages": [], "failure": "missing-binary"}
@@ -183,6 +213,7 @@ async def verify(binary: Path, *, web: bool = False, timeout: float = 60) -> dic
         for stage in ("components", "startup"):
             probe = ProbeProcess()
             held: list[socket.socket] = []
+            token = ""
             try:
                 command = [str(binary), "--agentwithu-package-probe"]
                 if stage == "components":
@@ -190,8 +221,9 @@ async def verify(binary: Path, *, web: bool = False, timeout: float = 60) -> dic
                 else:
                     port, held = reserve_ports()
                     token = secrets.token_urlsafe(32)
+                    # URL-safe 随机值允许以 '-' 开头；用等号绑定，避免 argparse 当成选项。
                     command.extend(["--bind", "127.0.0.1", "--port", str(port),
-                                    "--auth-token", token])
+                                    f"--auth-token={token}"])
                     if web:
                         command.extend(["--web-port", str(port + 2)])
                     for item in held:
@@ -236,6 +268,7 @@ async def verify(binary: Path, *, web: bool = False, timeout: float = 60) -> dic
                 if not cleaned:
                     report["failure"] = "cleanup-unconfirmed"
             if not cleaned or not report["stages"][-2]["ok"]:
+                report["diagnostics"] = failure_diagnostics(probe, root, token)
                 return report
     if digest(binary) != before:
         report["failure"] = "artifact-changed"

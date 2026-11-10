@@ -11,7 +11,7 @@ from typing import Any
 
 from . import paths
 from .session_collaboration_store import CollaborationError, fingerprint, identifier
-from .task_git import TaskGit, canonical_path
+from .task_git import TaskGit, TaskRepositoryUnavailable, canonical_path
 from ..types import Session
 
 
@@ -229,8 +229,13 @@ class TaskWorkspaces:
             self._collaboration_scope(session_id)
             return json.dumps({'status': 'ready', **view, 'defaults': self._task_defaults(source),
                 'notice': '默认复制当前项目修改、新文件和项目 Skills；其他 Git 忽略文件（含缓存、依赖、构建产物）不复制。'}, ensure_ascii=False)
+        except TaskRepositoryUnavailable as error:
+            return json.dumps({'status': 'unavailable', 'reason': error.reason, 'notice': str(error),
+                               'preparation': error.preparation}, ensure_ascii=False)
         except (ValueError, OSError) as error:
-            return json.dumps({'status': 'unavailable', 'notice': str(error), 'preparation': '请在本项目终端显式初始化 Git 并完成首个提交，再重新检查；不会自动初始化或换节点。'}, ensure_ascii=False)
+            return json.dumps({'status': 'unavailable', 'reason': 'inspection_failed',
+                'notice': '暂时无法检查项目', 'preparation': '请查看详情，处理后重新检查。',
+                'detail': str(error)}, ensure_ascii=False)
 
     async def _rpc_taskWorkspacePlan(self, session_id: str, request_id: str, config_json: str) -> str:
         self._window_guard(session_id)

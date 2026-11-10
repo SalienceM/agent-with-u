@@ -153,9 +153,26 @@ class TaskWorkspaceTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_repository_and_authority_fields_fail_without_initializing(self):
         view = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main'))
         self.assertEqual(view['status'], 'unavailable'); self.assertFalse((self.project / '.git').exists())
+        self.assertEqual(view['reason'], 'not_git')
+        self.assertEqual(view['notice'], '当前项目尚未启用 Git')
+        self.assertNotIn('fatal:', json.dumps(view))
+        git = TaskGit(str(self.project)); git.run('init')
+        unborn = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main'))
+        self.assertEqual(unborn['reason'], 'no_commits')
+        self.assertNotIn('fatal:', json.dumps(unborn))
+        self.assertEqual(git.run('rev-parse', '--verify', '--quiet', 'HEAD', allowed=(0, 1)), b'')
         for extra in [{'node': 'other'}, {'agentSessionId': 'main-native'}, {'kitApprovalDelegation': True}]:
             with self.assertRaises(ValueError):
                 await self.bridge._rpc_taskWorkspacePlan('main', 'invalid', json.dumps({'title': 'task', **extra}))
+
+    async def test_inspection_error_does_not_instruct_git_initialization(self):
+        with patch.object(TaskGit, 'inspect', side_effect=OSError('fixture permission denied')):
+            view = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main'))
+        self.assertEqual(view['reason'], 'inspection_failed')
+        self.assertEqual(view['notice'], '暂时无法检查项目')
+        self.assertEqual(view['detail'], 'fixture permission denied')
+        self.assertNotIn('初始化', view['preparation'])
+        self.assertFalse((self.project / '.git').exists())
 
     async def test_discard_preview_is_durable_idempotent_and_never_touches_git(self):
         git = self.repository(); plan = await self.plan()

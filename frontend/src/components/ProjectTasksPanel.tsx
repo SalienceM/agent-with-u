@@ -19,6 +19,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
   const [open, setOpen] = useState(!!initialAction), [revision, setRevision] = useState(0), [rows, setRows] = useState<CollaborationSummary[]>([]);
   const [selected, setSelected] = useState(workspaceId || ''), [task, setTask] = useState<TaskWorkspace>();
   const [editing, setEditing] = useState(false), [busy, setBusy] = useState(false), [notice, setNotice] = useState('');
+  const [unavailable, setUnavailable] = useState<{ title: string; description: string; detail?: string }>();
   const [repo, setRepo] = useState<TaskRepository>(), [config, setConfig] = useState<TaskWorkspace['config']>({ title: '', goal: '', backendId, runtime: {}, constraints: '', skills: [], skipPermissions: false, includePaths: [] });
   const [uncertain, setUncertain] = useState(false), [readNonce, setReadNonce] = useState(0);
   const [mode, setMode] = useState<'tasks' | 'merge' | 'graph'>(initialAction === 'merge' ? 'merge' : 'tasks');
@@ -77,9 +78,14 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
   const newTask = () => void act(async () => {
     viewEpoch.current++;
     createdHere.current = '';
+    setUnavailable(undefined); setEditing(false);
     const identity = current.current; const result = await api.taskWorkspaceInspect(session, executor);
     if (identity !== current.current) return;
-    if (result.status !== 'ready') { setNotice([result.notice, result.preparation].filter(Boolean).join(' ')); return; }
+    if (result.status !== 'ready') {
+      setUnavailable(result.reason ? { title: result.notice, description: result.preparation || '', detail: result.detail }
+        : { title: '暂时无法创建分支副本', description: '请查看详情，处理后重新检查。', detail: result.notice });
+      return;
+    }
     if (!result.defaults) { setNotice('该执行节点尚不支持继承配置的分支副本，请更新节点后再创建。'); return; }
     setRepo(result); setConfig({ ...result.defaults, includePaths: result.dirty.filter(row => !row.blocked).map(row => row.path) });
     setEditing(true); setUncertain(false);
@@ -114,7 +120,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
     setTask(plan); setSelected(plan.id); setEditing(false); setRevision(n => n + 1);
     await submitCreate(plan, epoch);
   });
-  const shown = task?.id === selected ? task : undefined;
+  const shown = !unavailable && task?.id === selected ? task : undefined;
   const discardPreview = () => void act(async () => {
     if (!shown || shown.status !== 'preview' || uncertain) return;
     const identity = current.current; setUncertain(true);
@@ -131,7 +137,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
     createdHere.current = '';
     onOpenSession(shown.sessionId); setOpen(false); onClose?.();
   }, [open, editing, mode, initialAction, shown, onOpenSession, onClose]);
-  const creationView = mode === 'tasks' && (initialAction === 'create' || editing || shown?.status === 'preview' || !!shown && shown.id === createdHere.current);
+  const creationView = mode === 'tasks' && (!!unavailable || initialAction === 'create' || editing || shown?.status === 'preview' || !!shown && shown.id === createdHere.current);
   const createBlocked = busy || uncertain || (editing && (!config.title.trim() || !runtimeBackend || runtimeBackend.enabled === false || config.snapshotMode === 'current' && !!repo?.dirty.some(row => !!row.blocked)));
   const checkStatus = () => { setRevision(n => n + 1); setReadNonce(n => n + 1); };
   return <>
@@ -150,7 +156,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
         {creationView ? <header style={{ ...workflowHeaderStyle, padding: '20px 24px', justifyContent: 'space-between' }}>
           <h2 style={{ fontSize: 18, lineHeight: 1.4, margin: 0 }}>新建分支副本</h2>
           <WorkflowButton tone="quiet" icon="close" aria-label="返回对话" title="关闭" onClick={close} style={{ minHeight: 36, width: 36, padding: 0 }} />
-          <p style={{ width: '100%', margin: 0, color: 'var(--theme-text-muted, #687487)' }}>从当前项目开启新对话，目录和分支自动分配。</p>
+          {!unavailable && <p style={{ width: '100%', margin: 0, color: 'var(--theme-text-muted, #687487)' }}>从当前项目开启新对话，目录和分支自动分配。</p>}
         </header> : <header style={workflowHeaderStyle}><strong style={{ flex: 1, fontWeight: 600, whiteSpace: 'nowrap' }}>分支与合并</strong>
           <WorkflowButton tone="quiet" aria-pressed={mode === 'tasks'} onClick={() => setMode('tasks')}>副本</WorkflowButton><WorkflowButton tone="quiet" aria-label={mergeTarget ? '合并与同步' : '合并记录'} title={mergeTarget ? '合并与同步' : '合并记录'} aria-pressed={mode === 'merge'} onClick={() => setMode('merge')}>合并请求</WorkflowButton>
           <WorkflowButton tone="quiet" aria-pressed={mode === 'graph'} onClick={() => setMode('graph')}>分支</WorkflowButton>
@@ -166,7 +172,10 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
           onOpenOrigin={(origin, operation, parent) => setMergeContext({ session: origin, operation, target: parent || (origin === session ? mergeTarget : undefined) })}
           onOpenSession={id => { onOpenSession?.(id); close(); }} /> : <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
           <section aria-label="当前分支副本" style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: creationView ? 24 : 20 }}>
-            {editing && repo ? <TaskWorkspaceForm config={config} repo={repo} backends={backends} executor={executor}
+            {unavailable ? <WorkflowEmptyState icon="branch" title={unavailable.title}>
+              <span role="status">{unavailable.description}</span>
+              {unavailable.detail && <details style={{ marginTop: 12, textAlign: 'left', overflowWrap: 'anywhere' }}><summary>查看详情</summary>{unavailable.detail}</details>}
+            </WorkflowEmptyState> : editing && repo ? <TaskWorkspaceForm config={config} repo={repo} backends={backends} executor={executor}
               busy={busy} setConfig={setConfig} onPreview={preview} /> : shown ? <>
               <h3 style={{ margin: '0 0 12px', fontSize: 16, overflowWrap: 'anywhere' }}>{shown.title} · {statusLabel[shown.status] || shown.status}</h3>
               <div style={{ display: 'grid', gap: 8, marginBottom: 16 }}>
@@ -200,11 +209,12 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
           </section>
         </div>}
         {creationView && <footer style={{ flexShrink: 0, padding: '16px 24px', borderTop: '1px solid var(--theme-border, #dce1e8)' }}>
-          <p style={{ margin: '0 0 12px', fontSize: 12, color: 'var(--theme-text-muted, #687487)' }}>创建后进入新对话，由你发送消息开始。</p>
+          {!unavailable && <p style={{ margin: '0 0 12px', fontSize: 12, color: 'var(--theme-text-muted, #687487)' }}>创建后进入新对话，由你发送消息开始。</p>}
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, flexWrap: 'wrap' }}>
             {(uncertain || shown?.status === 'creating' || shown?.status === 'unknown') && <WorkflowButton icon="refresh" onClick={checkStatus} style={copyActionStyle}>核对副本状态</WorkflowButton>}
             {!editing && shown?.status === 'preview' && <WorkflowButton disabled={busy || uncertain} onClick={() => { setRepo(shown.repository); setConfig(shown.config); setEditing(true); }} style={copyActionStyle}>修改配置</WorkflowButton>}
-            <WorkflowButton onClick={close} style={copyActionStyle}>{shown?.status === 'creating' || uncertain ? '关闭' : '取消'}</WorkflowButton>
+            <WorkflowButton onClick={close} style={copyActionStyle}>{unavailable ? '知道了' : shown?.status === 'creating' || uncertain ? '关闭' : '取消'}</WorkflowButton>
+            {unavailable && <WorkflowButton icon="refresh" disabled={busy} onClick={newTask} style={copyActionStyle}>重新检查</WorkflowButton>}
             {(editing || shown?.status === 'preview') && <WorkflowButton tone="primary" disabled={createBlocked} onClick={create} style={copyActionStyle}>{busy ? '正在创建…' : '创建副本'}</WorkflowButton>}
           </div>
           {!editing && shown?.status === 'preview' && <WorkflowButton tone="quiet" disabled={busy || uncertain} onClick={discardPreview} style={{ marginTop: 10 }}>移除预览</WorkflowButton>}

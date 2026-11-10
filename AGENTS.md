@@ -2152,6 +2152,11 @@ against its frozen snapshot, retaining the artifact/old validation and never cal
 `task_git.py` / `task_workspaces.py` create unique managed branches/worktrees using fixed argv and
 private-index selected-path snapshots. Source index/HEAD/files are not mutated. Credentials,
 links, external objects, oversized files and unsupported repositories are rejected.
+Inspection checks repository identity before local filter configuration. Missing Git, non-Git
+folders and repositories without commits return distinct prerequisite states; the copy dialog
+shows a short explanation and explicit recheck, without initializing or committing automatically.
+Other inspection failures retain technical details on demand and never suggest Git initialization
+as a generic fix for permissions or repository errors.
 Git metadata checks use bounded `scandir` with no-follow entry attributes and directory-boundary
 ancestor checks; never re-walk all ancestors per loose object. Overlapping common/git directories
 are scanned once per check. The 20000-entry and 8-second guards remain, with distinct diagnostic

@@ -56,6 +56,58 @@ async function mount(page: Page, width = 1200, sidebar = false, integration = fa
   }, { sidebar, integration });
 }
 
+for (const width of [1280, 390]) test(`non Git project shows a normal prerequisite and rechecks without creating (${width})`, async ({ page }, testInfo) => {
+  await mount(page, width);
+  await page.evaluate(async () => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const f = (window as any).taskFixture;
+    f.restoreInspect = api.taskWorkspaceInspect;
+    api.taskWorkspaceInspect = async () => {
+      f.inspect++;
+      return { status: 'unavailable', reason: 'not_git', notice: '当前项目尚未启用 Git',
+        preparation: '分支副本需要 Git。启用 Git 并完成首次提交后，即可创建。' } as any;
+    };
+  });
+  await page.getByRole('button', { name: '分支副本与合并', exact: true }).click();
+  await page.getByRole('button', { name: '新建分支副本', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '分支副本', exact: true });
+  await expect(dialog).toContainText('当前项目尚未启用 Git');
+  await expect(dialog).not.toContainText('独立分支，并行开发');
+  await expect(dialog).not.toContainText('fatal:');
+  await expect(dialog).not.toContainText('目录和分支自动分配');
+  await expect(dialog.getByRole('button', { name: '创建副本', exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: '知道了', exact: true })).toBeVisible();
+  expect(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth)).toBeTruthy();
+  await page.screenshot({ path: testInfo.outputPath(`non-git-${width}.png`), fullPage: true });
+  await page.evaluate(async () => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    api.taskWorkspaceInspect = (window as any).taskFixture.restoreInspect;
+  });
+  await dialog.getByRole('button', { name: '重新检查', exact: true }).click();
+  await expect(page.getByLabel('副本名称', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => {
+    const f = (window as any).taskFixture;
+    return { reads: f.inspect, plans: f.plans.length, creates: f.created.length, starts: f.started.length };
+  })).toEqual({ reads: 2, plans: 0, creates: 0, starts: 0 });
+});
+
+test('inspection failures keep technical output in optional details', async ({ page }) => {
+  await mount(page);
+  await page.evaluate(async () => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    api.taskWorkspaceInspect = async () => ({ status: 'unavailable', reason: 'inspection_failed',
+      notice: '暂时无法检查项目', preparation: '请查看详情，处理后重新检查。', detail: 'fatal: fixture permission denied' } as any);
+  });
+  await page.getByRole('button', { name: '分支副本与合并', exact: true }).click();
+  await page.getByRole('button', { name: '新建分支副本', exact: true }).click();
+  await expect(page.getByText('暂时无法检查项目', { exact: true })).toBeVisible();
+  const details = page.getByRole('dialog').locator('details');
+  await expect(details).not.toHaveAttribute('open');
+  await details.locator('summary').click();
+  await expect(details).toHaveAttribute('open');
+  await expect(details).toContainText('fixture permission denied');
+});
+
 for (const width of [1280, 390]) test(`compact copy form creates in one click with automatic directory (${width})`, async ({ page }, testInfo) => {
   await mount(page, width);
   await page.evaluate(async dark => {

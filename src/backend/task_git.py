@@ -84,12 +84,19 @@ def _check_git_metadata(*roots: str) -> None:
     check_deadline()
 
 
+class TaskRepositoryUnavailable(CollaborationError):
+    def __init__(self, reason: str, notice: str, preparation: str) -> None:
+        super().__init__(notice)
+        self.reason = reason
+        self.preparation = preparation
+
+
 class TaskGit:
     def __init__(self, root: str) -> None:
         self.root = canonical_path(root)
         self.executable = shutil.which('git')
         if not self.executable:
-            raise CollaborationError('本节点未安装 Git')
+            raise TaskRepositoryUnavailable('git_missing', '执行设备尚未安装 Git', '安装 Git 后，可重新检查。')
         binary = Path(self.executable).resolve()
         if Path(self.root) in binary.parents or os.name == 'nt' and binary.suffix.lower() != '.exe':
             raise CollaborationError('Git 启动程序不可信')
@@ -146,14 +153,22 @@ class TaskGit:
                           for value in ('-c', name + '.' + prop)]
 
     def repository(self) -> dict[str, Any]:
-        root = canonical_path(self.run('rev-parse', '--show-toplevel').decode('utf-8').strip())
+        try:
+            root = canonical_path(self.run('rev-parse', '--show-toplevel').decode('utf-8').strip())
+        except CollaborationError as error:
+            if 'not a git repository' in str(error).lower():
+                raise TaskRepositoryUnavailable('not_git', '当前项目尚未启用 Git',
+                    '分支副本需要 Git。启用 Git 并完成首次提交后，即可创建。') from error
+            raise
         if root != self.root:
             raise CollaborationError('请选择 Git 仓库根目录：' + root)
         common_value = Path(self.run('rev-parse', '--git-common-dir').decode('utf-8').strip())
         common = canonical_path(common_value if common_value.is_absolute() else Path(self.root) / common_value)
         git_dir = canonical_path(self.run('rev-parse', '--absolute-git-dir').decode('utf-8').strip())
         _check_git_metadata(common, git_dir)
-        head = self.run('rev-parse', '--verify', 'HEAD^{commit}').decode().strip()
+        head = self.run('rev-parse', '--verify', '--quiet', 'HEAD^{commit}', allowed=(0, 1)).decode().strip()
+        if not head and not self.run('rev-parse', '--verify', '--quiet', 'HEAD', allowed=(0, 1)).strip():
+            raise TaskRepositoryUnavailable('no_commits', '当前项目还没有 Git 提交', '完成首次提交后，即可创建分支副本。')
         if not OID.fullmatch(head):
             raise CollaborationError('没有可用基线提交，请先明确准备仓库')
         branch = self.run('symbolic-ref', '--quiet', '--short', 'HEAD', allowed=(0, 1)).decode('utf-8').strip()
@@ -189,8 +204,9 @@ class TaskGit:
         return rows
 
     def inspect(self) -> dict:
+        repo = self.repository()
         self.disable_filters()
-        repo = self.repository(); dirty = self.dirty()
+        dirty = self.dirty()
         self.run('worktree', 'list', '--porcelain')
         view = {**repo, 'dirty': dirty}
         view['fingerprint'] = fingerprint(view)

@@ -4904,7 +4904,7 @@ export const api = {
   async projectTransferList(executor: string, session: string): Promise<{ items: { id: string; status: string }[] }> {
     return collaborationCall(executor, 'projectTransferList', [session]);
   },
-  async taskWorkspaceInspect(session: string, executor: string): Promise<import('./types/taskWorkspaces').TaskRepository & { status: string; notice: string; preparation?: string }> {
+  async taskWorkspaceInspect(session: string, executor: string): Promise<import('./types/taskWorkspaces').TaskRepository & { status: string; notice: string; preparation?: string; reason?: string; detail?: string }> {
     return collaborationCall(executor, 'taskWorkspaceInspect', [session]);
   },
   async taskWorkspacePlan(session: string, executor: string, request: string, config: unknown): Promise<import('./types/taskWorkspaces').TaskWorkspace> {
