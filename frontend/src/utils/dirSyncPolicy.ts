@@ -12,7 +12,7 @@ function wildcardToRegExp(pat: string): RegExp {
 }
 
 export function isGitMetadataPath(rel: string): boolean {
-  return rel.replace(/\\/g, '/').split('/').filter(Boolean).includes('.git');
+  return rel.replace(/\\/g, '/').split('/').filter(Boolean).some(p => p.toLowerCase() === '.git');
 }
 
 /** 对旧执行端返回的清单也执行客户端兜底过滤，避免协议降级重新带入 .git。 */
@@ -30,7 +30,7 @@ export function filterGitMetadata<T>(
 export function isIgnored(rel: string, patterns: string[], includeGit = false): boolean {
   const r = rel.replace(/\\/g, '/');
   const segs = r.split('/').filter(Boolean);
-  if (segs.includes('.git')) return !includeGit;
+  if (segs.some(p => p.toLowerCase() === '.git')) return !includeGit;
   for (const pat of patterns) {
     const p = pat.trim().replace(/\/+$/, '');
     if (!p) continue;

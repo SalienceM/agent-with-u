@@ -12,7 +12,7 @@ from typing import Any
 import uuid
 
 PROTOCOL_VERSION = 1
-ACTIVITY_KINDS = frozenset({'document-save', 'sync-review', 'terminal', 'language-write'})
+ACTIVITY_KINDS = frozenset({'document-save', 'sync-review', 'directory-transfer', 'terminal', 'language-write'})
 
 
 @dataclass(frozen=True)

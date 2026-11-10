@@ -786,6 +786,7 @@ from .loop_control_bridge import LoopControlBridge
 from .engine_workbench import EngineWorkbenchBridge, WorkbenchError
 from .workspace_document_bridge import WorkspaceDocumentBridge
 from .sync_review_bridge import SyncReviewBridge
+from .directory_transfer_bridge import DirectoryTransferBridge
 from .workbench_windows import WorkbenchWindowBridge, WINDOW_REQUEST
 from .workbench_stream import WorkbenchStreamBridge
 from .workspace_terminals import TerminalBridge
@@ -808,7 +809,7 @@ from .loop_milestones import (MILESTONE_INSTRUCTIONS, register_plan, review_mile
                               milestone_progress, inherit_plan)
 
 
-class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, KitRunApprovalBridge, AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, SyncReviewBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
+class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, KitRunApprovalBridge, AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, SyncReviewBridge, DirectoryTransferBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
     def __init__(self, cli_path: Optional[str] = None, auth_guard: Optional["AuthGuard"] = None):
@@ -2024,7 +2025,7 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         observation_methods = {'ping', 'sessionWorkbenchCapabilities', 'loadSessionMeta', 'listSessions',
             'sessionScheduleList', 'sessionScheduleGet', 'sessionSchedulePreview',
             'sessionScheduleRequestStatus', 'sessionScheduleOccurrences', 'sessionScheduleOutput'}
-        collaboration_independent = {'projectTransferCapabilities', 'projectTransferExport', 'projectTransferFinish', 'projectTransferStatus', 'projectTransferList', 'projectTransferPlan',
+        collaboration_independent = {'syncTransferConfig', 'syncTransferPlan', 'syncTransferStatus', 'projectTransferCapabilities', 'projectTransferExport', 'projectTransferFinish', 'projectTransferStatus', 'projectTransferList', 'projectTransferPlan',
             'sessionCollaborationList', 'sessionCollaborationGet', 'sessionCollaborationRequestStatus',
             'reviewStatus', 'reviewTargets', 'reviewSnapshot', 'reviewSummarize', 'userInteractionList', 'userInteractionRespond',
             'taskWorkspaceInspect', 'taskWorkspacePlan', 'taskWorkspaceStatus', 'projectBufferReply', 'projectBufferState',
@@ -2222,7 +2223,7 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         if project_directory:
             self._project_check_write(working_dir=project_directory)
         if sid and method in {
-                'workspaceDocumentSave', 'syncReviewApply', 'terminalCreate', 'terminalInput', 'terminalResize', 'terminalStop',
+                'workspaceDocumentSave', 'syncReviewApply', 'syncTransferCommit', 'terminalCreate', 'terminalInput', 'terminalResize', 'terminalStop',
                 'languageServiceStart', 'languageServiceRequest', 'languageServiceStop',
                 'steerMessage', 'redirectMessage', 'steerSeqTask', 'seqtaskAdd', 'seqtaskEdit',
                 'seqtaskRemove', 'seqtaskReorder', 'seqtaskSetAuto', 'seqtaskTakeNext', 'seqtaskClear',

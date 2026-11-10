@@ -4280,6 +4280,15 @@ export const api = {
   },
 
   // ── 目录同步：远端工作目录 ↔ 本机副本目录 ──────────────────
+  async directoryTransferCall(executor: string, method: 'Config' | 'Plan' | 'Chunk' | 'Commit' | 'Status' | 'Cancel', args: unknown[]): Promise<any> {
+    const value = await collaborationCall<any>(executor, 'syncTransfer' + method, args, ['Plan', 'Commit'].includes(method) ? 120000 : 30000);
+    if (!value || value.status !== 'ok') {
+      const error = new Error(value?.message || '执行端不支持完整传输检查，请更新 AWU');
+      if (value?.status === 'error') Object.assign(error, { transferRejected: true });
+      throw error;
+    }
+    return value;
+  },
   // 这些操作的是某个执行节点上的工作目录,而参数是路径(不是 sessionId,无法被
   // 自动路由)。所以显式带上该会话的 execKey,把请求发到它归属的节点;缺省回落
   // home(向后兼容)。

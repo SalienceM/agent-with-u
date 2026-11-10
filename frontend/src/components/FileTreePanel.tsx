@@ -31,6 +31,8 @@ import { MarkdownPreview } from './MarkdownPreview';
 import { AppModalPortal, WorkbenchInteractionContext } from './AppModalPortal';
 import { FileDeleteConfirmation } from './FileDeleteConfirmation';
 import { useFileTreeSelection } from '../hooks/useFileTreeSelection';
+import { DirectoryTransferDialog } from './DirectoryTransferDialog';
+import type { DirectoryTransferInput } from '../utils/checkedDirectoryTransfer';
 import { useWindowWriteBlocked } from '../hooks/useWindowWriteBlocked';
 import type { ProvOpenResult } from '../types/prov';
 import {
@@ -711,6 +713,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   const fileSelection = useFileTreeSelection<TNode>(treeScrollRef, canSelectForDelete, selectionDisabled);
   useEffect(() => fileSelection.clear(), [searchQuery, onlyDifferent, fileSelection.clear]);
   const [deleteTarget, setDeleteTarget] = useState<{ nodes: TNode[]; batch: boolean; scope: string; owner: string } | null>(null);
+  const [directoryTransfer, setDirectoryTransfer] = useState<DirectoryTransferInput | null>(null);
   const deleteTargetRef = useRef(deleteTarget);
   const connectionOnlineRef = useRef(sessionOnline);
   const deleteAvailableRef = useRef(false);
@@ -2120,127 +2123,17 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     finally { fileTransfers.finish(job, outcome, failed); }
   }, [localFs, workingDir, execKey, collectFiles, bumpBaseline, remoteManifest, sessionOnline, includeGitMetadata, transferKey, execLabel, sessionId]);
 
-  // ⬆ 上传本地改动(本地→云端)
-  const push = useCallback(async (node: TNode) => {
-    if (!localFs || !workingDir || !localManifest) return;
-    if (!sessionOnline) { setMsg({ kind: 'err', text: '当前离线；修改已保留在平板，恢复连接后再上传' }); return; }
-    const job = fileTransfers.start(transferKey, (execLabel || execKey || '执行端') + ' · ' + (sessionId || workingDir), 'push', node.rel);
-    if (!job) return;
-    const transferAbortRef = job.abort;
-    let outcome = '';
-    let failed = false;
-    const report = (message: { kind: 'ok' | 'err'; text: string }) => {
-      outcome = message.text;
-      failed = message.kind === 'err';
-      setMsg(message);
-    };
-    const setTransfer = (progress: TransferProgress) => fileTransfers.progress(job, progress);
-    setMsg(null);
-    try {
-      const prefix = node.rel ? `${node.rel}/` : '';
-      const rels = node.isDir ? Object.keys(localManifest).filter((r) => !node.rel || r === node.rel || r.startsWith(prefix)) : [node.rel];
-      if (node.isDir && !window.confirm(`把本地「${node.name || '根'}」下的 ${rels.length} 个文件上传到远端？`)) return;
-      const sizes: Record<string, number> = {};
-      for (const rel of rels) sizes[rel] = localManifest[rel]?.size ?? await localFs.fileSize(rel);
-      const totalBytes = rels.reduce((sum, rel) => sum + sizes[rel], 0);
-      const ok: string[] = [];
-      const fileProgress = new Map<string, number>();
-      const startedAt = Date.now();
-      let doneBytes = 0;
-      let lastProgressPaint = 0;
-      let latestProgress: { rel: string; index: number; fileBytes: number; activeCount: number } | null = null;
-      const applyUploaded = async () => {
-        if (ok.length === 0) return;
-        bumpBaseline(ok, localManifest);
-        setRemoteManifest((prev) => {
-          if (!prev) return prev;
-          const next = { ...prev };
-          for (const rel of ok) if (localManifest[rel]) next[rel] = localManifest[rel];
-          return next;
-        });
-
-        // 不重扫所有已展开目录；只刷新本次节点的直接可见层，
-        // 让新上传的文件/目录立即显示，更深层仍由懒加载按需读取。
-        const parts = node.rel.split('/').filter(Boolean);
-        const parent = parts.slice(0, -1).join('/');
-        const visibleLevels = new Set<string>([parent]);
-        if (node.isDir && expanded[node.rel]) visibleLevels.add(node.rel);
-        await Promise.all([...visibleLevels].map((rel) => loadChildren(rel)));
-        void gitRefreshRef.current?.();
-      };
-      const paintProgress = (force = false) => {
-        if (!latestProgress) return;
-        const now = Date.now();
-        if (!force && now - lastProgressPaint < 80) return;
-        lastProgressPaint = now;
-        const { rel, index, fileBytes, activeCount } = latestProgress;
-        setTransfer({
-          direction: 'push', rel, fileIndex: index + 1, fileCount: rels.length,
-          fileBytes, fileSize: sizes[rel], doneBytes, totalBytes, activeCount, startedAt,
-        });
-      };
-      const publish = (rel: string, index: number, fileBytes: number, activeCount: number) => {
-        const previous = fileProgress.get(rel) || 0;
-        fileProgress.set(rel, fileBytes);
-        doneBytes += Math.max(0, fileBytes - previous);
-        latestProgress = { rel, index, fileBytes, activeCount };
-        paintProgress();
-      };
-
-      for (let batchStart = 0; batchStart < rels.length; batchStart += TRANSFER_FILE_CONCURRENCY) {
-        const batch = rels.slice(batchStart, batchStart + TRANSFER_FILE_CONCURRENCY);
-        const settled = await Promise.allSettled(batch.map(async (rel, batchIndex) => {
-          const index = batchStart + batchIndex;
-          const size = sizes[rel];
-          const id = transferId();
-          if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
-          publish(rel, index, 0, batch.length);
-          const start = await api.syncWriteStart(workingDir, rel, id, execKey);
-          if (start.status !== 'ok') throw new Error(start.message || `无法开始上传：${rel}`);
-          let offset = 0;
-          try {
-            while (offset < size) {
-              if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
-              const requestSize = Math.min(TRANSFER_CHUNK_SIZE, size - offset);
-              const data = await localFs.readChunk(rel, offset, requestSize);
-              const result = await api.syncWriteChunk(workingDir, rel, id, offset, data, execKey);
-              if (result.status !== 'ok') throw new Error(result.message || `上传失败：${rel}`);
-              const chunkBytes = result.written ?? requestSize;
-              if (chunkBytes <= 0) throw new Error(`上传返回空分块：${rel}`);
-              offset += chunkBytes;
-              publish(rel, index, offset, batch.length);
-            }
-            if (transferAbortRef.current) throw new Error('__TRANSFER_CANCELLED__');
-            const finish = await api.syncWriteFinish(workingDir, rel, id, size, execKey);
-            if (finish.status !== 'ok') throw new Error(finish.message || `上传完成校验失败：${rel}`);
-            publish(rel, index, size, batch.length);
-            ok.push(rel);
-          } catch (error) {
-            await api.syncWriteAbort(workingDir, rel, id, execKey).catch(() => {});
-            throw error;
-          }
-        }));
-        const failed = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
-        if (failed) {
-          await applyUploaded();
-          throw failed.reason;
-        }
-        if (transferAbortRef.current) {
-          await applyUploaded();
-          throw new Error('__TRANSFER_CANCELLED__');
-        }
-      }
-
-      paintProgress(true);
-      await applyUploaded();
-      // 合并树会依据上面的 remoteManifest 增量立刻更新，无需在传输完成后
-      // 再对所有已展开目录发一轮 listDirectory RPC。
-      report({ kind: 'ok', text: `✓ 已上传 ${ok.length}/${rels.length} 个文件到远端` });
-    } catch (e: any) {
-      report({ kind: 'err', text: e?.message === '__TRANSFER_CANCELLED__' ? '上传已取消，未完成文件不会覆盖远端原文件' : `上传失败：${e?.message ?? e}` });
-    }
-    finally { fileTransfers.finish(job, outcome, failed); }
-  }, [localFs, workingDir, execKey, localManifest, bumpBaseline, expanded, loadChildren, sessionOnline, transferKey, execLabel, sessionId]);
+  const push = useCallback((node: TNode, mirror = false) => {
+    if (!localFs || !workingDir || !sessionId || !sessionOnline || windowFrozen || fileTransfers.active(transferKey)) return;
+    const executor = execKey || getSessionExecKey(sessionId);
+    if (!executor) return;
+    const scopeIdentity = previewScope;
+    setDirectoryTransfer({ executor, session: sessionId, workingDir, fs: localFs, scope: node.rel,
+      directory: node.isDir, mirror, includeGit: mirror ? false : includeGitMetadata, transferKey,
+      label: (execLabel || executor) + ' ? ' + sessionId,
+      current: () => mountedRef.current && previewScopeRef.current === scopeIdentity && localFsRef.current === localFs,
+    });
+  }, [localFs, workingDir, sessionId, sessionOnline, windowFrozen, transferKey, execKey, execLabel, previewScope, includeGitMetadata]);
 
   /** 为浏览器预览分块取回二进制，绕开旧的 32 MiB 整文件 WS 帧并实时反馈读取进度。 */
   const readPreviewBytes = useCallback(async (
@@ -3011,6 +2904,12 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
       {deleteTarget && deleteTarget.scope === previewScope && <FileDeleteConfirmation
         entries={deleteTarget.nodes} batch={deleteTarget.batch} workingDir={workingDir} executor={execLabel || execKey || '当前执行端'}
         onCancel={cancelRemoteDelete} onConfirm={() => void confirmRemoteDelete()} />}
+      {directoryTransfer && directoryTransfer.current() && <DirectoryTransferDialog input={directoryTransfer} focusTarget={searchInputRef.current}
+        onClose={() => setDirectoryTransfer(null)} onChanged={() => {
+          if (!directoryTransfer.current()) return;
+          setRemoteManifest(null); setSyncReview(null); setReviewView(null);
+          void refreshAll();
+        }} />}
 
       {draftRecoveryOpen && <Suspense fallback={null}><DocumentDraftRecovery owner={documentOwner}
         onClose={() => setDraftRecoveryOpen(false)} onExport={exportGeneratedText} /></Suspense>}
@@ -3144,6 +3043,9 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
           <button style={localDirButtonStyle} disabled={!syncReview || comparing} title={reviewUnavailable || '先显式比对，再逐个审阅差异'}
             onClick={event => { setReviewView({ subtree: '', onlyDifferent, trigger: tool?.anchor || event.currentTarget }); closeSync(); }}>审阅差异 {syncReview ? reviewCount : ''}</button>
           {reviewUnavailable && <span role="status" style={{ fontSize: 11 }}>{reviewUnavailable}</span>}
+          <button style={localDirButtonStyle} disabled={!localFs || !sessionOnline || !!transfer || windowFrozen} onClick={() => {
+            closeSync(); push({ name: '根目录', rel: '', isDir: true, size: 0, local: true });
+          }}>上传变化 / 镜像同步</button>
           {!isTauri() && (
             <>
               <input
@@ -3390,6 +3292,10 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
             {isRemote && localFs && !gitTransferBlocked && n.local && !n.typeConflict && (n.isDir || st !== 'synced') && (
               <button style={{ ...contextItemStyle, ...((!sessionOnline || transfer) ? contextDisabledStyle : {}) }} disabled={!sessionOnline || !!transfer}
                 onClick={() => { setContextMenu(null); push(n); }}>⬆️ 上传到执行端</button>
+            )}
+            {isRemote && localFs && n.isDir && !isGitMetadataPath(n.rel) && !n.typeConflict && (
+              <button style={{ ...contextItemStyle, ...((!sessionOnline || transfer) ? contextDisabledStyle : {}) }} disabled={!sessionOnline || !!transfer}
+                onClick={() => { setContextMenu(null); push(n, true); }}>镜像此目录到执行端…</button>
             )}
             {!isTauri() && localFs && n.local && !n.isDir && (
               <button style={contextItemStyle} onClick={() => {
