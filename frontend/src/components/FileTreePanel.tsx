@@ -453,6 +453,8 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   const searchResultRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const searchRequestRef = useRef(0);
   const processedFocusRequestRef = useRef(restored?.processedFocusRequestId || 0);
+  const activeFocusRequestRef = useRef<number | null>(null);
+  const [activeFocusRequest, setActiveFocusRequest] = useState<number | null>(null);
   const focusFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [searchQuery, setSearchQuery] = useState(restored?.searchQuery || '');
   const [searchResults, setSearchResults] = useState<TNode[]>(restored?.searchResults || []);
@@ -1487,10 +1489,10 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
     searchResultRefs.current.get(searchSelectedIndex)?.scrollIntoView({ block: 'nearest' });
   }, [searchQuery, searchSelectedIndex, searchResults]);
 
-  // 聊天气泡中的文件链接 → 自动逐层加载、展开、选中并滚动到目标。
+  // 聊天气泡中的文件链接 → 复用目录缓存，只补读目标路径上的缺失层级。
   // 请求同时绑定 Session 和 workingDir，避免分屏/切换节点时定位到同名目录。
-  const focusDataRef = useRef({ loadChildren, localTree });
-  focusDataRef.current = { loadChildren, localTree };
+  const focusDataRef = useRef({ loadChildren, localTree, children });
+  focusDataRef.current = { loadChildren, localTree, children };
   useEffect(() => {
     if (!focusRequest
       || focusRequest.requestId === processedFocusRequestRef.current
@@ -1500,10 +1502,19 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
 
     const relativePath = normalizeRelativeFilePath(focusRequest.relativePath);
     if (!relativePath) return;
-    processedFocusRequestRef.current = focusRequest.requestId;
-    if (documentHost) { setSelected(relativePath); navigateRef.current({ ...focusRequest, relativePath }); return; }
+    if (documentHost) {
+      processedFocusRequestRef.current = focusRequest.requestId;
+      setSelected(relativePath); navigateRef.current({ ...focusRequest, relativePath }); return;
+    }
     let cancelled = false;
     let revealFrame = 0;
+    activeFocusRequestRef.current = focusRequest.requestId;
+    setActiveFocusRequest(focusRequest.requestId);
+    const finish = () => {
+      processedFocusRequestRef.current = focusRequest.requestId;
+      if (activeFocusRequestRef.current === focusRequest.requestId) activeFocusRequestRef.current = null;
+      setActiveFocusRequest(null);
+    };
 
     void (async () => {
       setOnlyDifferent(false);
@@ -1513,16 +1524,32 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
       for (let i = 1; i < parts.length; i++) {
         ancestors[parts.slice(0, i).join('/')] = true;
       }
-      setExpanded((previous) => ({ ...previous, ...ancestors }));
+      setExpanded((previous) => Object.keys(ancestors).some(path => !previous[path]) ? { ...previous, ...ancestors } : previous);
 
+      // 显式链接已给出完整相对路径，各层读取独立且服务端仍检查工作区边界。
+      // 最多四个并发请求，避免把远端往返延迟按目录深度累加；同层沿用 loadChildren 的在途合并。
+      const found: Array<TNode | undefined> = new Array(parts.length);
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(4, parts.length) }, async () => {
+        while (!cancelled && next < parts.length) {
+          const index = next++;
+          const parent = parts.slice(0, index).join('/');
+          const expected = parts.slice(0, index + 1).join('/');
+          const match = (node: TNode) => node.rel.replace(/\\/g, '/') === expected;
+          const cached = (focusDataRef.current.children[parent] || []).find(match)
+            || (focusDataRef.current.localTree[parent] || []).find(match);
+          if (cached) { found[index] = cached; continue; }
+          // 缓存未命中时重读这一层，让新建文件可被定位，不刷新已命中的祖先。
+          const loaded = await focusDataRef.current.loadChildren(parent);
+          if (cancelled) return;
+          found[index] = loaded.find(match) || (focusDataRef.current.localTree[parent] || []).find(match);
+        }
+      }));
+      if (cancelled) return;
       for (let i = 0; i < parts.length; i++) {
-        const parent = parts.slice(0, i).join('/');
-        const expected = parts.slice(0, i + 1).join('/');
-        const loaded = await focusDataRef.current.loadChildren(parent);
-        if (cancelled) return;
-        const candidates = [...loaded, ...(focusDataRef.current.localTree[parent] || [])];
-        const node = candidates.find((item) => item.rel.replace(/\\/g, '/') === expected);
+        const node = found[i];
         if (!node || (i < parts.length - 1 && !node.isDir)) {
+          finish();
           setMsg({ kind: 'err', text: `无法在当前工作目录中定位：${relativePath}` });
           return;
         }
@@ -1530,28 +1557,40 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
 
       if (cancelled) return;
       setSelected(relativePath);
-      setFocusFlash(relativePath);
-      if (focusFlashTimerRef.current) clearTimeout(focusFlashTimerRef.current);
-      focusFlashTimerRef.current = setTimeout(() => setFocusFlash(null), 1800);
 
       let attempts = 0;
       const reveal = () => {
         if (cancelled) return;
         const row = rowRefs.current.get(relativePath);
         if (row) {
-          row.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+          finish();
+          const tree = treeScrollRef.current;
+          if (tree) {
+            const rowBounds = row.getBoundingClientRect();
+            const top = tree.getBoundingClientRect().top + tree.clientTop;
+            const bottom = top + tree.clientHeight;
+            if (rowBounds.top < top) tree.scrollTop += rowBounds.top - top;
+            else if (rowBounds.bottom > bottom) tree.scrollTop += rowBounds.bottom - bottom;
+            // scroll 事件晚于目录更新 effect，立即保存，避免恢复旧位置把定位滚动冲掉。
+            savedScrollTop.current = tree.scrollTop;
+          }
           row.focus({ preventScroll: true });
+          setFocusFlash(relativePath);
+          if (focusFlashTimerRef.current) clearTimeout(focusFlashTimerRef.current);
+          focusFlashTimerRef.current = setTimeout(() => setFocusFlash(null), 1800);
           return;
         }
         attempts += 1;
         if (attempts < 16) revealFrame = requestAnimationFrame(reveal);
-        else setMsg({ kind: 'err', text: `文件已加载，但暂时无法显示：${relativePath}` });
+        else { finish(); setMsg({ kind: 'err', text: `文件已加载，但暂时无法显示：${relativePath}` }); }
       };
       revealFrame = requestAnimationFrame(reveal);
     })();
 
     return () => {
       cancelled = true;
+      if (activeFocusRequestRef.current === focusRequest.requestId) activeFocusRequestRef.current = null;
+      setActiveFocusRequest(null);
       if (revealFrame) cancelAnimationFrame(revealFrame);
     };
   }, [focusRequest, sessionId, workingDir, isRemote, sessionOnline, localFs, documentHost]);
@@ -1639,6 +1678,8 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
   // 刷新后逐层恢复可见的展开目录；只信任当前父目录返回的子项，不从保存路径直接发起读取。
   // 折叠祖先下的状态保留但不加载，失败也不在重渲染/重连时自动重试。
   useEffect(() => {
+    // 定位优先加载目标路径，历史展开目录不要争抢远端请求和渲染时间。
+    if (activeFocusRequestRef.current !== null) return;
     const pending = [''];
     const visited = new Set<string>();
     while (pending.length) {
@@ -1652,7 +1693,7 @@ const FileTreePanelContent: React.FC<Props & { viewKey: string }> = ({ sessionId
         } else pending.push(node.rel);
       }
     }
-  }, [expanded, children, mergedChildren, loading, directoryErrors, loadChildren]);
+  }, [expanded, children, mergedChildren, loading, directoryErrors, loadChildren, activeFocusRequest]);
 
   // ── 文件状态(仅远端会话)──
   const statusOf = useCallback((node: TNode): FStatus | null => {
