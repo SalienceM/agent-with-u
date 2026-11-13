@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api, getCurrentUserProfile, onExecStatus, onCurrentUserChanged, kitUpdateScope } from '../api';
 import { KitLocalUpdateCard } from './KitLocalUpdateCard';
+import { KitSshConnection } from './KitSshConnection';
 import { isLocalUpdateCapability } from '../types/workspaceKits';
 import type {
   WorkspaceKitState,
@@ -504,7 +505,7 @@ export const WorkspaceKitsPanel: React.FC<Props> = ({ sessionId, open, onClose, 
   useEffect(() => {
     if (!selected) { setInputs({}); return; }
     setInputs(defaultInputsOf(selected));
-  }, [selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedId, selected?.activeVersionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const showGeneration = () => {
     if (!generationJob) return;
@@ -1958,11 +1959,16 @@ const KitDetail: React.FC<{
 
       <section style={cardStyle}>
         <div style={cardTitle}>标准输入</div>
+        {(kit.inputs.some(spec => spec.key === 'ssh_connection') || kit.inputs.some(spec => spec.key === 'ssh_host')) && (
+          <KitSshConnection sessionId={sessionId} kit={kit} running={!!running}
+            value={String(inputs.ssh_connection || '')}
+            onChange={value => onInputsChange({ ...inputs, ssh_connection: value })} />
+        )}
         {kit.inputs.length === 0 ? (
           <div style={subtleStyle}>这个 Kit 没有运行时输入。</div>
         ) : (
           <div style={twoColumns}>
-            {kit.inputs.map((spec) => (
+            {kit.inputs.filter(spec => spec.key !== 'ssh_connection').map((spec) => (
               <label key={spec.key}>
                 <FieldLabel>{spec.label || spec.key}{spec.required ? ' *' : ''}
                   {spec.sourceKey ? ` · 自动来源 ${spec.sourceKey}` : ''}</FieldLabel>

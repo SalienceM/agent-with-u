@@ -2,6 +2,7 @@ import React, {
   useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
 } from 'react';
 import { api, onCurrentUserChanged } from '../api';
+import { useVisibleSessionCandidates } from '../hooks/useSessionVisibility';
 import {
   detectPromptReference,
   fileReferenceLocation,
@@ -87,7 +88,8 @@ export const AdvancedPromptTextarea: React.FC<AdvancedPromptTextareaProps> = ({
   const [currentDir, setCurrentDir] = useState('.');
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState('');
-  const [sessionRefs, setSessionRefs] = useState<any[]>([]);
+  const [allSessionRefs, setSessionRefs] = useState<any[]>([]);
+  const sessionRefs = useVisibleSessionCandidates(allSessionRefs);
   const [sessionQuery, setSessionQuery] = useState('');
   const [sessionLoading, setSessionLoading] = useState(false);
   const [popupPosition, setPopupPosition] = useState<PopupPosition | null>(null);

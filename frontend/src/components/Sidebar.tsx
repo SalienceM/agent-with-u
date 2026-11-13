@@ -1,5 +1,7 @@
+import { useSessionVisibility } from '../hooks/useSessionVisibility';
+import { canShowSession, showPrivateSessions } from '../utils/sessionVisibility';
 import React, { useEffect, useState, useCallback, memo, useRef, useMemo, useLayoutEffect } from 'react';
-import { api, getHomeExecKey, isTauri, onExecStatus, onCurrentUserChanged } from '../api';
+import { api, getCurrentUserProfile, getHomeExecKey, isTauri, onExecStatus, onCurrentUserChanged } from '../api';
 import { FileTreePanel } from './FileTreePanel';
 import type { AttentionContext } from '../utils/attentionContext';
 import { mergeAttention } from '../utils/mergeAttention';
@@ -10,6 +12,7 @@ import type { SidebarView, WorkbenchTab } from '../utils/workbench';
 import type { SessionViewMetadata, SessionViewMode } from '../utils/sessionWorkbench';
 import { WorkbenchIcon } from './WorkbenchChrome';
 import type { SessionDeletionResult } from '../utils/sessionDeletion';
+import { groupCollapsed, saveGroupCollapsed, NAVIGATION_CHANGED } from '../utils/clientNavigation';
 import type { FavoritePhase } from '../utils/sessionFavorites';
 
 import { SkillBindingTree } from './SkillBindingTree';
@@ -43,6 +46,7 @@ interface Session extends SessionViewMetadata {
   mergeLink?: import('../types/taskWorkspaces').MergeLink;
   loopExecutionMode?: 'loop' | 'aimein';
   pinned?: boolean;
+  isPrivate?: boolean; privacyKnown?: boolean; privacyStatus?: FavoritePhase; privacyMessage?: string;
   favoriteStatus?: FavoritePhase;
   favoriteMessage?: string;
   sidebarColor?: string;
@@ -57,6 +61,7 @@ interface Backend {
 const favoriteStatusLabel = (phase: FavoritePhase): string => ({
   pending: '待同步', unknown: '结果未知', conflict: '收藏冲突', unsupported: '仅本设备', blocked: '同步受阻',
 })[phase];
+const privacyStatusLabel = (phase: FavoritePhase): string => favoriteStatusLabel(phase).replace('收藏', '私密');
 
 interface Props {
   view?: SidebarView;
@@ -92,6 +97,10 @@ interface Props {
 // ★ Wrap with React.memo to prevent unnecessary re-renders when parent updates
 export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession, onRequestViewMode, onNewSession, onDeleteSession, onAcknowledgeSession, streamingSessions, completedSessions = new Set(), collapsed, onToggleCollapse, isMobile, width, activeWorkingDir, activeSessionMetaId, activeExecKey, activeExecLabel, activeExecMode, activeBackendId, activeCodexRemoteHost, activeEngineMode, sessionLimit = 25, fileFocusRequest, onAttentionChange, view: controlledView, onViewChange, onOpenExtension, activeWorkbenchTab }) => {
   const [sessions, setSessions] = useState<Session[]>([]);
+  const revealPrivate = useSessionVisibility();
+  const shownSessions = useMemo(() => sessions.filter(row => canShowSession(row, revealPrivate)), [sessions, revealPrivate]);
+  const allowed = (row: Session | null) => !!row && canShowSession(sessions.find(s => s.id === row.id && s.execKey === row.execKey), revealPrivate);
+  const [privacyError, setPrivacyError] = useState('');
   const refreshGenerationRef = useRef(0);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // ★ 侧栏视图：会话列表 / 文件目录树（本地 ⇄ 远端），左侧小按钮切换
@@ -153,7 +162,13 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [appearancePickerSession, setAppearancePickerSession] = useState<Session | null>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
   // ★ 执行节点分组折叠；每组显示数量由应用配置控制。
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [, refreshNavigation] = useState(0);
+  useEffect(() => {
+    const changed = () => refreshNavigation(value => value + 1);
+    window.addEventListener(NAVIGATION_CHANGED, changed); window.addEventListener('storage', changed);
+    const off = onCurrentUserChanged(changed);
+    return () => { off(); window.removeEventListener(NAVIGATION_CHANGED, changed); window.removeEventListener('storage', changed); };
+  }, []);
 
   // 聊天气泡请求定位文件时，侧栏自动切到文件视图。Session 尚未切换完成
   // 时先保留请求；activeSessionId 更新后该 effect 会再次命中。
@@ -462,13 +477,17 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   useEffect(() => onCurrentUserChanged((_profile, changed) => {
     if (!changed) return;
     ++managementEpoch.current; ++refreshGenerationRef.current;
+    setSessions([]); setBackends([]); setSearchQuery(''); setPrivacyError('');
+    setSessionToConvert(null); setBranchStatus(null); setProjectTransfer(null); setAppearancePickerSession(null);
+    setRenamingSessionId(null);
     completedDeletions.current.clear(); deletionBusy.current = false;
     setSessionToDelete(null); setSessionToDestroy(null); setSessionContextMenu(null);
     setBranchDialog(null);
     setGitDialog(null);
     setExpandedSessionFamilies(new Set());
     setDeleteResult(null); setDestroyResult(null); setDeleting(false); setDestroying(false); setFavoriteError('');
-  }), []);
+    scheduleRefresh(0);
+  }), [scheduleRefresh]);
 
   // ★ 本窗口新建会话时直接插入。createSession 返回的是完整且带节点归属的
   // 最新对象，不再立即整表重拉，避免旧索引把它短暂刷掉。
@@ -510,13 +529,14 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   useEffect(() => {
     const unsubscribeSession = api.onSessionUpdated((data: any) => {
       const sessionId = data?.sessionId;
+      if (data?.type === 'privacy_storage_error') { setPrivacyError(data.message); return; }
       if (data?.type === 'favorite_storage_error') { setFavoriteError(data.message); return; }
       // 增量事件比任何更早发起的列表请求都新，旧请求完成后不得覆盖它。
-      if (data?.type !== 'favorite_changed') refreshGenerationRef.current += 1;
+      if (!['favorite_changed', 'privacy_changed'].includes(data?.type)) refreshGenerationRef.current += 1;
       let needsRefresh = false;
       if (data?.type === 'session_deleted' && sessionId) {
         completeDeletion(sessionId, data.execKey);
-      } else if (data?.type === 'favorite_changed') {
+      } else if (['favorite_changed', 'privacy_changed'].includes(data?.type)) {
         setSessions(prev => prev.map(session => {
           const summary = data.summaries?.find((item: Session) => item.id === session.id && item.execKey === session.execKey);
           return summary ? { ...session, ...summary } : session;
@@ -640,40 +660,40 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   const [expandedSessionFamilies, setExpandedSessionFamilies] = useState<Set<string>>(new Set());
   // 子项是普通 Session，默认收在主项下；从标签页等入口切入子项时展开所属主项。
   const activeFamilyKey = useMemo(() => {
-    const family = taskSessionTree(sessions, new Set(), true).find(row => row.depth === 0 && row.children.some(child =>
+    const family = taskSessionTree(shownSessions, new Set(), true).find(row => row.depth === 0 && row.children.some(child =>
       child.id === activeSessionId && (!activeExecKey || (child.execKey || 'local') === activeExecKey)));
     return family ? `${family.item.execKey || 'local'}:${family.item.id}` : '';
-  }, [sessions, activeSessionId, activeExecKey]);
+  }, [shownSessions, activeSessionId, activeExecKey]);
   useEffect(() => {
     if (activeFamilyKey) setExpandedSessionFamilies(old => old.has(activeFamilyKey) ? old : new Set(old).add(activeFamilyKey));
   }, [activeFamilyKey, activeSessionId]);
   const visibleSessions = useMemo(() => {
     const filtered = normalizedSearch
-      ? sessions.filter((session) => [
+      ? shownSessions.filter((session) => [
           session.title,
           session.workingDir,
           session.backendId,
           session.execLabel,
           session.sessionType,
         ].some((value) => String(value || '').toLocaleLowerCase().includes(normalizedSearch)))
-      : projectTaskSessions(sessions, false, `${activeExecKey || 'local'}:${activeSessionId}`).filter(session => session.relationKind !== 'review' || session.pinned || session.id === activeSessionId);
+      : projectTaskSessions(shownSessions, false, `${activeExecKey || 'local'}:${activeSessionId}`).filter(session => session.relationKind !== 'review' || session.pinned || session.id === activeSessionId);
     if (normalizedSearch) {
       const seen = new Set(filtered.map(row => `${row.execKey || 'local'}:${row.id}`));
       for (let i = 0; i < filtered.length; i++) {
         const child = filtered[i];
         if (!['task', 'integration'].includes(child.relationKind || '') || !child.parentSessionId) continue;
-        const parent = sessions.find(row => row.id === child.parentSessionId && (row.execKey || 'local') === (child.execKey || 'local'));
+        const parent = shownSessions.find(row => row.id === child.parentSessionId && (row.execKey || 'local') === (child.execKey || 'local'));
         if (parent && !seen.has(`${parent.execKey || 'local'}:${parent.id}`)) {
           seen.add(`${parent.execKey || 'local'}:${parent.id}`); filtered.push(parent);
         }
       }
     }
     return [...filtered].sort(sortSessionsByPriority);
-  }, [sessions, normalizedSearch, activeSessionId, activeExecKey]);
+  }, [shownSessions, normalizedSearch, activeSessionId, activeExecKey]);
   const collapsedSessionFamilies = useMemo(() => new Set(visibleSessions
     .map(row => `${row.execKey || 'local'}:${row.id}`).filter(key => !expandedSessionFamilies.has(key))), [visibleSessions, expandedSessionFamilies]);
 
-  const pendingCount = completedSessions.size;
+  const pendingCount = shownSessions.filter(row => completedSessions.has(row.id)).length;
 
   // ★ 按执行节点分组：每个节点按配置展示最近 N 条；收藏和搜索不受此限制。
   const maxPerNode = Math.max(5, Math.min(500, Math.trunc(Number(sessionLimit) || 25)));
@@ -685,7 +705,9 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       isDefault: boolean;
       sessions: Session[];
     }>();
-    const families = taskSessionTree(visibleSessions, new Set(), true).filter(row => row.depth === 0);
+    const privateSessions = visibleSessions.filter(row => row.isPrivate);
+    if (privateSessions.length) map.set('__private__', { key: '__private__', label: '私密', isLocal: false, isDefault: false, sessions: privateSessions });
+    const families = taskSessionTree(visibleSessions.filter(row => !row.isPrivate), new Set(), true).filter(row => row.depth === 0);
     const isFavorite = (row: typeof families[number]) => row.item.pinned || row.children.some(child => child.pinned);
     const pinnedSessions = families.filter(isFavorite).flatMap(row => [row.item, ...row.children]);
     if (pinnedSessions.length) {
@@ -718,6 +740,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     arr.sort((a, b) => {
       if (a.key === '__pinned__') return -1;
       if (b.key === '__pinned__') return 1;
+      if (a.key === '__private__') return -1;
+      if (b.key === '__private__') return 1;
       if (a.isLocal !== b.isLocal) return a.isLocal ? -1 : 1;
       if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
       return a.label.localeCompare(b.label);
@@ -726,11 +750,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
   }, [visibleSessions, normalizedSearch, maxPerNode]);
 
   const toggleGroup = useCallback((key: string) => {
-    setCollapsedGroups(prev => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key); else next.add(key);
-      return next;
-    });
+    const profile = getCurrentUserProfile();
+    saveGroupCollapsed(profile, key, !groupCollapsed(profile, key));
   }, []);
 
   // ★ 移动端折叠：完全隐藏，由顶栏的 ☰ 按钮负责唤出抽屉
@@ -931,6 +952,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             <circle cx="11" cy="11" r="7" />
             <path d="m20 20-3.5-3.5" />
           </svg>
+          <button type="button" role="switch" aria-label="显示私密 Session" aria-checked={revealPrivate}
+            onClick={() => showPrivateSessions(!revealPrivate)} style={{ border: '1px solid var(--theme-border)', borderRadius: 5, padding: '6px 4px', color: 'var(--theme-text)', background: 'transparent', fontSize: 11, flexShrink: 0 }} title="显示私密 Session（刷新后关闭）">◈ {revealPrivate ? '隐藏私密' : '显示私密'}</button>
           <input
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.target.value)}
@@ -972,21 +995,25 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           onAttentionChange={onAttentionChange} />
       ) : (
       <div style={{ flex: 1, overflow: 'auto', padding: '4px 7px 10px' }}>
+        {sessions.some(row => row.privacyKnown === false) && <div role="status" style={{ padding: 12, fontSize: 12 }}>
+          部分 Session 的私密状态未就绪，暂不显示。<button type="button" onClick={() => { void api.retrySessionPrivacyStorage().then(refresh).catch(error => setPrivacyError(error.message)); }}>重新读取</button>
+        </div>}
         {groups.map(group => {
           // 多组时显示组头；单组（仅本机）不显示
+          const isPrivateGroup = group.key === '__private__';
           const isPinnedGroup = group.key === '__pinned__';
-          const showGroupHeader = groups.length > 1 || isPinnedGroup;
+          const showGroupHeader = true;
           // 只有标题可见时才允许折叠，避免分组数量变化后留下一个无法展开的隐藏组。
-          const isCollapsed = showGroupHeader && collapsedGroups.has(group.key);
+          const isCollapsed = showGroupHeader && groupCollapsed(getCurrentUserProfile(), group.key);
           const groupTone = isPinnedGroup
             ? { accent: '#d9ad45', iconBackground: 'rgba(217,173,69,.13)' }
             : { accent: 'var(--theme-accent, #7aa2f7)', iconBackground: 'var(--theme-accent-bg, rgba(122,162,247,.13))' };
-          const groupLabel = isPinnedGroup
+          const groupLabel = isPrivateGroup ? '私密' : isPinnedGroup
             ? '收藏'
             : group.isLocal
               ? (isTauri() ? '本机' : '当前 Web 节点')
               : group.label;
-          const groupDescription = isPinnedGroup
+          const groupDescription = isPrivateGroup ? '仅开启时显示' : isPinnedGroup
             ? '置顶会话'
             : group.isLocal
               ? '此设备执行'
@@ -1010,7 +1037,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     color: groupTone.accent,
                     background: groupTone.iconBackground,
                   }} aria-hidden="true">
-                    {isPinnedGroup ? (
+                    {isPrivateGroup ? '◈' : isPinnedGroup ? (
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
                         <path d="m12 2.8 2.72 5.52 6.09.88-4.4 4.29 1.04 6.06L12 16.68l-5.45 2.87 1.04-6.06-4.4-4.29 6.09-.88L12 2.8Z" />
                       </svg>
@@ -1157,6 +1184,10 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                       {getBackendShortLabel(s.backendId)}
                     </span>
                     {s.pinned && <span style={{ color: '#f5c451', fontSize: 13 }} title="已置顶">★</span>}
+                    {s.privacyStatus && <button type="button" data-privacy-status={s.privacyStatus}
+                      aria-label={`私密状态：${privacyStatusLabel(s.privacyStatus)}`} title={s.privacyMessage}
+                      onClick={event => { event.stopPropagation(); setSessionContextMenu({ session: s, x: event.clientX, y: event.clientY, anchor: event.currentTarget }); }}
+                      style={{ fontSize: 10, color: 'var(--theme-text-muted)', background: 'transparent', border: 0 }}>◈ {privacyStatusLabel(s.privacyStatus)}</button>}
                     {s.favoriteStatus && <button type="button" data-favorite-status={s.favoriteStatus}
                       aria-label={`收藏状态：${favoriteStatusLabel(s.favoriteStatus)}`}
                       title={s.favoriteMessage || '本设备已保存；等待原节点同步'}
@@ -1186,20 +1217,23 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       </div>
       )}
 
+      {privacyError && <AppModalPortal><div style={overlayStyle}><div role="alertdialog" aria-label="私密保存失败" style={confirmPanelStyle}>
+        <p role="alert">{privacyError}</p><button type="button" onClick={() => setPrivacyError('')}>知道了</button>
+      </div></div></AppModalPortal>}
       {favoriteError && <AppModalPortal><div style={overlayStyle}><div role="alertdialog" aria-label="收藏保存失败" style={confirmPanelStyle}>
         <p role="alert" style={{ fontSize: 13, overflowWrap: 'anywhere' }}>{favoriteError}</p>
         <button style={cancelBtnStyle} onClick={() => setFavoriteError('')}>知道了</button>
       </div></div></AppModalPortal>}
 
-      {branchDialog && <SessionBranchDialog key={`${branchDialog.session.execKey || 'local'}:${branchDialog.session.id}:${branchDialog.action}`}
+      {branchDialog && allowed(branchDialog.session) && <SessionBranchDialog key={`${branchDialog.session.execKey || 'local'}:${branchDialog.session.id}:${branchDialog.action}`}
         session={branchDialog.session} action={branchDialog.action} onClose={() => setBranchDialog(null)} onOpenSession={onSelectSession} />}
-      {branchStatus && <SessionBranchStatusDialog key={`${branchStatus.session.execKey || 'local'}:${branchStatus.session.id}`}
+      {branchStatus && allowed(branchStatus.session) && <SessionBranchStatusDialog key={`${branchStatus.session.execKey || 'local'}:${branchStatus.session.id}`}
         session={branchStatus.session} focusTarget={branchStatus.anchor} onClose={() => setBranchStatus(null)} />}
-      {projectTransfer && <ProjectTransferDialog key={`${projectTransfer.session.execKey || 'local'}:${projectTransfer.session.id}:${projectTransfer.mode}`}
+      {projectTransfer && allowed(projectTransfer.session) && <ProjectTransferDialog key={`${projectTransfer.session.execKey || 'local'}:${projectTransfer.session.id}:${projectTransfer.mode}`}
         session={projectTransfer.session} mode={projectTransfer.mode} focusTarget={projectTransfer.anchor} onClose={() => setProjectTransfer(null)} onOpenSession={onSelectSession} />}
-      {gitDialog && <SessionGitDialog key={`${gitDialog.session.execKey}:${gitDialog.session.id}`} session={gitDialog.session}
+      {gitDialog && allowed(gitDialog.session) && <SessionGitDialog key={`${gitDialog.session.execKey}:${gitDialog.session.id}`} session={gitDialog.session}
         focusTarget={gitDialog.anchor} onClose={() => setGitDialog(null)} />}
-      {sessionContextMenu && (
+      {sessionContextMenu && allowed(sessionContextMenu.session) && (
         <AppModalPortal>
         <div
           ref={sessionContextMenuRef}
@@ -1261,6 +1295,20 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
             <span className="awu-session-context-icon">{sessionContextMenu.session.pinned ? '★' : '☆'}</span>
             <span>{sessionContextMenu.session.pinned ? '取消置顶' : '收藏并置顶'}</span>
           </button>
+          <button type="button" role="menuitem" className="awu-session-context-item" onClick={() => {
+            const target = sessionContextMenu.session, epoch = managementEpoch.current; setSessionContextMenu(null); setPrivacyError('');
+            void api.setSessionPrivacy(target.id, !target.isPrivate, target.execKey).catch(error => { if (epoch === managementEpoch.current) setPrivacyError(`私密未能保存：${error.message}`); });
+          }}><span aria-hidden="true" className="awu-session-context-icon">◈</span>{sessionContextMenu.session.isPrivate ? '取消私密' : '设为私密'}</button>
+          {sessionContextMenu.session.privacyStatus && <>
+            <div style={{ padding: '6px 12px', fontSize: 11, maxWidth: 260, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+              私密 · {privacyStatusLabel(sessionContextMenu.session.privacyStatus)}<br />{sessionContextMenu.session.privacyMessage}
+            </div>
+            {(sessionContextMenu.session.privacyStatus === 'conflict' ? [['remote', '采用远端私密值'], ['local', '保留本设备选择并同步私密']] : [['retry', '只读核对并协调私密']]).map(([choice, label]) =>
+              <button key={choice} type="button" role="menuitem" className="awu-session-context-item" onClick={() => {
+                const target = sessionContextMenu.session, epoch = managementEpoch.current; setSessionContextMenu(null);
+                void api.resolveSessionPrivacy(target.id, choice as 'local' | 'remote' | 'retry', target.execKey).catch(error => { if (epoch === managementEpoch.current) setPrivacyError(error.message); });
+              }}>{label}</button>)}
+          </>}
           {sessionContextMenu.session.favoriteStatus && <>
             <div style={{ padding: '6px 12px', fontSize: 11, lineHeight: 1.5, whiteSpace: 'normal', overflowWrap: 'anywhere', maxWidth: 260 }}>
               本设备已保存 · {favoriteStatusLabel(sessionContextMenu.session.favoriteStatus)}<br />
@@ -1370,7 +1418,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       )}
 
       {/* 能力绑定面板 */}
-      {abilityPickerSession && (
+      {abilityPickerSession && allowed(abilityPickerSession) && (
         <AppModalPortal>
         <div ref={pickerRef} style={overlayStyle}>
           <div role="dialog" aria-label="绑定能力" aria-busy={abilityLoading || abilitySaving} style={{
@@ -1604,7 +1652,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       )}
 
       {/* 受控渐变色板：只保存 preset id，不把任意 CSS 写入 Session。 */}
-      {appearancePickerSession && (
+      {appearancePickerSession && allowed(appearancePickerSession) && (
         <div style={overlayStyle} onClick={() => setAppearancePickerSession(null)}>
           <div style={{ ...confirmPanelStyle, maxWidth: 360, padding: 18 }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
@@ -1649,7 +1697,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       )}
 
       {/* 删除确认对话框 */}
-      {sessionToDelete && (
+      {sessionToDelete && allowed(sessionToDelete) && (
         <div style={overlayStyle}>
           <div role="dialog" aria-label="确认删除会话" style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }} onClick={(e) => e.stopPropagation()}>
             <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
@@ -1675,7 +1723,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       )}
 
       {/* 普通 Session 转 LOOP：转换时必须明确制定目标。 */}
-      {sessionToConvert && (
+      {sessionToConvert && allowed(sessionToConvert) && (
         <AppModalPortal>
           <div style={overlayStyle} onClick={() => { if (!converting) setSessionToConvert(null); }}>
             <div
@@ -1761,7 +1809,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       )}
 
       {/* 销毁与普通删除严格分离：必须输入中文“销毁”后才能触发执行端目录删除。 */}
-      {sessionToDestroy && (
+      {sessionToDestroy && allowed(sessionToDestroy) && (
         <div style={overlayStyle}>
           <div role="dialog" aria-label="销毁 Session 与工作目录" style={{ ...confirmPanelStyle, maxWidth: 460, border: '1px solid rgba(239,68,68,.48)' }} onClick={(e) => e.stopPropagation()}>
             <h3 style={{ margin: '0 0 10px', fontSize: 16, color: 'var(--theme-error, #ef4444)' }}>
@@ -1813,7 +1861,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       )}
 
       {/* 删除技能/提示确认对话框 */}
-      {itemToDelete && (
+      {itemToDelete && allowed(abilityPickerSession) && (
         <div style={overlayStyle}>
           <div style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }} onClick={(e) => e.stopPropagation()}>
             <h3 style={{ margin: '0 0 12px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>

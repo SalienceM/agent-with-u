@@ -1,3 +1,5 @@
+import { useSessionVisibility } from './hooks/useSessionVisibility';
+import { canShowSession, canNotifySession, sessionVisibility, projectSessionNavigation, showPrivateSessions } from './utils/sessionVisibility';
 import React, { useState, useCallback, useEffect, useRef, useMemo, useReducer } from 'react';
 import { FileTransferCenter } from './components/FileTransferCenter';
 import { useLoopControl } from './hooks/useLoopControl';
@@ -65,6 +67,7 @@ import { useIsMobile } from './hooks/useIsMobile';
 import { hljsLightCss, hljsDarkCss } from './utils/hljsThemes';
 import { messagesToMarkdown, messagesToJson } from './utils/markdown';
 import type { SmoothGhostState } from './utils/smoothGhost';
+import { NAVIGATION_ERROR, navigationSaveFailed } from './utils/clientNavigation';
 import { notifyTaskCompletion } from './utils/desktopNotifications';
 import type { FileFocusRequest } from './utils/fileFocus';
 import { normalizeRelativeFilePath, sameWorkspacePath } from './utils/fileFocus';
@@ -113,6 +116,8 @@ export const App: React.FC = () => {
       return [];
     }
   }, []);
+  // 启动离线时也读取原节点的缓存；连接状态不能使已恢复标签丢失标题或成员。
+  useEffect(() => { void refreshSessionList(); }, [refreshSessionList]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [releaseCenterOpen, setReleaseCenterOpen] = useState(false);
   const [backendManagerOpen, setBackendManagerOpen] = useState(false);
@@ -123,6 +128,8 @@ export const App: React.FC = () => {
   const [backendManagerError, setBackendManagerError] = useState('');
   const backendManagerLoadGenerationRef = useRef(0);
   const [windowRoute] = useState(() => readSessionWindowRoute(window.location.search));
+  const [windowRouteResolved, setWindowRouteResolved] = useState(!windowRoute);
+  const navigationCommitRef = useRef(false);
   const [initialWorkspace] = useState(() => windowRoute ? normalizeWorkbenchSnapshot(null) : loadWorkbenchSnapshot(getCurrentUserProfile()));
   const [workbench, dispatchWorkbench] = useReducer(workbenchReducer, initialWorkspace.workbench);
   const mountedSessionIdsRef = useRef(new Set<string>());
@@ -208,15 +215,29 @@ export const App: React.FC = () => {
   const [focusedPaneIdx, setFocusedPaneIdx] = useState(initialWorkspace.focused);
 
   // 当前焦点 pane 对应的 sessionId(派生,不再是独立 state)
-  const activeSessionId = paneSessions[focusedPaneIdx] ?? null;
+  const revealPrivate = useSessionVisibility();
+  const [suppressedSessions, setSuppressedSessions] = useState<Set<string>>(new Set());
+  const [activeSessionMeta, setActiveSession] = useState<any | null>(null);
+  const desiredActiveSessionId = paneSessions[focusedPaneIdx] ?? null;
+  const sessionMeta = (id: string) => api.peekSessionMeta(id) || sessions.find(row => row.id === id)
+    || (activeSessionMeta?.id === id ? activeSessionMeta : null);
+  const visibleNavigation = projectSessionNavigation(workbench, paneSessions, sessionMeta, revealPrivate, suppressedSessions);
+  const visiblePanes = visibleNavigation.panes;
+  const visibleSessions = sessions.filter(row => canShowSession(row, revealPrivate));
+  const activeSessionId = visiblePanes[focusedPaneIdx] ?? null;
+  const activeSession = activeSessionId ? sessionMeta(activeSessionId) : null;
+  useEffect(() => {
+    if (revealPrivate) return;
+    const hidden = paneSessions.filter((id): id is string => !!id && sessionVisibility(sessionMeta(id)) === 'private');
+    if (hidden.length) setSuppressedSessions(previous => hidden.every(id => previous.has(id)) ? previous : new Set([...previous, ...hidden]));
+  }, [revealPrivate, paneSessions, sessions, activeSessionMeta]);
   const activeSessionIdRef = useRef(activeSessionId);
   activeSessionIdRef.current = activeSessionId;
   const visibleSessionIdRef = useRef<string | null>(null);
   visibleSessionIdRef.current = chatWorkspaceVisible ? activeSessionId : null;
 
   // 焦点 pane 的 session 详情(顶栏展示 workingDir / backendId 用)
-  const [activeSession, setActiveSession] = useState<any | null>(null);
-  const focusedMeta = activeSession?.id === activeSessionId ? activeSession : sessions.find(session => session.id === activeSessionId);
+  const focusedMeta = activeSession;
   const focusedViewKey = sessionViewKey(currentUser.userId, focusedMeta?.execKey || getSessionExecKey(activeSessionId) || '', activeSessionId || '');
   const focusedMode = sessionViews[focusedViewKey] || (() => {
     try { return localSessionView(window.localStorage, focusedViewKey); } catch { return undefined; }
@@ -229,7 +250,11 @@ export const App: React.FC = () => {
   useEffect(() => onCurrentUserChanged((profile, identityChanged) => {
     setCurrentUser(profile);
     if (!identityChanged) return;
+    setWindowRouteResolved(!windowRoute);
+    setSuppressedSessions(new Set());
     setSessionViews({}); setSessionViewPresence({}); setModeRequest(null); setSessionMenuRequest(null);
+    ++sessionRefreshGenerationRef.current;
+    navigationCommitRef.current = false;
     const restored = loadWorkbenchSnapshot(profile);
     mountedSessionIdsRef.current.clear();
     dispatchWorkbench({ type: 'restore', state: restored.workbench });
@@ -255,6 +280,8 @@ export const App: React.FC = () => {
       setToast({ type: 'info', message: '当前窗口专注此工程。请从当前会话菜单返回 Chat 后再切换会话。' });
       return;
     }
+    navigationCommitRef.current = true;
+    if (id) setSuppressedSessions(previous => { if (!previous.has(id)) return previous; const next = new Set(previous); next.delete(id); return next; });
     if (id) window.dispatchEvent(new CustomEvent('awu-session-selected', { detail: { session: id } }));
     const selected = selectSessionPane(paneSessions, id, paneIdx ?? focusedPaneIdx, LAYOUT_SLOTS[layout]);
     dispatchWorkbench({ type: 'open', tab: id ? sessionWorkbenchTab(id) : 'chat' });
@@ -302,12 +329,13 @@ export const App: React.FC = () => {
     let alive = true;
     void api.resolveWorkspaceSession(windowRoute.executor, windowRoute.session).then(session => {
       if (alive && session?.id) {
+        setWindowRouteResolved(true);
         dispatchWorkbench({ type: 'open', tab: sessionWorkbenchTab(session.id) });
         setPaneSessions([session.id, null, null, null]); setFocusedPaneIdx(0); setLayout('1x1');
       }
     }).catch(error => { if (alive) setToast({ type: 'error', message: String(error) }); });
     return () => { alive = false; };
-  }, [windowRoute, backendConnected, currentUser.userId]);
+  }, [windowRoute, backendConnected, currentUser.userId, currentUser.realm]);
 
   // 分屏焦点、启动恢复、会话迁移也走同一个标签账本；列表更新不会重排/打开所有 Session。
   useEffect(() => {
@@ -329,8 +357,8 @@ export const App: React.FC = () => {
 
   // 分屏焦点、启动恢复、会话迁移也走同一个标签账本；列表更新不会重排/打开所有 Session。
   useEffect(() => {
-    dispatchWorkbench({ type: 'syncSessions', sessionIds: paneSessions, focusedSessionId: activeSessionId });
-  }, [paneSessions, activeSessionId]);
+    dispatchWorkbench({ type: 'syncSessions', sessionIds: paneSessions, focusedSessionId: desiredActiveSessionId });
+  }, [paneSessions, desiredActiveSessionId]);
 
   useEffect(() => {
     if (!activeSessionId || !chatWorkspaceVisible) return;
@@ -346,6 +374,7 @@ export const App: React.FC = () => {
       setSessionInPane(workbenchSessionId(tab));
       setSurfaceFocus(tab === 'chat' ? 'home' : 'session');
     } else {
+      navigationCommitRef.current = true;
       dispatchWorkbench({ type: 'open', tab }); setSurfaceFocus('skills');
     }
   }, [setSessionInPane]);
@@ -355,6 +384,7 @@ export const App: React.FC = () => {
       setToast({ type: 'info', message: '请先保存或退出技能/提示词编辑，再关闭标签页。切换标签不会丢失草稿。' });
       return;
     }
+    navigationCommitRef.current = true;
     const next = workbenchReducer(workbench, { type: 'close', tab });
     const sid = workbenchSessionId(tab);
     if (sid) mountedSessionIdsRef.current.delete(sid);
@@ -373,6 +403,7 @@ export const App: React.FC = () => {
   const isMobile = useIsMobile();
   const openExtensionTab = useCallback((tab: 'library' | 'market') => {
     if (engineSessionRef.current) return;
+    navigationCommitRef.current = true;
     dispatchWorkbench({ type: 'open', tab }); setSurfaceFocus('skills');
     if (isMobile) setSidebarCollapsed(true);
   }, [isMobile]);
@@ -384,6 +415,7 @@ export const App: React.FC = () => {
 
   // 顶栏弹层遵循标准菜单交互：切换焦点会话、点击外部或按 Esc 都立即收起。
   useEffect(() => {
+    setFileAttention(null); setFileFocusRequest(null); setSessionMenuRequest(null); setModeRequest(null);
     setManualLoopMenuOpen(false);
     setManualLoopInspectorOpen(false);
     setMoreMenuOpen(false);
@@ -429,8 +461,15 @@ export const App: React.FC = () => {
 
   // 保存完整导航账本，不把未选中的 Tab 丢在刷新边界；只保存当前用户的导航。
   useEffect(() => {
-    saveWorkbenchSnapshot(currentUser, { version: 1, workbench, panes: paneSessions, focused: focusedPaneIdx, layout });
-  }, [currentUser.mode, currentUser.userId, workbench, paneSessions, focusedPaneIdx, layout]);
+    saveWorkbenchSnapshot(currentUser, { version: 1, workbench, panes: paneSessions, focused: focusedPaneIdx, layout }, navigationCommitRef.current);
+    navigationCommitRef.current = false;
+  }, [currentUser.mode, currentUser.userId, currentUser.realm, workbench, paneSessions, focusedPaneIdx, layout]);
+  useEffect(() => {
+    const failed = () => setToast({ type: 'error', message: '本设备未能保存导航状态，重启后可能无法恢复。' });
+    window.addEventListener(NAVIGATION_ERROR, failed);
+    if (navigationSaveFailed()) failed();
+    return () => window.removeEventListener(NAVIGATION_ERROR, failed);
+  }, []);
 
   // 焦点 pane 索引超出当前布局时,回落到 0,防止顶栏读到隐藏 pane 的 session
   useEffect(() => {
@@ -563,6 +602,13 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  useEffect(() => {
+    if (!activeSessionId && ghostSnapshotRef.current) {
+      const cleared = { sessionId: '', sessionTitle: '', backendLabel: '', question: '', answer: '', historyText: '', isStreaming: false, updatedAt: Date.now() };
+      ghostSnapshotRef.current = cleared; ghostEmitRef.current?.(cleared);
+    }
+  }, [activeSessionId]);
+
   const handleGhostStateChange = useCallback((state: SmoothGhostState) => {
     ghostSnapshotRef.current = state;
     if (!hackerModeEnabledRef.current) return;
@@ -688,7 +734,7 @@ export const App: React.FC = () => {
   useEffect(() => {
     return api.onSessionUpdated((data: any) => {
       const t = data?.type;
-      if (t === 'favorite_changed') {
+      if (t === 'favorite_changed' || t === 'privacy_changed') {
         const project = (session: any) => {
           const summary = data.summaries?.find((row: any) => row.id === session?.id && row.execKey === session?.execKey);
           return summary ? { ...session, ...summary } : session;
@@ -735,26 +781,26 @@ export const App: React.FC = () => {
 
   /* ---- 加载焦点 pane 的 session 详情(用于顶栏 workingDir / backend 展示) ---- */
   useEffect(() => {
-    if (!activeSessionId) {
+    if (!desiredActiveSessionId) {
       setActiveSession(null);
       return;
     }
     // 切换窗格后先撤掉旧元数据，避免顶层“俺寻思”在新 Session 加载的极短窗口里
     // 把问题误发给上一个 Session。
-    setActiveSession((current: any) => current?.id === activeSessionId ? current : null);
+    setActiveSession((current: any) => current?.id === desiredActiveSessionId ? current : null);
     let cancelled = false;
-    const unsubscribe = api.onSessionMetaChanged(activeSessionId, session => {
+    const unsubscribe = api.onSessionMetaChanged(desiredActiveSessionId, session => {
       if (!cancelled) setActiveSession(session);
     });
     // 顶栏只读 SessionStore index；不再为了元数据解析任意消息正文。
-    api.loadSessionMeta(activeSessionId).then((session) => {
+    api.loadSessionMeta(desiredActiveSessionId).then((session) => {
       if (cancelled) return;
       setActiveSession(session);
     }).catch(() => {
-      if (!cancelled) setActiveSession(api.peekSessionMeta(activeSessionId));
+      if (!cancelled) setActiveSession(api.peekSessionMeta(desiredActiveSessionId));
     });
     return () => { cancelled = true; unsubscribe(); };
-  }, [activeSessionId]);
+  }, [desiredActiveSessionId, currentUser.userId, currentUser.realm, backendConnected]);
 
   // Phase 2: 每 Session 独立的模型配置(顶栏标签用)
   const activeBackendId = activeSession?.backendId || backends[0]?.id || '';
@@ -991,8 +1037,8 @@ export const App: React.FC = () => {
               const oldest = notified.values().next().value as string | undefined;
               if (oldest) notified.delete(oldest);
             }
-            const sessionTitle = sessionsRef.current.find((session) => session.id === sid)?.title;
-            void notifyTaskCompletion(sessionTitle || '未命名 Session');
+            const meta = api.peekSessionMeta(sid) || sessionsRef.current.find((session) => session.id === sid);
+            if (canNotifySession(meta)) void notifyTaskCompletion(meta.title || '未命名 Session');
           }
         }
       } else {
@@ -1411,7 +1457,7 @@ export const App: React.FC = () => {
     );
   }
 
-  const firstHomePaneIdx = paneSessions
+  const firstHomePaneIdx = visiblePanes
     .slice(0, LAYOUT_SLOTS[layout])
     .findIndex((sessionId) => !sessionId);
 
@@ -1872,12 +1918,13 @@ export const App: React.FC = () => {
             {moreMenuOpen && (
               <div role="menu" aria-label="更多功能" style={moreMenuStyle}>
                 {!engineWorkspace && <TopbarMenuItem icon="▦" label={`分屏布局 · ${LAYOUT_LABEL[layout]}`} onClick={() => {
+                  navigationCommitRef.current = true;
                   setLayout((current) => LAYOUT_CYCLE[(LAYOUT_CYCLE.indexOf(current) + 1) % LAYOUT_CYCLE.length]);
                   setMoreMenuOpen(false);
                 }} />}
                 {!engineWorkspace && <TopbarMenuItem icon="📦" label="Skills 与 Prompts" active={repoPanelOpen} onClick={() => {
                   setSurfaceFocus('skills');
-                  dispatchWorkbench({ type: 'open', tab: 'library' });
+                  selectWorkbenchTab('library');
                   setSidebarView('extensions');
                   setMoreMenuOpen(false);
                 }} />}
@@ -1919,14 +1966,15 @@ export const App: React.FC = () => {
 
         {/* ---- Claude 登录状态提示 ---- */}
 
-        {!engineWorkspace && <WorkbenchTabs state={workbench} editing={repoPanelEditing} sessions={sessions}
+        {!engineWorkspace && <WorkbenchTabs state={visibleNavigation.workbench} editing={repoPanelEditing}
+          sessions={visibleNavigation.workbench.tabs.map(workbenchSessionId).filter((id): id is string => !!id).map(sessionMeta).filter(Boolean)}
           streamingSessions={streamingSessions} completedSessions={completedSessions}
           onSelect={selectWorkbenchTab} onClose={closeWorkbenchTab} onSessionMenu={openSessionMenu} />}
         {workbench.tabs.includes('library') && <section id="workbench-panel-library" role="tabpanel" aria-labelledby="workbench-tab-library"
           hidden={workbench.active !== 'library'} style={{ display: workbench.active === 'library' ? 'flex' : 'none', flex: 1, minHeight: 0, overflow: 'hidden' }}>
           <RepoPanel open={workbench.active === 'library'} embedded revision={skillLibraryRevision} workingDir=""
             onClose={() => closeWorkbenchTab('library')} onEditingChange={setRepoPanelEditing}
-            onOpenMarket={() => dispatchWorkbench({ type: 'open', tab: 'market' })} />
+            onOpenMarket={() => selectWorkbenchTab('market')} />
         </section>}
         {workbench.tabs.includes('market') && <section id="workbench-panel-market" role="tabpanel" aria-labelledby="workbench-tab-market"
           hidden={workbench.active !== 'market'} style={{ display: workbench.active === 'market' ? 'flex' : 'none', flex: 1, minHeight: 0, overflow: 'hidden' }}>
@@ -1950,13 +1998,13 @@ export const App: React.FC = () => {
             ...workbench.tabs.map(workbenchSessionId), ...paneSessions,
           ].filter((id): id is string => !!id))];
           // 刷新恢复的后台 Tab 仅显示标题，首次选中才挂载；已打开的实例继续保活。
-          if (chatWorkspaceVisible) for (const sid of paneSessions.slice(0, slotCount)) {
+          if (chatWorkspaceVisible) for (const sid of visiblePanes.slice(0, slotCount)) {
             if (sid) mountedSessionIdsRef.current.add(sid);
           }
           const columnCount = layout === '1x1' ? 1 : 2;
           return (
             <div id="workbench-panel-chat" role={engineWorkspace ? 'region' : 'tabpanel'} aria-label={engineWorkspace ? 'Session 工程工作区' : undefined}
-              aria-labelledby={engineWorkspace ? undefined : `workbench-tab-${chatWorkspaceVisible ? workbench.active : 'chat'}`} hidden={!chatWorkspaceVisible} style={{
+              aria-labelledby={engineWorkspace ? undefined : `workbench-tab-${chatWorkspaceVisible ? visibleNavigation.workbench.active : 'chat'}`} hidden={!chatWorkspaceVisible} style={{
               flex: 1,
               display: chatWorkspaceVisible ? 'grid' : 'none',
               gridTemplateColumns: gridCols,
@@ -1967,7 +2015,7 @@ export const App: React.FC = () => {
               background: 'var(--theme-border)',
             }}>
               {openedSessionIds.filter(sid => mountedSessionIdsRef.current.has(sid)).map(sid => {
-                const idx = paneSessions.indexOf(sid);
+                const idx = visiblePanes.indexOf(sid);
                 const placed = engineWorkspace ? sid === activeSessionId : idx >= 0 && idx < slotCount;
                 return <div key={sid} data-session-tab-panel={sid} hidden={!placed}
                   style={{ display: placed ? 'flex' : 'none', minWidth: 0, minHeight: 0, overflow: 'hidden',
@@ -1994,6 +2042,11 @@ export const App: React.FC = () => {
                     isMobile={isMobile}
                     onRequestNewSession={handleNewSession}
                     onOpenSession={id => setSessionInPane(id, idx >= 0 ? idx : undefined)}
+                    onRenewSession={(sourceId, next) => {
+                      setSessions(previous => [...previous.filter(row => row.id !== next.id), next]);
+                      setSessionInPane(next.id, idx >= 0 ? idx : undefined);
+                      dispatchWorkbench({ type: 'renewSession', source: sourceId, session: next.id });
+                    }}
                     onSessionDeleted={(sid) => {
                       closeWorkbenchTab(sessionWorkbenchTab(sid));
                     }}
@@ -2012,21 +2065,32 @@ export const App: React.FC = () => {
                   </AppModalVisibilityContext.Provider>
                 </div>;
               })}
-              {!engineWorkspace && Array.from({ length: slotCount }).map((_, idx) => paneSessions[idx] ? null : (
+              {!engineWorkspace && Array.from({ length: slotCount }).map((_, idx) => visiblePanes[idx] ? null : (
                 <div key={`empty-slot-${idx}`} onPointerDown={() => {
+                  navigationCommitRef.current = true;
                   setFocusedPaneIdx(idx); dispatchWorkbench({ type: 'open', tab: 'chat' });
                 }} style={{ display: 'contents' }}>
-                {idx === firstHomePaneIdx ? (
+                {windowRoute && !windowRouteResolved && idx === 0 ? (
+                  <section aria-label="Session 暂不可显示" style={{ background: 'var(--theme-bg)', display: 'grid', placeContent: 'center', padding: 20 }}>
+                    <p>正在确认目标 Session；节点离线或访问状态未确认时保持隐藏。</p>
+                  </section>
+                ) : paneSessions[idx] && !canShowSession(sessionMeta(paneSessions[idx]!), revealPrivate) ? (
+                  <section aria-label="Session 暂不可显示" style={{ background: 'var(--theme-bg)', display: 'grid', placeContent: 'center', gap: 12, padding: 20 }}>
+                    <p>{sessionVisibility(sessionMeta(paneSessions[idx]!)) === 'private' ? '此 Session 已隐藏' : '正在确认 Session 状态；节点离线或信息未就绪时保持隐藏。'}</p>
+                    <button type="button" onClick={() => { showPrivateSessions(true); setSessionInPane(paneSessions[idx], idx); }}>显示私密 Session</button>
+                    <button type="button" onClick={() => setSessionInPane(null, idx)}>返回首页</button>
+                  </section>
+                ) : idx === firstHomePaneIdx ? (
                   <HomeDashboard
                     key={`home-${idx}`}
                     contentId={`home-dashboard-content-${idx}`}
                     showSkipLink={false}
-                    sessions={sessions}
+                    sessions={visibleSessions}
                     backends={backends}
                     activeBackendId={backends[0]?.id}
                     connected={backendConnected}
-                    streamingSessionIds={streamingSessions}
-                    completedSessionIds={completedSessions}
+                    streamingSessionIds={new Set(visibleSessions.filter(s => streamingSessions.has(s.id)).map(s => s.id))}
+                    completedSessionIds={new Set(visibleSessions.filter(s => completedSessions.has(s.id)).map(s => s.id))}
                     onNavigate={handleDashboardNavigate}
                   />
                 ) : (

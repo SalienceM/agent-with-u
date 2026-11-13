@@ -1,8 +1,9 @@
 import asyncio
 import json
+import threading
 from pathlib import Path
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from tests.test_role_reviews import ReviewTests
 from src.backend.task_git import TaskGit
@@ -152,18 +153,84 @@ class TaskWorkspaceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_repository_and_authority_fields_fail_without_initializing(self):
         view = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main'))
-        self.assertEqual(view['status'], 'unavailable'); self.assertFalse((self.project / '.git').exists())
-        self.assertEqual(view['reason'], 'not_git')
-        self.assertEqual(view['notice'], '当前项目尚未启用 Git')
+        self.assertEqual(view['status'], 'ready'); self.assertFalse((self.project / '.git').exists())
+        self.assertEqual(view['initialization']['kind'], 'init')
+        self.assertTrue(view['defaults']['initializeRepository'])
         self.assertNotIn('fatal:', json.dumps(view))
+        with self.assertRaisesRegex(ValueError, '首次 Git 基线'):
+            await self.plan('no-initialization-consent')
+        self.assertFalse((self.project / '.git').exists())
         git = TaskGit(str(self.project)); git.run('init')
         unborn = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main'))
-        self.assertEqual(unborn['reason'], 'no_commits')
+        self.assertEqual(unborn['initialization']['kind'], 'initial_commit')
         self.assertNotIn('fatal:', json.dumps(unborn))
         self.assertEqual(git.run('rev-parse', '--verify', '--quiet', 'HEAD', allowed=(0, 1)), b'')
         for extra in [{'node': 'other'}, {'agentSessionId': 'main-native'}, {'kitApprovalDelegation': True}]:
             with self.assertRaises(ValueError):
                 await self.bridge._rpc_taskWorkspacePlan('main', 'invalid', json.dumps({'title': 'task', **extra}))
+
+    async def test_initialization_create_freezes_scope_and_creates_once_without_starting_model(self):
+        view = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main'))
+        plan = json.loads(await self.bridge._rpc_taskWorkspacePlan('main', 'initial-plan', json.dumps(view['defaults'])))
+        self.assertFalse((self.project / '.git').exists())
+        self.assertEqual(plan['repository']['initialization']['kind'], 'init')
+        self.bridge._project_reserve = AsyncMock(return_value={'root': str(self.project)})
+        self.bridge._project_release = AsyncMock()
+        self.bridge._project_branch_changed = Mock()
+        self.bridge._rpc_taskWorkspaceCreate('main', plan['id'], 'initial-create', plan['planFingerprint'])
+        await asyncio.gather(*list(self.bridge._task_jobs().values()))
+        result = json.loads(self.bridge._rpc_taskWorkspaceStatus('main', plan['id']))
+        self.assertEqual(result['status'], 'ready', result.get('notice'))
+        self.assertEqual(result['receipt']['status'], 'succeeded')
+        parent = TaskGit(str(self.project)).inspect()
+        self.assertEqual(parent['dirty'], [])
+        self.assertEqual(parent['head'], result['actual']['head'])
+        self.assertEqual(parent['branch'], 'main')
+        self.assertEqual((Path(result['root']) / 'proof.txt').read_bytes(), (self.project / 'proof.txt').read_bytes())
+        child = self.bridge._session_store.load(result['sessionId'])
+        self.assertEqual(child.messages, []); self.assertIsNone(child.agent_session_id)
+        self.bridge._project_release.assert_awaited_once()
+        again = json.loads(self.bridge._rpc_taskWorkspaceCreate('main', plan['id'], 'initial-create', plan['planFingerprint']))
+        self.assertEqual(again['actual']['head'], result['actual']['head'])
+        self.bridge._project_reserve.assert_awaited_once()
+
+    async def test_initialization_respects_source_activity_before_writing(self):
+        defaults = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main'))['defaults']
+        plan = json.loads(await self.bridge._rpc_taskWorkspacePlan('main', 'busy-plan', json.dumps(defaults)))
+        self.bridge._project_reserve = AsyncMock(side_effect=ValueError('主项目仍在运行'))
+        self.bridge._rpc_taskWorkspaceCreate('main', plan['id'], 'busy-create', plan['planFingerprint'])
+        await asyncio.gather(*list(self.bridge._task_jobs().values()))
+        result = json.loads(self.bridge._rpc_taskWorkspaceStatus('main', plan['id']))
+        self.assertEqual(result['status'], 'error')
+        self.assertFalse((self.project / '.git').exists())
+
+    async def test_cancelled_initialization_keeps_source_reserved_until_worker_exits(self):
+        defaults = json.loads(await self.bridge._rpc_taskWorkspaceInspect('main'))['defaults']
+        plan = json.loads(await self.bridge._rpc_taskWorkspacePlan('main', 'cancel-plan', json.dumps(defaults)))
+        self.bridge._project_reserve = AsyncMock(return_value={'root': str(self.project)})
+        self.bridge._project_release = AsyncMock()
+        self.bridge._project_branch_changed = Mock()
+        entered, release = threading.Event(), threading.Event()
+        def owned_create(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(5): raise RuntimeError('fixture timeout')
+            return {'head': 'a' * 40}
+        with patch.object(TaskGit, 'create', side_effect=owned_create):
+            self.bridge._rpc_taskWorkspaceCreate('main', plan['id'], 'cancel-create', plan['planFingerprint'])
+            task = self.bridge._task_jobs()[plan['id']]
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+                task.cancel()
+                await asyncio.sleep(.02)
+                self.bridge._project_release.assert_not_awaited()
+                self.assertFalse(task.done())
+            finally:
+                release.set()
+                await task
+        self.bridge._project_release.assert_awaited_once()
+        row = json.loads(self.bridge._rpc_taskWorkspaceStatus('main', plan['id']))
+        self.assertEqual(row['status'], 'unknown')
+        self.assertIsNone(self.bridge._session_store.load(plan['sessionId']))
 
     async def test_inspection_error_does_not_instruct_git_initialization(self):
         with patch.object(TaskGit, 'inspect', side_effect=OSError('fixture permission denied')):

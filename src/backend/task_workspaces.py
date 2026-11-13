@@ -180,7 +180,7 @@ class TaskWorkspaces:
         return source
 
     def _task_config(self, source: Any, raw: Any) -> dict:
-        if not isinstance(raw, dict) or set(raw) - {'title', 'goal', 'backendId', 'runtime', 'constraints', 'skills', 'skipPermissions', 'includePaths', 'snapshotMode', 'inheritSource'}:
+        if not isinstance(raw, dict) or set(raw) - {'title', 'goal', 'backendId', 'runtime', 'constraints', 'skills', 'skipPermissions', 'includePaths', 'snapshotMode', 'inheritSource', 'initializeRepository'}:
             raise CollaborationError('任务配置无效，不接受目录、原生线程或委托字段')
         if type(raw.get('inheritSource', False)) is not bool:
             raise CollaborationError('继承选项无效')
@@ -188,6 +188,9 @@ class TaskWorkspaces:
             raw = {**self._task_defaults(source), **raw}
         config = {}
         config['inheritSource'] = raw.get('inheritSource', False)
+        if type(raw.get('initializeRepository', False)) is not bool:
+            raise CollaborationError('初始化选项无效')
+        config['initializeRepository'] = raw.get('initializeRepository', False)
         config['snapshotMode'] = raw.get('snapshotMode', 'selected')
         if config['snapshotMode'] not in {'current', 'selected'}:
             raise CollaborationError('副本范围无效')
@@ -225,9 +228,10 @@ class TaskWorkspaces:
     async def _rpc_taskWorkspaceInspect(self, session_id: str) -> str:
         source = self._task_parent(session_id)
         try:
-            view = await asyncio.to_thread(lambda: TaskGit(source.working_dir).inspect())
+            view = await asyncio.to_thread(lambda: TaskGit(source.working_dir).inspect_for_copy())
             self._collaboration_scope(session_id)
-            return json.dumps({'status': 'ready', **view, 'defaults': self._task_defaults(source),
+            return json.dumps({'status': 'ready', **view, 'defaults': {**self._task_defaults(source),
+                'initializeRepository': bool(view.get('initialization'))},
                 'notice': '默认复制当前项目修改、新文件和项目 Skills；其他 Git 忽略文件（含缓存、依赖、构建产物）不复制。'}, ensure_ascii=False)
         except TaskRepositoryUnavailable as error:
             return json.dumps({'status': 'unavailable', 'reason': error.reason, 'notice': str(error),
@@ -250,7 +254,11 @@ class TaskWorkspaces:
             if old: return json.dumps(old, ensure_ascii=False)
             raise CollaborationError('原预览未完成；请核对原请求，没有自动重建')
         try:
-            repo = await asyncio.to_thread(lambda: TaskGit(source.working_dir).inspect())
+            repo = await asyncio.to_thread(lambda: TaskGit(source.working_dir).inspect_for_copy())
+            if repo.get('initialization') and not config['initializeRepository']:
+                raise CollaborationError('当前项目需要首次 Git 基线，请在创建表单中选择初始化并创建副本')
+            if config['initializeRepository'] and not repo.get('initialization'):
+                raise CollaborationError('项目已经有 Git 提交，请重新检查后创建副本')
             source = self._task_parent(session_id)
             if inherited is not None and inherited != self._task_inheritance(source):
                 raise CollaborationError('主 Session 配置已变化，请重新预览')
@@ -259,7 +267,8 @@ class TaskWorkspaces:
                 blocked = [item['path'] for item in repo['dirty'] if item['blocked']]
                 if blocked: raise CollaborationError('当前项目有不可复制路径，请处理或改选部分路径：' + '、'.join(blocked[:10]))
                 config['includePaths'] = [item['path'] for item in repo['dirty']]
-            skill_files = await asyncio.to_thread(lambda: TaskGit(source.working_dir).skill_files()) if config['inheritSource'] else []
+            skill_files = (repo['initialSkillFiles'] if repo.get('initialization') else
+                await asyncio.to_thread(lambda: TaskGit(source.working_dir).skill_files())) if config['inheritSource'] else []
             for name in config['includePaths']:
                 row = next((row for row in repo['dirty'] if row['path'] == name), None)
                 if row is None or row['blocked']: raise CollaborationError('路径不可快照：' + name)
@@ -269,6 +278,8 @@ class TaskWorkspaces:
                 'root': str(root), 'branch': 'awu/task/' + workspace_id, 'relationKind': 'task',
                 'inherited': inherited, 'skillFiles': skill_files,
                 'notice': '仅创建独立 Session、分支和 worktree；不会启动模型、push 或删除源内容。'}
+            if repo.get('initialization'):
+                plan['notice'] = '在当前项目建立首次 Git 提交，再创建独立分支副本。源文件保留，不启动模型或推送远端。'
             backend = next(item for item in self._backend_configs if item.id == config['backendId'])
             plan['backendFingerprint'] = fingerprint(backend.to_dict())
             plan['planFingerprint'] = fingerprint(plan)
@@ -314,14 +325,19 @@ class TaskWorkspaces:
 
     async def _task_create_owned(self, scope: Any, row: dict, receipt: dict) -> None:
         store = self._collaboration_store()
+        lease = None
+        worker = None
         try:
             root = paths.sub('task-workspaces', fingerprint([scope.owner, scope.executor])[:32], row['id'])
             if canonical_path(root) != canonical_path(row['root']): raise CollaborationError('任务目录归属变化')
             source = self._task_recheck_source(row)
             if canonical_path(source.working_dir) != row['repository']['root']: raise CollaborationError('源目录已变化')
-            result = await asyncio.to_thread(lambda: TaskGit(source.working_dir).create(row['repository'], root,
+            if row['repository'].get('initialization'):
+                lease = await self._project_reserve(source.id, 'initialize-' + row['id'])
+            worker = asyncio.create_task(asyncio.to_thread(lambda: TaskGit(source.working_dir).create(row['repository'], root,
                 row['branch'], row['config']['includePaths'], root.parent / '.scratch',
-                row.get('skillFiles', []) if row['config'].get('inheritSource') else None))
+                row.get('skillFiles', []) if row['config'].get('inheritSource') else None)))
+            result = await asyncio.shield(worker)
             self._task_recheck_source(row)
             config = row['config']
             inherited = deepcopy(row.get('inherited') or {})
@@ -345,6 +361,12 @@ class TaskWorkspaces:
             store.finish_request(scope, receipt['requestId'], receipt['revision'], 'succeeded', {'workspaceId': row['id'], 'sessionId': child.id, 'head': result['head']})
             self._emit_session_updated({'type': 'session_created', 'sessionId': child.id, 'summary': child.meta_dict()})
         except BaseException as error:
+            # 取消等待者不等于 Git 线程退出；首次提交持有的源目录保护要到实际结束才释放。
+            if lease and worker and not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except BaseException:
+                    pass
             try:
                 current = store.read(scope, 'workspace', row['id'])
                 self._task_update(scope, current, status='unknown' if isinstance(error, asyncio.CancelledError) else 'error', notice=str(error)[:1000] or '创建退出未知；原目录保留')
@@ -352,6 +374,10 @@ class TaskWorkspaces:
                 if current_receipt['status'] not in {'failed', 'succeeded'}:
                     store.finish_request(scope, receipt['requestId'], current_receipt['revision'], 'unknown', {'workspaceId': row['id'], 'notice': '创建未确认完成；原目录保留，未重试'})
             except Exception: pass
+        finally:
+            if lease and (worker is None or worker.done()):
+                self._project_branch_changed(row['repository']['root'])
+                await self._project_release(lease, committed=worker is not None)
 
     def _rpc_taskWorkspaceStatus(self, session_id: str, workspace_id: str) -> str:
         scope, store, row = self._task_workspace(session_id, workspace_id)

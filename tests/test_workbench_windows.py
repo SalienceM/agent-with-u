@@ -140,6 +140,35 @@ class WindowBridgeTests(unittest.IsolatedAsyncioTestCase):
             WINDOW_REQUEST.reset(wrong_window)
         store.commit_appearance.assert_not_called()
 
+    async def test_privacy_dispatch_checks_owner_and_window_for_new_and_legacy_writes(self):
+        store = Mock()
+        store.get_meta.return_value = self.session.meta_dict()
+        store.privacy_state.return_value = {"status": "ok", "protocolVersion": 1, "isPrivate": False, "privacyRevision": 0}
+        store.commit_appearance.return_value = {"status": "ok", "privacyRevision": 1}
+        self.bridge._session_store = store
+        self.bridge._emit_session_updated = Mock()
+        payload = json.dumps({"isPrivate": True, "expectedRevision": 0, "requestId": "one"})
+        result = json.loads(await self.bridge._dispatch('sessionPrivacySet', [self.session.id, payload]))
+        self.assertEqual('ok', result['status'])
+        store.commit_appearance.reset_mock()
+        owner = _REQUEST_OWNER_ID.set('another-user')
+        try:
+            with self.assertRaises(PermissionError):
+                await self.bridge._dispatch('sessionPrivacyGet', [self.session.id])
+            with self.assertRaises(PermissionError):
+                await self.bridge._dispatch('sessionPrivacySet', [self.session.id, payload])
+        finally:
+            _REQUEST_OWNER_ID.reset(owner)
+        wrong_window = WINDOW_REQUEST.set({**self.metadata, 'windowId': 'read-only'})
+        try:
+            for method, body in [('sessionPrivacySet', payload), ('updateSessionAppearance', '{"isPrivate":true}')]:
+                with self.assertRaises(WorkbenchError):
+                    await self.bridge._dispatch(method, [self.session.id, body])
+            self.assertEqual('ok', json.loads(await self.bridge._dispatch('sessionPrivacyGet', [self.session.id]))['status'])
+        finally:
+            WINDOW_REQUEST.reset(wrong_window)
+        store.commit_appearance.assert_not_called()
+
     async def test_transport_binds_one_authenticated_connection_and_rejects_metadata_omission(self):
         first, second = object(), object()
         self.bridge._window_bind_connection(first, self.metadata)

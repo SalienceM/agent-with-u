@@ -24,16 +24,16 @@ export const FileTransferCenter: React.FC = () => {
     {jobs.map(job => <div key={job.id} style={{ padding: '8px 0', borderTop: '1px solid var(--theme-border)', fontSize: 12 }}>
       <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between' }}>
         <span>{job.progress.direction === 'delete' ? '删除执行端' : job.progress.direction === 'push' ? '上传' : '下载'} · {job.label}</span>
-        {job.protectedReview ? <button disabled={['running','preparing'].includes(job.status)}
-          onClick={() => job.status === 'unresolved' ? void job.reconcile?.() : fileTransfers.dismiss(job)}>
-          {job.status === 'unresolved' ? '核对结果' : ['running','preparing'].includes(job.status) ? '等待确认…' : '关闭'}
+        {job.protectedReview ? <button disabled={job.status === 'preparing' || job.status === 'running' && !job.reconcile}
+          onClick={() => job.reconcile ? void job.reconcile() : fileTransfers.dismiss(job)}>
+          {job.status === 'preparing' ? '正在查询…' : job.reconcile ? '刷新状态' : job.status === 'running' ? '正在写入…' : '关闭'}
         </button> : <button disabled={job.status === 'running' && (job.abort.current || job.progress.direction === 'delete')}
           onClick={() => job.status === 'running' ? fileTransfers.cancel(job) : fileTransfers.dismiss(job)}>
           {job.status === 'running' ? (job.progress.direction === 'delete' ? '删除中…' : job.abort.current ? '取消中…' : '取消') : '关闭'}
         </button>}
       </div>
       <div title={job.workspace} style={{ overflowWrap: 'anywhere' }}>{job.progress.rel}</div>
-      {job.status === 'running' ? <>
+      {job.status === 'running' && !job.protectedReview ? <>
         <progress style={{ width: '100%' }} max={job.progress.totalBytes || 1} value={job.progress.doneBytes} />
         <div>{job.progress.direction === 'delete' ? '正在删除，请等待执行端确认…' : job.progress.totalBytes ? Math.round(job.progress.doneBytes / job.progress.totalBytes * 100) + '%' : '准备中…'}</div>
       </> : <div role="status">{job.message}</div>}

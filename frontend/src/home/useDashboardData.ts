@@ -260,7 +260,7 @@ export function useDashboardData({
         at: Date.now(),
         kind: 'session',
         title: event?.type === 'session_deleted' ? '会话已删除' : '会话列表已更新',
-        detail: event?.summary?.title || event?.title || '',
+        detail: sessionId && event?.type !== 'session_deleted' ? event?.summary?.title || event?.title || '' : '',
         tone: event?.type === 'session_deleted' ? 'warning' : 'neutral',
         destination: sessionId && event?.type !== 'session_deleted'
           ? { kind: 'session', sessionId }
@@ -302,15 +302,15 @@ export function useDashboardData({
 
   const viewModel = useMemo(() => buildDashboardViewModel({
     sessions,
-    loopStates,
-    taskStates,
+    loopStates: Object.fromEntries(Object.entries(loopStates).filter(([id]) => sessions.some(s => s.id === id))),
+    taskStates: Object.fromEntries(Object.entries(taskStates).filter(([id]) => sessions.some(s => s.id === id))),
     backends,
     executors,
     activeBackendId,
     connected,
     streamingSessionIds,
     completedSessionIds,
-    activity,
+    activity: activity.filter(item => !item.destination || !('sessionId' in item.destination) || sessions.some(s => s.id === (item.destination as { sessionId: string }).sessionId)),
     loadState,
     errorMessage,
     updatedAt,

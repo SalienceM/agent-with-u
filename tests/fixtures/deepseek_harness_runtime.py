@@ -15,7 +15,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--scenario", choices=("normal", "malformed-end", "missing-end", "crash", "slow", "oversize", "large-frame", "unterminated", "flood", "tree", "bad-cap", "no-cap", "error", "aborted", "blocked", "max-tokens", "child", "auth",
-        "http-401", "http-403", "http-404", "http-429", "http-503", "stale-end", "child-end", "duplicate-end"), default="normal")
+        "http-401", "http-403", "http-404", "http-429", "http-503", "stale-end", "child-end", "duplicate-end",
+        "continuation", "continuation-error", "continuation-recovery", "continuation-missing-end",
+        "continuation-wrong-end", "continuation-repeated-start", "continuation-stall", "duplicate-new-seq",
+        "wait-stall", "compaction"), default="normal")
     parser.add_argument("--identity-patch", type=Path)
     args = parser.parse_args()
     state: dict[str, int] = json.loads(args.state.read_text()) if args.state.exists() else {}
@@ -31,10 +34,10 @@ def main() -> None:
     def notify(method: str, params: dict[str, Any]) -> None:
         emit({"method": method, "params": params})
 
-    def event(session_id: str, kind: str, data: dict[str, Any]) -> None:
+    def event(session_id: str, kind: str, data: dict[str, Any], **metadata: Any) -> None:
         nonlocal seq
         notify("session.event", {"sessionId": session_id,
-               "event": {"type": kind, "seq": seq, "time": 0, "data": data}})
+               "event": {"type": kind, "seq": seq, "time": 0, "data": data, **metadata}})
         seq += 1
 
     for line in sys.stdin:
@@ -86,7 +89,16 @@ def main() -> None:
             # Receipt 之前的 idle 必须被 SDK 忽略，不能提前终结本次输入。
             notify("session.status", {"sessionId": session_id, "status": "idle"})
             event(session_id, "agent/inbox/spliced", {"inserted": [{"id": message_id}]})
+            event(session_id, "turn/start", {"turn": 14})
             notify("session.status", {"sessionId": session_id, "status": "running"})
+            if args.scenario == "compaction":
+                event(session_id, "compaction/prune", {"shadowedRange": {"start": 0, "end": 0},
+                    "shadowedSeqs": [0], "shadowedTokenCount": 100})
+                # 来源位于本轮 receipt 之前，不会在本次订阅中出现对应的 tool/call。
+                event(session_id, "tool/result", {"turn": 1, "step": 1, "message": {
+                    "role": "tool", "id": "historic-result", "toolCallId": "historic-call", "isError": False,
+                    "content": [{"type": "text", "text": "pruned historic output"}]}},
+                    surfaceOp={"op": "replace", "startSeq": 0, "endSeq": 0}, sourceEventSeqs=[0])
             if args.scenario == "slow":
                 time.sleep(0.15)
             state[session_id] = state.get(session_id, 0) + 1
@@ -108,16 +120,44 @@ def main() -> None:
             if args.scenario != "missing-end":
                 reason = args.scenario if args.scenario in {"error", "aborted", "blocked", "max-tokens"} else "completed"
                 end = {"kind": reason}
+                if args.scenario == "continuation-recovery":
+                    end = {"kind": "error", "error": {"status": 429}}
                 if args.scenario.startswith("http-"):
                     end = {"kind": "error", "error": {"status": int(args.scenario[5:]), "code": "INVALID_REQUEST",
                         "message": "PRIVATE_PROVIDER_BODY " + os.environ.get("DEEPSEEK_API_KEY", ""),
                         "requestId": "PRIVATE_PROVIDER_REQUEST", "url": "https://fixture.invalid/?token=PRIVATE"}}
-                event(session_id, "turn/end", {} if args.scenario == "malformed-end" else {"reason": end})
+                event(session_id, "turn/end", {"turn": 14} if args.scenario == "malformed-end" else {"turn": 14, "reason": end})
                 if args.scenario == "duplicate-end":
                     notify("session.event", {"sessionId": session_id, "event": {"type": "turn/end", "seq": seq - 1,
                         "data": {"reason": {"kind": "error", "error": {"status": 401}}}}})
+                if args.scenario == "duplicate-new-seq":
+                    event(session_id, "turn/end", {"turn": 14, "reason": end})
             notify("session.status", {"sessionId": session_id, "status": "idle"})
         elif method == "session/wait":
+            if args.scenario == "wait-stall":
+                continue
+            if args.scenario.startswith("continuation"):
+                # rc.3 原生 goal 在短暂 idle 后自行续跑；不需要第二次 session/prompt。
+                for turn in (15, 16):
+                    event(session_id, "agent/inbox/spliced", {"target": "next-turn", "inserted": [
+                        {"id": f"fixture-goal-{turn}", "source": {"kind": "goal"}}]})
+                    event(session_id, "turn/start", {"turn": turn})
+                    notify("session.status", {"sessionId": session_id, "status": "running"})
+                    if args.scenario == "continuation-repeated-start":
+                        event(session_id, "turn/start", {"turn": turn})
+                    event(session_id, "assistant/message", {"message": {"id": f"fixture-output-{turn}",
+                        "role": "assistant", "content": [{"type": "text", "text": f"continued-{turn}"}]}, "stream": []})
+                    time.sleep(.3)
+                    if args.scenario == "continuation-stall":
+                        break
+                    end = ({"kind": "error", "error": {"status": 503}}
+                           if args.scenario == "continuation-error" else {"kind": "completed"})
+                    if args.scenario != "continuation-missing-end":
+                        event(session_id, "turn/end", {"turn": 14 if args.scenario == "continuation-wrong-end" else turn,
+                            "reason": end})
+                    notify("session.status", {"sessionId": session_id, "status": "idle"})
+                if args.scenario == "continuation-stall":
+                    continue
             if args.scenario == "child":
                 time.sleep(.2)
                 notify("subagent.finished", {"parentSessionId": session_id, "childSessionId": "fixture-child",

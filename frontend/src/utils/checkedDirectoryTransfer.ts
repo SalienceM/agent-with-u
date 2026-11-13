@@ -62,35 +62,53 @@ export async function cancelDirectoryTransfer(prepared: PreparedDirectoryTransfe
   if (api.projectTransferIdentity() !== identity) return;
   await api.directoryTransferCall(input.executor, 'Cancel', [input.session, JSON.stringify(plan.workspace), plan.id]);
 }
-export async function submitDirectoryTransfer(prepared: PreparedDirectoryTransfer, changed: () => void): Promise<void> {
+export async function submitDirectoryTransfer(prepared: PreparedDirectoryTransfer, changed: () => void, started?: () => void): Promise<void> {
   const { input, plan, source, ignore, identity } = prepared;
   assertCurrent(input, identity); checkDrafts(prepared);
   const job = fileTransfers.start(input.transferKey, input.label, 'push', input.scope);
   if (!job) throw new Error('此目录已有传输尚未完成');
   job.ownerId = plan.workspace.ownerId;
-  let submitted = false, pending: Promise<void> | undefined;
+  let submitted = false, pending: Promise<void> | undefined, commitError = '';
   const args = [input.session, JSON.stringify(plan.workspace), plan.id];
-  const unknown = () => fileTransfers.reviewState(job, 'unresolved', '提交结果未知，请核对原请求；不会自动重复写入', reconcile);
-  const settle = (row: DirectoryTransferPlan) => {
+  const messageOf = (error: unknown) => {
+    const message = String(error instanceof Error ? error.message : error).slice(0, 500);
+    return message === 'window_lease_required' ? '当前窗口未取得上传权限，请重新打开目标会话' : message;
+  };
+  const unknown = (reason: string) => fileTransfers.reviewState(job, 'unresolved',
+    `暂时无法确认上传结果${reason ? '：' + reason : ''}。恢复连接后可刷新状态。`, reconcile);
+  const settle = async (row: DirectoryTransferPlan): Promise<void> => {
     validatePlan(row, plan.workspace, input);
     if (row.id !== plan.id) throw new Error('回执不属于原传输');
-    if (row.state === 'succeeded') {
+    if (row.state === 'preview') {
+      // 原提交可能仍在队列中。先关闭未开始的计划，收到取消回执才释放占用；
+      // 若提交已先开始，Cancel 返回 committing，继续保留真实运行状态。
+      if (api.projectTransferIdentity() !== identity) throw new Error('用户或连接身份已变化，请回到原用户和节点核对');
+      const cancelled = await api.directoryTransferCall(input.executor, 'Cancel', args);
+      if (cancelled?.state === 'preview') throw new Error('执行端未确认关闭未开始的上传');
+      await settle(cancelled);
+    } else if (row.state === 'succeeded') {
       const expected = plan.entries.filter(e => e.action === 'add' || e.action === 'update').map(e => e.path).sort();
       const deletions = plan.entries.filter(e => e.action === 'delete').map(e => e.path).sort();
       if (JSON.stringify([...row.uploaded].sort()) !== JSON.stringify(expected) || JSON.stringify([...row.deleted].sort()) !== JSON.stringify(deletions)) throw new Error('传输验收回执不完整');
       fileTransfers.reviewState(job, 'done', `已上传 ${expected.length} · 跳过 ${plan.entries.filter(e => e.action === 'skip').length} · 删除 ${deletions.length}`);
       changed();
     } else if (row.state === 'failed' || row.state === 'cancelled') {
-      fileTransfers.reviewState(job, 'error', `${row.message || '传输未完成'}；已上传 ${row.uploaded.length}，已删除 ${row.deleted.length}`);
+      const reason = row.message || commitError || '上传已取消';
+      fileTransfers.reviewState(job, 'error', row.state === 'cancelled' && !row.uploaded.length && !row.deleted.length
+        ? `上传未写入目标：${reason}。可以重新上传。`
+        : `${reason}；已上传 ${row.uploaded.length}，已删除 ${row.deleted.length}`);
       changed();
-    } else unknown();
+    } else if (row.state === 'committing') {
+      fileTransfers.reviewState(job, 'running', '执行端正在写入文件，可刷新查看结果。', reconcile);
+    } else throw new Error('执行端返回了无效的上传状态');
   };
   const reconcile = (): Promise<void> => {
     if (pending) return pending;
     pending = (async () => {
-      if (api.projectTransferIdentity() !== identity) { unknown(); return; }
-      try { settle(await api.directoryTransferCall(input.executor, 'Status', args)); }
-      catch { unknown(); }
+      if (api.projectTransferIdentity() !== identity) { unknown('用户或连接身份已变化，请回到原用户和节点核对'); return; }
+      fileTransfers.reviewState(job, 'preparing', '正在查询上传结果…', reconcile);
+      try { await settle(await api.directoryTransferCall(input.executor, 'Status', args)); }
+      catch (error) { unknown(messageOf(error)); }
     })().finally(() => { pending = undefined; });
     return pending;
   };
@@ -101,6 +119,7 @@ export async function submitDirectoryTransfer(prepared: PreparedDirectoryTransfe
     if (!sameTransferManifest(actual, source)) throw new Error('源目录已变化，请重新预览；未提交目标修改');
   };
   try {
+    started?.();
     await recheckSource();
     const entries = plan.entries.filter(e => e.action === 'add' || e.action === 'update');
     const totalBytes = entries.reduce((sum, e) => sum + e.size, 0);
@@ -125,9 +144,11 @@ export async function submitDirectoryTransfer(prepared: PreparedDirectoryTransfe
     fileTransfers.reviewState(job, 'running', '正在核对目标并提交…');
     submitted = true;
     const row = await api.directoryTransferCall(input.executor, 'Commit', [input.session, JSON.stringify(plan.workspace), input.workingDir, plan.id]);
-    settle(row);
+    await settle(row);
   } catch (error) {
-    if (submitted && !(error as { transferRejected?: boolean })?.transferRejected) await reconcile();
+    commitError = messageOf(error);
+    if (submitted && !(error as { transferRejected?: boolean; notSubmitted?: boolean })?.transferRejected
+      && !(error as { notSubmitted?: boolean })?.notSubmitted) await reconcile();
     else {
       await cancelDirectoryTransfer(prepared).catch(() => {});
       fileTransfers.finish(job, String(error instanceof Error ? error.message : error), true);

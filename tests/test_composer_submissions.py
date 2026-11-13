@@ -69,3 +69,36 @@ class ComposerSubmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.status()['state'], 'unknown')
         self.assertEqual(self.submit()['state'], 'unknown')
         self.bridge._async_send.assert_not_awaited()
+
+    async def test_steer_submission_retains_draft_until_real_receipt_and_deduplicates(self):
+        self.payload['deliveryMode'] = 'steer'
+        started, release = asyncio.Event(), asyncio.Event()
+        async def steer(*args):
+            self.assertEqual(args[1], self.payload['content'])
+            self.assertEqual(args[4], 'user-1')
+            self.assertEqual(json.loads(args[3])[0]['content'], 'edited block')
+            started.set()
+            await release.wait()
+            return json.dumps({'status': 'ok'})
+        with patch.object(self.bridge, '_rpc_steerMessage', side_effect=steer) as method:
+            self.assertEqual(self.submit()['state'], 'preparing')
+            await started.wait()
+            release.set()
+            await asyncio.gather(*self.bridge._composer_steer_tasks)
+            self.assertEqual(self.status()['state'], 'accepted')
+            self.assertEqual(self.submit()['state'], 'accepted')
+            method.assert_awaited_once()
+        self.bridge._async_send.assert_not_awaited()
+
+    async def test_late_and_unknown_steers_never_start_or_queue_a_turn(self):
+        self.payload['deliveryMode'] = 'steer'
+        for result, state in [('turn_finished', 'rejected'), ('unknown', 'unknown')]:
+            self.payload['requestId'] = result
+            with patch.object(self.bridge, '_rpc_steerMessage', return_value=json.dumps({'status': result})) as method:
+                self.assertEqual(self.submit()['state'], 'preparing')
+                await asyncio.gather(*self.bridge._composer_steer_tasks)
+                self.assertEqual(self.status()['state'], state)
+                self.assertEqual(self.submit()['state'], state)
+                method.assert_awaited_once()
+        self.assertFalse(self.bridge._chat_extras_get(self.session.id).seq_tasks)
+        self.bridge._async_send.assert_not_awaited()

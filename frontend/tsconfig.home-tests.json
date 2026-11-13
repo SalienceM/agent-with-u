@@ -17,6 +17,8 @@
     "src/utils/harnessImageSubmission.ts",
     "src/types/harnessImages.ts",
     "src/utils/sessionFavorites.ts",
+    "src/utils/sessionPrivacy.ts",
+    "src/utils/sessionVisibility.ts",
     "src/utils/sessionDeletion.ts",
     "src/utils/aimeinRuntime.ts",
     "src/utils/aimeinReviewSummary.ts",

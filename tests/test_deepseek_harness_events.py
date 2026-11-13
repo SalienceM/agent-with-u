@@ -28,10 +28,55 @@ class HarnessEventTests(unittest.TestCase):
             "sessionId": sid, "generation": "generation", "configFingerprint": "fingerprint",
             "frame": {"type": kind, "attemptId": attempt, "revision": revision, **data}}})
 
-    def event(self, kind, data, sid="root", seq=None):
+    def event(self, kind, data, sid="root", seq=None, **metadata):
         self.seq += 1
         self.project.observe({"method": "session.event", "payload": {"sessionId": sid,
-            "event": {"seq": self.seq if seq is None else seq, "type": kind, "data": data}}})
+            "event": {"seq": self.seq if seq is None else seq, "type": kind, "data": data, **metadata}}})
+
+    def test_historical_compaction_replacement_is_not_an_unmatched_live_result(self) -> None:
+        self.event("turn/start", {"turn": 24}, seq=100)
+        self.event("compaction/prune", {"shadowedRange": {"start": 4, "end": 4},
+                   "shadowedSeqs": [4], "shadowedTokenCount": 100}, seq=101)
+        self.event("tool/result", {"turn": 1, "step": 1, "message": {"toolCallId": "old-call",
+                   "content": [{"type": "text", "text": "pruned historical skill"}]}}, seq=102,
+                   surfaceOp={"op": "replace", "startSeq": 4, "endSeq": 4}, sourceEventSeqs=[4])
+        self.assertEqual(self.deltas, [])
+        self.assertFalse(self.project.tools)
+        self.assertIsNone(self.project.usage())
+
+    def test_replacement_keeps_current_original_output_and_does_not_repeat_usage(self) -> None:
+        self.event("tool/call", {"callId": "current", "name": "read", "arguments": "{}"}, seq=10)
+        self.event("tool/result", {"message": {"toolCallId": "current", "content": [
+            {"type": "text", "text": "full original"}]}}, seq=11)
+        self.event("assistant/message", {"message": {"content": [{"type": "text", "text": "reply"}]},
+            "usage": {"inputTokens": 10, "outputTokens": 5}}, seq=12)
+        before = list(self.deltas)
+        usage = self.project.usage()
+        self.event("tool/result", {"message": {"toolCallId": "current", "content": [
+            {"type": "text", "text": "pruned"}]}}, seq=13,
+            surfaceOp={"op": "replace", "startSeq": 11, "endSeq": 11}, sourceEventSeqs=[11])
+        self.event("assistant/message", {"message": {"content": [{"type": "text", "text": "summary"}]},
+            "usage": {"inputTokens": 10, "outputTokens": 5}}, seq=14,
+            surfaceOp={"op": "replace", "startSeq": 12, "endSeq": 12})
+        self.assertEqual(self.deltas, before)
+        self.assertEqual(self.project.usage(), usage)
+
+    def test_normal_orphan_and_invalid_replacement_still_fail(self) -> None:
+        data = {"message": {"toolCallId": "missing", "content": []}}
+        with self.assertRaisesRegex(ValueError, "没有对应调用"):
+            self.event("tool/result", data, seq=20, surfaceOp="append", sourceEventSeqs=[2])
+        invalid = [
+            {"surfaceOp": "replace"},
+            {"surfaceOp": {"op": "replace", "startSeq": 2, "endSeq": 2}},
+            {"surfaceOp": {"op": "replace", "startSeq": True, "endSeq": 2}, "sourceEventSeqs": [1, 2]},
+            {"surfaceOp": {"op": "replace", "startSeq": 8, "endSeq": 2}, "sourceEventSeqs": [2, 8]},
+            {"surfaceOp": {"op": "replace", "startSeq": 2, "endSeq": 2}, "sourceEventSeqs": [3]},
+            {"surfaceOp": {"op": "replace", "startSeq": 2, "endSeq": 2}, "sourceEventSeqs": [2, 2]},
+            {"surfaceOp": {"op": "replace", "startSeq": 2, "endSeq": 99}, "sourceEventSeqs": [2, 99]},
+        ]
+        for seq, metadata in enumerate(invalid, 21):
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(ValueError, "上下文替换事件无效"):
+                self.event("tool/result", data, seq=seq, **metadata)
 
     def test_revisions_are_per_publication_and_commit_does_not_repeat_text_thinking_or_usage(self) -> None:
         self.live("start")
@@ -59,6 +104,9 @@ class HarnessEventTests(unittest.TestCase):
         self.event("tool/call", {"callId": "call", "name": "write", "arguments": '{"file":"x"}'})
         self.event("tool/result", {"message": {"toolCallId": "call", "isError": True, "content": [{"type": "text", "text": "denied"}]}})
         self.assertEqual([kind for kind, _ in self.deltas], ["tool_start", "tool_input", "tool_result"])
+        self.assertEqual(self.deltas[1][1]["tool_call"]["inputDelta"], '"x"}')
+        self.assertEqual(self.deltas[0][1]["tool_call"]["input"] + self.deltas[1][1]["tool_call"]["inputDelta"],
+                         '{"file":"x"}')
         self.assertEqual(self.deltas[-1][1]["tool_call"]["status"], "error")
         self.assertEqual(self.deltas[-1][1]["tool_call"]["id"], "call")
 

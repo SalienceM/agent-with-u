@@ -13,6 +13,7 @@ async function mount(page: Page, width = 1280) {
   await page.evaluate(async () => {
     const { React, createRoot } = await import('/tests/engine/chat-kit-feedback-harness.ts');
     const { DirectoryTransferDialog } = await import('/src/components/DirectoryTransferDialog.tsx');
+    const { FileTransferCenter } = await import('/src/components/FileTransferCenter.tsx');
     const { api, getCurrentUserProfile } = await import('/src/api.ts');
     const { byteHash } = await import('/src/utils/documentCodec.ts');
     const { fileTransfers } = await import('/src/utils/fileTransfers.ts');
@@ -21,7 +22,8 @@ async function mount(page: Page, width = 1280) {
     document.body.style.fontFamily = 'system-ui, sans-serif'; document.body.style.margin = '0';
     const f = { calls: [] as any[], source: { same: 'same', changed: 'new', empty: '' } as Record<string, string>,
       target: { same: 'same', changed: 'old', extra: 'delete me' }, mirror: false, identity: 'initial',
-      lost: false, unknown: false, corrupt: false, closed: 0, changed: 0, render: () => {}, rows: new Map(), scans: 0,
+      lost: false, unknown: false, corrupt: false, rejected: false, statusError: '', holdCommit: null as Promise<void> | null,
+      holdStatus: null as Promise<void> | null, cancelRace: false, closed: 0, changed: 0, render: () => {}, rows: new Map(), scans: 0,
       manager: fileTransfers, scanTransferSource };
     const meta = (data: string) => ({ hash: byteHash(new TextEncoder().encode(data)), size: data.length });
     const sourceManifest = () => Object.fromEntries(Object.entries(f.source).map(([p, s]) => [p, meta(s)]));
@@ -38,21 +40,29 @@ async function mount(page: Page, width = 1280) {
         f.rows.set(row.id, row); return structuredClone(row);
       }
       const id = args[method === 'Commit' ? 3 : 2] as string, row = f.rows.get(id);
-      if (method === 'Cancel') { row.state = 'cancelled'; return structuredClone(row); }
+      if (method === 'Cancel') { row.state = f.cancelRace ? 'committing' : 'cancelled'; return structuredClone(row); }
       if (method === 'Chunk') { if (f.corrupt) throw Error('network failure'); return { written: atob(args[5] as string).length }; }
       if (method === 'Commit') {
+        if (f.holdCommit) await f.holdCommit;
+        if (f.rejected) throw Error('window_lease_required');
         row.state = f.unknown ? 'committing' : 'succeeded';
         row.uploaded = row.entries.filter((e: any) => e.action === 'add' || e.action === 'update').map((e: any) => e.path);
         row.deleted = row.entries.filter((e: any) => e.action === 'delete').map((e: any) => e.path);
         if (f.lost || f.unknown) throw Error('reply lost');
         return structuredClone(row);
       }
-      if (method === 'Status') return structuredClone(row);
+      if (method === 'Status') {
+        if (f.holdStatus) await f.holdStatus;
+        if (f.statusError) throw Error(f.statusError);
+        return structuredClone(row);
+      }
       throw Error(method);
     };
     const fs = { kind: 'browser', id: () => 'local-copy', label: () => 'D:/source', transferScan: async () => { f.scans++; return sourceManifest(); },
       readChunk: async (rel: string, offset: number, size: number) => btoa(f.source[rel].slice(offset, offset + size)) };
     const root = createRoot(document.getElementById('root')!);
+    const center = document.createElement('div'); document.body.append(center);
+    createRoot(center).render(React.createElement(FileTransferCenter));
     f.render = () => root.render(React.createElement(DirectoryTransferDialog, { input: { executor: 'remote', session: 's', workingDir: 'C:/remote', fs, scope: '', directory: true, mirror: f.mirror,
       includeGit: false, transferKey: 'remote:/work', label: '执行节点 B', current: () => true },
       onClose: () => { f.closed++; root.render(null); }, onChanged: () => { f.changed++; } }));
@@ -100,16 +110,73 @@ test('source changes refuse the frozen plan', async ({ page }) => {
   expect(await page.evaluate(() => (window as any).fixture.calls.filter((a: any[]) => ['Chunk', 'Commit'].includes(a[0])))).toEqual([]);
 });
 
-test('lost receipt checks original without replay and unresolved remains reserved', async ({ page }) => {
+test('lost receipt shows actual running state and refresh completes without replay', async ({ page }) => {
   await mount(page); await page.evaluate(() => { (window as any).fixture.unknown = true; });
   await page.getByRole('button', { name: '确认传输', exact: true }).click();
-  await expect.poll(() => page.evaluate(() => (window as any).fixture.manager.getSnapshot()[0]?.status)).toBe('unresolved');
+  await expect(page.getByRole('region', { name: '文件传输' })).toContainText('执行端正在写入文件');
+  expect(await page.evaluate(() => !!(window as any).fixture.manager.active('remote:/work'))).toBe(true);
   expect(await page.evaluate(() => (window as any).fixture.calls.filter((a: any[]) => a[0] === 'Status'))).toHaveLength(1);
-  await page.evaluate(async () => {
-    const f = (window as any).fixture; f.rows.get('1').state = 'succeeded'; await f.manager.getSnapshot()[0].reconcile();
-  });
-  expect(await page.evaluate(() => (window as any).fixture.manager.getSnapshot()[0].status)).toBe('done');
+  await page.evaluate(() => { (window as any).fixture.rows.get('1').state = 'succeeded'; });
+  await page.getByRole('button', { name: '刷新状态' }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).fixture.manager.getSnapshot()[0].status)).toBe('done');
   expect(await page.evaluate(() => (window as any).fixture.calls.filter((a: any[]) => a[0] === 'Commit'))).toHaveLength(1);
+});
+
+test('pre-dispatch rejection closes original preview and releases transfer controls', async ({ page }) => {
+  await mount(page); await page.evaluate(() => { (window as any).fixture.rejected = true; });
+  await page.getByRole('button', { name: '确认传输', exact: true }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByRole('region', { name: '文件传输' })).toContainText('上传未写入目标');
+  await expect(page.getByRole('region', { name: '文件传输' })).toContainText('当前窗口未取得上传权限');
+  const state = await page.evaluate(() => {
+    const f = (window as any).fixture;
+    return { active: !!f.manager.active('remote:/work'), state: f.rows.get('1').state, methods: f.calls.map((c: any[]) => c[0]) };
+  });
+  expect(state.active).toBe(false); expect(state.state).toBe('cancelled');
+  expect(state.methods.slice(-3)).toEqual(['Commit', 'Status', 'Cancel']);
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('region', { name: '文件传输' })).toHaveCount(0);
+});
+
+test('cancel racing a delayed commit keeps the upload reserved', async ({ page }) => {
+  await mount(page); await page.evaluate(() => { Object.assign((window as any).fixture, { rejected: true, cancelRace: true }); });
+  await page.getByRole('button', { name: '确认传输', exact: true }).click();
+  await expect(page.getByRole('region', { name: '文件传输' })).toContainText('执行端正在写入文件');
+  expect(await page.evaluate(() => !!(window as any).fixture.manager.active('remote:/work'))).toBe(true);
+});
+
+test('status errors stay visible and refresh shows progress while coalescing clicks', async ({ page }) => {
+  await mount(page); await page.evaluate(() => { Object.assign((window as any).fixture, { unknown: true, statusError: '执行端离线' }); });
+  await page.getByRole('button', { name: '确认传输', exact: true }).click();
+  await expect(page.getByRole('region', { name: '文件传输' })).toContainText('执行端离线');
+  await page.evaluate(() => {
+    const f = (window as any).fixture;
+    f.holdStatus = new Promise(resolve => { f.releaseStatus = resolve; });
+  });
+  await page.getByRole('button', { name: '刷新状态' }).click();
+  await expect(page.getByRole('button', { name: '正在查询…' })).toBeDisabled();
+  await expect(page.getByRole('region', { name: '文件传输' })).toContainText('正在查询上传结果');
+  await page.evaluate(() => {
+    const f = (window as any).fixture; void f.manager.getSnapshot()[0].reconcile();
+    f.statusError = ''; f.rows.get('1').state = 'succeeded'; f.releaseStatus();
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).fixture.manager.getSnapshot()[0].status)).toBe('done');
+  const calls = await page.evaluate(() => (window as any).fixture.calls.map((c: any[]) => c[0]));
+  expect(calls.filter((c: string) => c === 'Commit')).toHaveLength(1);
+  expect(calls.filter((c: string) => c === 'Status')).toHaveLength(2);
+});
+
+test('confirmation closes the modal while the upload continues in the transfer center', async ({ page }) => {
+  await mount(page);
+  await page.evaluate(() => {
+    const f = (window as any).fixture; f.holdCommit = new Promise(resolve => { f.releaseCommit = resolve; });
+  });
+  await page.getByRole('button', { name: '确认传输', exact: true }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByRole('region', { name: '文件传输' })).toContainText('正在核对目标并提交');
+  await expect(page.getByRole('button', { name: '正在写入…' })).toBeDisabled();
+  await page.evaluate(() => { (window as any).fixture.releaseCommit(); });
+  await expect(page.getByRole('region', { name: '文件传输' })).toContainText('已上传 2');
 });
 
 test('body failure never commits mirror deletion', async ({ page }) => {

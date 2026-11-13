@@ -305,6 +305,8 @@ class Session:
     # sidebar_color 只保存受控预设 ID，前端负责映射成固定渐变，禁止任意 CSS。
     pinned: bool = False
     favorite_revision: int = 0
+    is_private: bool = False
+    privacy_revision: int = 0
     sidebar_color: str = ""
     # ★ 自动 AI commit + push：对话/Loop 结束时自动 stage-all → AI 生成 message → commit → push
     auto_commit: bool = False
@@ -323,6 +325,10 @@ class Session:
     workspace_id: Optional[str] = None
     followup_suggestions_enabled: bool = False
     followup_suggestions_config: dict = field(default_factory=dict)
+    # 同目录新会话的时间轴；与任务父子关系、原生线程身份分开。
+    history_root_id: Optional[str] = None
+    history_source_id: Optional[str] = None
+    history_request_id: Optional[str] = None
     # 未识别持久字段仅供原样写回，绝不加入跨节点/UI 投影。
     persisted_extra: dict = field(default_factory=dict, repr=False)
 
@@ -376,6 +382,8 @@ class Session:
             "loopControlMode": self.loop_control_mode,
             "pinned": self.pinned,
             "favoriteRevision": self.favorite_revision,
+            "isPrivate": self.is_private,
+            "privacyRevision": self.privacy_revision,
             "sidebarColor": self.sidebar_color,
             "skipPermissions": self.skip_permissions,
             "autoContinue": self.auto_continue,
@@ -383,6 +391,9 @@ class Session:
             "autoCommitPush": self.auto_commit_push,
             "autoCommitBackendId": self.auto_commit_backend_id,
             "tokenUsage": self.token_usage or {},
+            "historyRootId": self.history_root_id,
+            "historySourceId": self.history_source_id,
+            "historyRequestId": self.history_request_id,
             **self.collaboration_meta(),
         }
 
@@ -411,10 +422,14 @@ class Session:
             "loopControlMode": self.loop_control_mode,
             "pinned": self.pinned,
             "favoriteRevision": self.favorite_revision,
+            "isPrivate": self.is_private,
+            "privacyRevision": self.privacy_revision,
             "sidebarColor": self.sidebar_color,
             "autoCommit": self.auto_commit,
             "autoCommitPush": self.auto_commit_push,
             "autoCommitBackendId": self.auto_commit_backend_id,
+            "historyRootId": self.history_root_id,
+            "historySourceId": self.history_source_id,
             **self.collaboration_meta(),
         }
 

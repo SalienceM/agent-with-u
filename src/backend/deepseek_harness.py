@@ -8,6 +8,18 @@ from .base import ModelBackend, PermissionRequest, StreamDelta
 
 
 class DeepSeekHarnessBackend(ModelBackend):
+    def follow_up_capabilities(self) -> dict:
+        return {"queue": True, "nativeSteer": True, "interruptResume": False, "steerAttachments": False}
+
+    async def steer_message(self, *, session_id: str, content: str,
+                            images: Optional[list[ImageAttachment]] = None, client_message_id: str = "") -> dict:
+        if images:
+            return {"status": "unsupported", "message": "DSH 当前轮引导暂不支持图片，请使用排到下一轮"}
+        worker = getattr(self, "_harness_workers", {}).get(session_id)
+        if worker is None:
+            return {"status": "turn_finished", "message": "当前回答已经结束，未执行引导"}
+        return await worker.steering.send(worker, content, client_message_id)
+
     def abort(self, session_id: Optional[str] = None) -> None:
         super().abort(session_id)
         for sid, worker in list(getattr(self, "_harness_workers", {}).items()):

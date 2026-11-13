@@ -7,6 +7,8 @@ import importlib.metadata
 import os
 import sys
 import tempfile
+import threading
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -37,14 +39,32 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(bridge.stop)
         self.config = ModelBackendConfig(id="fixture", type=BackendType.DEEPSEEK_HARNESS, label="fixture",
                                           model="fixture-model", api_key="fixture-secret-never-echo")
+        self.wait_timeouts = []
+        self.methods = []
 
-    async def send(self, scenario="normal", native=None, trace=None, working_dir=None):
-        backend = DeepSeekHarnessBackend(self.config)
+    async def send(self, scenario="normal", native=None, trace=None, working_dir=None, wait_scale=1,
+                   backend=None, settle=True, close_hook=None):
+        backend = backend or DeepSeekHarnessBackend(self.config)
         deltas = []
         def client(*, config, owner):
             fixture = Path(__file__).parent / "fixtures/deepseek_harness_runtime.py"
-            return create_client(config=config, owner=owner, launch_args=(sys.executable, "-u", str(fixture.resolve()),
+            owned_client = create_client(config=config, owner=owner, launch_args=(sys.executable, "-u", str(fixture.resolve()),
                 "--state", str(self.root / "state.json"), "--scenario", scenario, "--identity-patch", config.patches[0]))
+            request = owned_client.request
+            def observed_request(method, params=None, **options):
+                self.methods.append(method)
+                if method == "session/wait":
+                    self.wait_timeouts.append(options["timeout_seconds"])
+                    options["timeout_seconds"] *= wait_scale
+                return request(method, params, **options)
+            owned_client.request = observed_request
+            if close_hook:
+                close = owned_client.close
+                def delayed_close():
+                    close_hook()
+                    close()
+                owned_client.close = delayed_close
+            return owned_client
         with patch("src.backend.deepseek_harness_turn.create_client", client):
             kwargs = dict(messages=[], content="new input only", images=None, session_id="test-session", message_id="message",
                           on_delta=deltas.append, agent_session_id=native,
@@ -54,9 +74,64 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
             else:
                 from src.backend.call_trace import traced_send
                 result = await traced_send(backend, kwargs, trace)
-        for worker in list(getattr(backend, "_harness_workers", {}).values()):
-            await asyncio.wait_for(asyncio.shield(worker.task), timeout=12)
+        if settle:
+            for worker in list(getattr(backend, "_harness_workers", {}).values()):
+                await asyncio.wait_for(asyncio.shield(worker.task), timeout=12)
+            self.assertFalse(backend.has_unconfirmed_activity("test-session"))
         return result, deltas
+
+    async def test_projection_failure_releases_cache_only_after_actual_exit(self) -> None:
+        from src.backend.deepseek_harness_events import HarnessProjection
+        backend = DeepSeekHarnessBackend(self.config)
+        gate = threading.Event()
+        original = HarnessProjection.observe
+        def fail(projection, note):
+            if note["payload"].get("event", {}).get("type") == "assistant/message":
+                raise ValueError("Harness 实时帧 index 无效")
+            return original(projection, note)
+        try:
+            with patch.object(HarnessProjection, "observe", fail):
+                result, deltas = await self.send(backend=backend, settle=False, close_hook=lambda: gate.wait(5))
+            self.assertFalse(result["success"])
+            self.assertIn("流式事件处理", result["error"])
+            self.assertNotIn("done", [d.type for d in deltas])
+            worker = backend._harness_workers["test-session"]
+            self.assertFalse(worker.confirmed)
+            blocked, _ = await self.send(backend=backend, settle=False)
+            self.assertFalse(blocked["success"])
+            self.assertIs(backend._harness_workers["test-session"], worker)
+            self.assertEqual(self.methods.count("session/prompt"), 1)
+        finally:
+            gate.set()
+        await asyncio.wait_for(asyncio.gather(asyncio.shield(worker.task), return_exceptions=True), 10)
+        await asyncio.sleep(0)
+        self.assertTrue(worker.confirmed)
+        self.assertNotIn("test-session", backend._harness_workers)
+        self.assertFalse(worker.layout.activity_file.exists())
+        # 兼容已退出但旧版本遗留的缓存；新提交仍恢复同一原生 Session。
+        backend._harness_workers["test-session"] = worker
+        resumed, _ = await self.send(backend=backend, native=result["agentSessionId"])
+        self.assertTrue(resumed["success"])
+        self.assertEqual(resumed["agentSessionId"], result["agentSessionId"])
+        self.assertEqual(self.methods.count("session/prompt"), 2)
+
+    async def test_finished_cleanup_preserves_unknown_exit_and_replacement(self) -> None:
+        from src.backend.deepseek_harness_turn import _retire_finished_worker
+        backend = DeepSeekHarnessBackend(self.config)
+        task = asyncio.create_task(asyncio.sleep(0))
+        await task
+        old = SimpleNamespace(confirmed=False, task=task)
+        backend._harness_workers = {"test-session": old}
+        _retire_finished_worker(backend, "test-session", old)
+        blocked, _ = await self.send(backend=backend, settle=False)
+        self.assertFalse(blocked["success"])
+        self.assertIs(backend._harness_workers["test-session"], old)
+        self.assertNotIn("session/prompt", self.methods)
+        newer = SimpleNamespace(confirmed=False, task=None)
+        backend._harness_workers["test-session"] = newer
+        old.confirmed = True
+        _retire_finished_worker(backend, "test-session", old)
+        self.assertIs(backend._harness_workers["test-session"], newer)
 
     async def test_handshake_missing_or_mismatch_never_submits_prompt(self) -> None:
         for scenario in ("bad-cap", "no-cap"):
@@ -104,6 +179,56 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
         kinds = [delta.type for delta in deltas]
         self.assertIn("subagent_done", kinds)
         self.assertLess(kinds.index("subagent_done"), kinds.index("done"))
+
+    async def test_compaction_of_historic_result_before_model_does_not_fail_turn(self) -> None:
+        result, deltas = await self.send("compaction")
+        self.assertTrue(result["success"], [d.to_dict() for d in deltas])
+        self.assertEqual("".join(d.text or "" for d in deltas), "reply-1")
+        self.assertNotIn("tool_result", [d.type for d in deltas])
+        self.assertEqual([d.type for d in deltas].count("done"), 1)
+        self.assertEqual(self.methods.count("session/prompt"), 1)
+
+    async def test_native_goal_continuations_share_budget_and_complete_once(self) -> None:
+        # 压缩 RPC 时钟：旧 120 秒变为 .12 秒，会在原生续跑途中错误终止。
+        result, deltas = await self.send("continuation", wait_scale=.001)
+        self.assertTrue(result["success"], [d.to_dict() for d in deltas])
+        self.assertEqual("".join(d.text or "" for d in deltas), "reply-1continued-15continued-16")
+        self.assertEqual([d.type for d in deltas].count("done"), 1)
+        self.assertEqual(self.methods.count("session/prompt"), 1)
+        self.assertEqual(self.methods.count("session/wait"), 1)
+        self.assertTrue(120 < self.wait_timeouts[0] <= 1800)
+
+    async def test_native_continuation_failure_is_never_erased_by_other_success(self) -> None:
+        for scenario, status in (("continuation-error", 503), ("continuation-recovery", 429)):
+            with self.subTest(scenario=scenario):
+                result, deltas = await self.send(scenario)
+                self.assertFalse(result["success"])
+                self.assertIn(f"HTTP {status}", result["error"])
+                self.assertIn("模型与工具执行", result["error"])
+                self.assertNotIn("done", [d.type for d in deltas])
+
+    async def test_continuations_require_matching_start_end_boundaries(self) -> None:
+        for scenario in ("continuation-missing-end", "continuation-wrong-end",
+                         "continuation-repeated-start", "duplicate-new-seq"):
+            with self.subTest(scenario=scenario):
+                result, deltas = await self.send(scenario)
+                self.assertFalse(result["success"])
+                self.assertNotIn("done", [d.type for d in deltas])
+                diagnosis = next(d.diagnostic for d in deltas if d.type == "diagnostic"
+                                 and d.diagnostic.get("phase") == "backend_error")
+                self.assertEqual(diagnosis["errorCode"], "protocol_error")
+
+    async def test_overall_deadline_still_bounds_wait_and_active_continuation(self) -> None:
+        for scenario, stage in (("wait-stall", "wait"), ("continuation-stall", "execution")):
+            with self.subTest(scenario=scenario), patch("src.backend.deepseek_harness_turn.TURN_TIMEOUT_SECONDS", .5):
+                result, deltas = await asyncio.wait_for(self.send(scenario), timeout=8)
+                self.assertFalse(result["success"])
+                self.assertNotIn("done", [d.type for d in deltas])
+                diagnosis = next(d.diagnostic for d in deltas if d.type == "diagnostic"
+                                 and d.diagnostic.get("phase") == "backend_error")
+                self.assertEqual(diagnosis["errorCode"], "timeout")
+                self.assertEqual(diagnosis["failureStage"], stage)
+                self.assertTrue(0 < self.wait_timeouts[-1] <= .5)
 
     async def test_trace_is_opt_in_and_auth_errors_do_not_echo_credentials(self) -> None:
         await self.send()

@@ -6,6 +6,7 @@ import { createImageCatalog } from './image-catalog.mjs'
 import { installImageEgressGuard, ImageEgressError } from './image-egress.mjs'
 import { promptImageDigest } from './image-digest.mjs'
 import { IMAGE_ADMISSION_VERSION, IMAGE_BRIDGE_VERSION, IMAGE_LIMITS } from './image-limits.mjs'
+import { callConfig, preparedOptions, modelCallError } from './model-call.mjs'
 export { IMAGE_ADMISSION_VERSION, IMAGE_BRIDGE_VERSION, IMAGE_LIMITS } from './image-limits.mjs'
 
 export const IMAGE_IDENTITY_KEYS = Object.freeze(['ownerId', 'executorId', 'awuSessionId', 'backendId',
@@ -148,22 +149,26 @@ export function createImageAdmission(ctx, config, runtime, transportLimits, cata
         const observation = await ensureEvidence()
         if (observation.capability !== 'supported') fail(observation.reason)
         yield* egress.stream(binding, async function* () {
-          const { provider, model, reasoningEffort, maxTokens } = options
+          const { provider, model } = options
           let prepared
-          try { prepared = await agent.ctx.llm.prepareCall({ provider, model, reasoningEffort, maxTokens }, options.signal) }
-          catch { fail('native_prepare_failed') }
+          try { prepared = await agent.ctx.llm.prepareCall(callConfig(options), options.signal) }
+          catch (error) {
+            throw modelCallError(connection.LlmError, error instanceof connection.LlmError ? error.failure : undefined)
+          }
           await currentConnection()
           if (!prepared.inputModalities?.includes('image') || prepared.config.provider !== provider
               || prepared.config.model !== model) fail('runtime_text_only')
-          const token = { options, entered: false }
-          const iterator = dispatchContext.run(token, () => prepared.stream(options)[Symbol.asyncIterator]())
+          const resolved = preparedOptions(options, prepared.config)
+          const token = { options: resolved, entered: false }
+          const iterator = dispatchContext.run(token, () => prepared.stream(resolved)[Symbol.asyncIterator]())
           try {
             while (true) {
               const item = await dispatchContext.run(token, () => iterator.next())
               if (item.done) return
               // 不让原生上层按 IMAGE_OFFLOAD_REQUIRED 删图重试；不转发服务端原始错误。
               if (item.value.type === 'finish' && item.value.reason?.kind === 'error') {
-                fail(item.value.reason.failure?.code === 'IMAGE_OFFLOAD_REQUIRED' ? 'image_offload_forbidden' : 'image_model_failed')
+                if (item.value.reason.failure?.code === 'IMAGE_OFFLOAD_REQUIRED') fail('image_offload_forbidden')
+                throw modelCallError(connection.LlmError, item.value.reason.failure)
               }
               yield item.value
             }

@@ -44,6 +44,7 @@ class ExternalHarnessNativeTests(unittest.TestCase):
             client._stderr_loop = read_diagnostics
             return client
 
+        self.external_client = external_client
         shim = patch("tests.test_harness_image_turn.create_client", external_client)
         shim.start()
         self.addCleanup(shim.stop)
@@ -85,6 +86,15 @@ class ExternalHarnessNativeTests(unittest.TestCase):
                 self.assertFalse(any(method == "DELETE" for method, _ in model.paths))
                 self.assertEqual(model.errors, [])
         self.run_case(check)
+
+    def test_compaction_defaults_and_safe_failure_through_external_runtime(self) -> None:
+        from src.backend.deepseek_harness_sdk import bridge_path
+        from tests.test_harness_image_admission import HarnessImageAdmissionTests
+        checks = HarnessImageAdmissionTests()
+        checks.bridge = bridge_path()
+        with patch("src.backend.deepseek_harness_sdk.create_client", self.external_client):
+            checks.test_native_compaction_with_image_history_uses_resolved_call_defaults()
+            checks.test_native_image_history_failures_keep_safe_http_reason_without_retry()
 
 
 if __name__ == "__main__":

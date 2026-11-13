@@ -4,7 +4,7 @@ import { HarnessSdkJsonRpcServer } from '@deepseek-ai/dsh-sdk-jsonrpc-server'
 import { JsonRpcLineTransport } from '@deepseek-ai/dsh-sdk-protocol'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import { parseModelListing, resolveListedCatalog } from '@deepseek-ai/dsh-llm-deepseek'
-import { APP_IDENTITY } from '@deepseek-ai/dsh-llm'
+import { APP_IDENTITY, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { installBridge } from './bridge.mjs'
 import { createBoundedJsonlIO } from './jsonl-io.mjs'
 // 离线构建核对只读取静态导出，不调用 apply、不启动 worker 或目录查询。
@@ -36,6 +36,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const server = new HarnessSdkJsonRpcServer(ctx, transport, { maxTokensAsSuccess: false })
   const dispose = installBridge(ctx, transport, server, config, process, {
     imageCatalogProtocol,
+    createUserMessage,
     mountMcp: async (options: McpClient.Config) => { await ctx.plugin(McpClient, options) },
   })
   ctx.effect(() => {

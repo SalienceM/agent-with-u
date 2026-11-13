@@ -12,6 +12,8 @@ class LocalModel:
         self.replies = replies or ["local fixture done"]
         self.posts: list[dict] = []
         self.paths: list[str] = []
+        self.first_request = threading.Event()
+        self.first_response_gate: threading.Event | None = None
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -22,6 +24,10 @@ class LocalModel:
                 fixture.paths.append(self.path)
                 fixture.posts.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
                 index = len(fixture.posts) - 1
+                if index == 0:
+                    fixture.first_request.set()
+                    if fixture.first_response_gate is not None:
+                        fixture.first_response_gate.wait(20)
                 response = fixture.replies[min(index, len(fixture.replies) - 1)]
                 tool = isinstance(response, tuple)
                 block = {"type": "tool_use", "id": f"call-{index}", "name": response[0], "input": {}} if tool else {"type": "text", "text": ""}

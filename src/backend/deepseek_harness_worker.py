@@ -28,6 +28,8 @@ class HarnessWorker:
         self.events: asyncio.Queue[Any] = asyncio.Queue(maxsize=128)
         self.task: asyncio.Task[Any] | None = None
         self.client: Any = None
+        from .deepseek_harness_steering import HarnessSteering
+        self.steering = HarnessSteering()
         self.key = str(layout.guard_root)
         self.confirmed = False
         self.ephemeral = ephemeral

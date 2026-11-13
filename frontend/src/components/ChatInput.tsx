@@ -1,5 +1,7 @@
+import { useVisibleSessionCandidates } from '../hooks/useSessionVisibility';
 import React, { useRef, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, memo, useState, useMemo } from 'react';
 import { ImagePreview } from './ImagePreview';
+import { SpeechDictation } from './SpeechDictation';
 import { TextAttachmentPreview } from './TextAttachmentPreview';
 import { ComposerEditor, ComposerTransformUndo } from './ComposerEditor';
 import { composerDrafts, validateComposerMeta } from '../utils/composerDrafts';
@@ -17,6 +19,7 @@ import { api, isTauri, onCurrentUserChanged, getExecutors, getCurrentUserProfile
 import { ComposerSubmissionStatus } from './ComposerSubmissionStatus';
 import { RoleLibrary } from './RoleLibrary';
 import { WorkflowButton, WorkflowIcon, WorkflowPopover } from './WorkflowControls';
+import { SessionHistory } from './SessionHistory';
 import { imageReceiptLabel, type ChatSendResult, type ImageDraftContext } from '../utils/harnessImageSubmission';
 import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
 import { isSkillCommand, slashQuery, skillInvocation, suggestedSlashCommand, type SkillInvocation, type SkillCommand } from '../utils/skillCommands';
@@ -150,6 +153,8 @@ interface Props {
   onOpenOpinions?: () => void;
   workflowTools?: React.ReactNode;
   isStreaming: boolean;
+  canSteer?: boolean;
+  steerAttachments?: boolean;
   backends: any[];
   activeBackendId: string;
   sessionId?: string;
@@ -168,6 +173,11 @@ interface Props {
   ) => ChatSendResult | Promise<ChatSendResult>;
   seqCount?: number;
   onCompact?: () => void;
+  renewing?: boolean;
+  renewalUnknown?: boolean;
+  renewalMessage?: string;
+  onRetryRenewal?: () => void;
+  onOpenSession?: (id: string) => void;
   fontSize?: number;                         // 当前对话字号(用于 A−/A+ 显示)
   onAdjustFontSize?: (delta: number) => void; // 步进对话字号
   // 多 pane 场景:用来决定全局快捷键(截图等)归哪个输入框处理。
@@ -181,6 +191,8 @@ interface Props {
   onRefreshBackends?: () => void;
   // 自动实时语音对话占用麦克风/STT 时，关闭这里的单次听写入口。
   voiceConversationActive?: boolean;
+  speechPanelHost?: HTMLElement | null;
+  isVisible?: boolean;
   realtimeVoice?: {
     sessionId: string;
     backendLabel: string;
@@ -231,8 +243,13 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   onSend, onAbort, onReviewSubmitted, onOpenOpinions, workflowTools, isStreaming, backends, activeBackendId, sessionId, workingDir, historyKey = null, historySeed,
   skipPermissions = true, onSkipPermissionsChange,
   isMobile = false,
-  onQueueTask, seqCount = 0,
+  onQueueTask, seqCount = 0, canSteer = false, steerAttachments = false,
   onCompact,
+  renewing = false,
+  renewalUnknown = false,
+  renewalMessage = '',
+  onRetryRenewal,
+  onOpenSession,
   fontSize, onAdjustFontSize,
   isFocused = true,
   execKey,
@@ -240,6 +257,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   onSessionRuntimeChange,
   onRefreshBackends,
   voiceConversationActive = false,
+  speechPanelHost,
+  isVisible = true,
   realtimeVoice,
 }, forwardedRef) => {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -520,7 +539,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
 
   // ★ @SESSION: 会话引用选择器状态
   const [showSessionPicker, setShowSessionPicker] = useState(false);
-  const [sessionRefs, setSessionRefs] = useState<any[]>([]);
+  const [allSessionRefs, setSessionRefs] = useState<any[]>([]);
+  const sessionRefs = useVisibleSessionCandidates(allSessionRefs);
   const [sessionQuery, setSessionQuery] = useState('');
   const [sessionSelectedIndex, setSessionSelectedIndex] = useState(0);
   const showSessionPickerRef = useRef(false);
@@ -841,299 +861,23 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     return () => { filePickerLoadVersionRef.current += 1; };
   }, [sessionId, execKey, workingDir]);
 
-  // ── 清理上下文 ──
-  const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
-  // ── 语音流式转写 ──
-  const [micActive, setMicActive] = useState(false);
-  const [micStatus, setMicStatus] = useState<'idle' | 'connecting' | 'listening' | 'reconnecting' | 'finalizing' | 'error'>('idle');
-  const [micError, setMicError] = useState('');
-  const [micNotice, setMicNotice] = useState('');
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const micAudioCtxRef = useRef<AudioContext | null>(null);
-  const micUnsubRef = useRef<(() => void) | null>(null);
-  const micPrefixRef = useRef<string | null>(null);
-  const micAttachmentIdRef = useRef<string | null>(null);
-  const micStoppedRef = useRef(false);
-  const micFlushResolveRef = useRef<(() => void) | null>(null);
-
-  const micWorkletRef = useRef<AudioWorkletNode | null>(null);
-
-  const applyMicTranscript = useCallback((transcript: string) => {
+  // 转写先独立暂存，明确应用时才追加到此刻的草稿（包括录音期间的手动编辑）。
+  const applyVoiceTranscript = useCallback((transcript: string): boolean => {
     const el = ref.current;
-    if (!el) return;
-    const prefix = micPrefixRef.current ?? '';
-    const combined = prefix ? `${prefix}\n${transcript}` : transcript;
-    const activeAttachmentId = textAttachmentsRef.current.some(item => item.id === micAttachmentIdRef.current) ? micAttachmentIdRef.current : null;
-    if (!activeAttachmentId) micAttachmentIdRef.current = null;
-
-    if (activeAttachmentId || (!composerDrafts.get(draftKeyRef.current)?.keepLongText && combined.length >= LONG_INPUT_ATTACHMENT_CHARS)) {
-      if (activeAttachmentId) {
-        const next = textAttachmentsRef.current.map((item) => (
-          item.id === activeAttachmentId
-            ? { ...item, content: transcript, size: transcript.length }
-            : item
-        ));
-        setTextAttachmentList(next);
-      } else if (transcript) {
-        const id = uuid();
-        saveSessionDraft(combined);
-        composerDrafts.pack(draftKeyRef.current, { id, name: `voice-transcript-${textAttachmentsRef.current.length + 1}.txt`, content: transcript, size: transcript.length, source: 'voice' }, prefix ? prefix.length + 1 : 0, combined.length);
-        micAttachmentIdRef.current = id;
-        applyComposerDraft();
-        return;
-      }
-      el.value = prefix;
-    } else {
-      el.value = combined;
+    if (!el || draftKeyRef.current !== draftKey) return false;
+    const prefix = el.value;
+    const separator = prefix && !prefix.endsWith('\n') ? '\n' : '';
+    const combined = `${prefix}${separator}${transcript}`;
+    saveSessionDraft(combined);
+    if (!composerDrafts.get(draftKey)?.keepLongText && combined.length >= LONG_INPUT_ATTACHMENT_CHARS) {
+      composerDrafts.pack(draftKey, { id: uuid(), name: `voice-transcript-${textAttachmentsRef.current.length + 1}.txt`,
+        content: transcript, size: transcript.length, source: 'voice' }, prefix.length + separator.length, combined.length);
     }
-
-    saveSessionDraft(el.value, textAttachmentsRef.current);
-    textareaHeightCappedRef.current = false;
-    scheduleTextareaResize(true);
-  }, [
-    applyComposerDraft,
-    saveSessionDraft,
-    scheduleTextareaResize,
-    setTextAttachmentList,
-  ]);
-
-  const flushMicWorklet = useCallback(async () => {
-    const worklet = micWorkletRef.current;
-    if (!worklet) return;
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        micFlushResolveRef.current = null;
-        resolve();
-      };
-      micFlushResolveRef.current = finish;
-      worklet.port.postMessage({ type: 'flush' });
-      window.setTimeout(finish, 150);
-    });
-  }, []);
-
-  const micStop = useCallback(async () => {
-    if (micStoppedRef.current) return;
-    micStoppedRef.current = true;
-    setMicStatus('finalizing');
-    await flushMicWorklet();
-    if (micWorkletRef.current) {
-      micWorkletRef.current.port.close();
-      micWorkletRef.current.disconnect();
-      micWorkletRef.current = null;
-    }
-    micStreamRef.current?.getTracks().forEach(t => t.stop());
-    micStreamRef.current = null;
-    micAudioCtxRef.current?.close().catch(() => {});
-    micAudioCtxRef.current = null;
-    try {
-      const res = await api.sttStreamStop(sessionId);
-      if (res.ok && res.text && ref.current) {
-        applyMicTranscript(res.text);
-        if (res.refinedByFlash) {
-          setMicNotice('已使用 Fun-ASR-Flash 完成短音频精校');
-        } else if (res.refineSkipped) {
-          setMicNotice(res.refineSkipped);
-        } else if (res.refineError) {
-          setMicNotice(`Flash 精校失败，已保留实时识别结果：${res.refineError}`);
-        }
-      } else if (!res.ok && res.error !== 'No active STT stream') {
-        setMicError(res.error || '实时语音识别停止失败');
-      }
-    } catch (e: any) {
-      setMicError(e?.message || '实时语音识别停止失败');
-    }
-    micUnsubRef.current?.();
-    micUnsubRef.current = null;
-    micPrefixRef.current = null;
-    micAttachmentIdRef.current = null;
-    setMicActive(false);
-    setMicStatus('idle');
-    ref.current?.focus();
-  }, [applyMicTranscript, flushMicWorklet, sessionId]);
-
-  const micStart = useCallback(async () => {
-    micStoppedRef.current = false;
-    setMicActive(true);
-    setMicStatus('connecting');
-    setMicError('');
-    setMicNotice('');
-    let serverStarted = false;
-    try {
-      const cfg = await api.getSttConfig(sessionId);
-      const deviceId = cfg?.deviceId || '';
-
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-            channelCount: 1,
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-      } catch (devErr) {
-        if (deviceId) {
-          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        } else {
-          throw devErr;
-        }
-      }
-      if (micStoppedRef.current) {
-        stream.getTracks().forEach(t => t.stop());
-        return;
-      }
-      micStreamRef.current = stream;
-
-      const res = await api.sttStreamStart(undefined, sessionId);
-      if (!res.ok) {
-        stream.getTracks().forEach(t => t.stop());
-        throw new Error(res.error || 'STT stream start failed');
-      }
-      serverStarted = true;
-      if (micStoppedRef.current) {
-        await api.sttStreamStop(sessionId).catch(() => {});
-        stream.getTracks().forEach(t => t.stop());
-        return;
-      }
-
-      micPrefixRef.current = ref.current?.value ?? '';
-      micAttachmentIdRef.current = null;
-
-      const unsub = api.onSttStreamText((data) => {
-        applyMicTranscript(data.text);
-      });
-      micUnsubRef.current = unsub;
-
-      const audioCtx = new AudioContext({ sampleRate: 16000 });
-      micAudioCtxRef.current = audioCtx;
-      await audioCtx.resume();
-      await audioCtx.audioWorklet.addModule('./pcm-worklet.js');
-      const source = audioCtx.createMediaStreamSource(stream);
-      const worklet = new AudioWorkletNode(audioCtx, 'pcm-processor');
-      micWorkletRef.current = worklet;
-      worklet.port.onmessage = (e: MessageEvent<ArrayBuffer | { type?: string }>) => {
-        if (!(e.data instanceof ArrayBuffer)) {
-          if (e.data?.type === 'flushed') micFlushResolveRef.current?.();
-          return;
-        }
-        // 停止时 Worklet 会先 flush 最后一段不足 100ms 的 PCM；该帧仍需发送。
-        if (micStoppedRef.current && !micFlushResolveRef.current) return;
-        api.sttStreamAudioBinary(e.data);
-      };
-      source.connect(worklet);
-      // AudioWorklet 必须连入活动输出图；0 增益确保不会回放麦克风。
-      const silentSink = audioCtx.createGain();
-      silentSink.gain.value = 0;
-      worklet.connect(silentSink);
-      silentSink.connect(audioCtx.destination);
-
-      setMicStatus('listening');
-    } catch (e: any) {
-      console.error('[mic]', e);
-      micStoppedRef.current = true;
-      micUnsubRef.current?.();
-      micUnsubRef.current = null;
-      if (serverStarted) await api.sttStreamStop(sessionId).catch(() => {});
-      if (micWorkletRef.current) {
-        micWorkletRef.current.port.close();
-        micWorkletRef.current.disconnect();
-        micWorkletRef.current = null;
-      }
-      micStreamRef.current?.getTracks().forEach(t => t.stop());
-      micStreamRef.current = null;
-      micAudioCtxRef.current?.close().catch(() => {});
-      micAudioCtxRef.current = null;
-      setMicActive(false);
-      setMicStatus('error');
-      setMicError(e?.message || '无法启动实时语音识别');
-    }
-  }, [applyMicTranscript, sessionId]);
-
-  const toggleMic = useCallback(() => {
-    if (micActive) {
-      micStop();
-    } else {
-      micStart();
-    }
-  }, [micActive, micStart, micStop]);
-
-  const micReconnect = useCallback(async () => {
-    if (micStoppedRef.current) return;
-    setMicStatus('reconnecting');
-    micUnsubRef.current?.();
-    micUnsubRef.current = null;
-    // 保存当前文本作为新前缀，避免重连后丢失已转写内容
-    if (ref.current) micPrefixRef.current = ref.current.value;
-    micAttachmentIdRef.current = null;
-    try {
-      const res = await api.sttStreamStart(undefined, sessionId);
-      if (!res.ok) throw new Error(res.error);
-      const unsub = api.onSttStreamText((data) => {
-        applyMicTranscript(data.text);
-      });
-      micUnsubRef.current = unsub;
-      setMicStatus('listening');
-    } catch (e: any) {
-      micStoppedRef.current = true;
-      if (micWorkletRef.current) {
-        micWorkletRef.current.port.close();
-        micWorkletRef.current.disconnect();
-        micWorkletRef.current = null;
-      }
-      micStreamRef.current?.getTracks().forEach(t => t.stop());
-      micStreamRef.current = null;
-      micAudioCtxRef.current?.close().catch(() => {});
-      micAudioCtxRef.current = null;
-      micPrefixRef.current = null;
-      micAttachmentIdRef.current = null;
-      setMicActive(false);
-      setMicStatus('error');
-      setMicError(e?.message || '实时语音连接已断开');
-    }
-  }, [applyMicTranscript, sessionId]);
-
-  useEffect(() => {
-    if (voiceConversationActive && !micStoppedRef.current) {
-      void micStop();
-    }
-  }, [voiceConversationActive, micStop]);
-
-  useEffect(() => {
-    const unsub = api.onSttStreamEnd(() => {
-      if (!micStoppedRef.current) {
-        micReconnect();
-      }
-    });
-    return () => {
-      unsub();
-      if (micStreamRef.current) {
-        micStoppedRef.current = true;
-        micUnsubRef.current?.();
-        if (micWorkletRef.current) {
-          micWorkletRef.current.port.close();
-          micWorkletRef.current.disconnect();
-          micWorkletRef.current = null;
-        }
-        micStreamRef.current.getTracks().forEach(t => t.stop());
-        micAudioCtxRef.current?.close().catch(() => {});
-        void api.sttStreamStop(sessionId).catch(() => {});
-      }
-    };
-  }, [micReconnect, sessionId]);
-
-  const handleCompact = useCallback(() => {
-    // ★ 二次确认：新会话会清空上下文，误触代价很大
-    setShowNewSessionConfirm(true);
-  }, []);
-  const confirmNewSession = useCallback(() => {
-    setShowNewSessionConfirm(false);
-    onCompact?.();
-  }, [onCompact]);
+    applyComposerDraft();
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+    return true;
+  }, [draftKey, saveSessionDraft, applyComposerDraft]);
 
   // ═══════════════════════════════════════
   //  ★ 图像尺寸选择器（DashScope 图像 backend）
@@ -1337,13 +1081,17 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   }, [saveSessionDraft, scheduleTextareaResize]);
 
   // ── 发送 ──
-  const handleSend = useCallback(() => {
+  const handleSend = useCallback((steer = false) => {
     if (roleReviewRef.current.review.roles.length) { kitApprovalDelegationRef.current = false; setKitApprovalDelegation(false); void roleReviewRef.current.send(); return; }
     const sendDelegation = kitApprovalDelegationRef.current;
     let text = ref.current?.value.trim() || '';
     const imgs = imagesRef.current;
     const textFiles = textAttachmentsRef.current;
     if (!text && imgs.length === 0 && textFiles.length === 0) return;
+    if (steer && (!canSteer || !isStreamingRef.current || text.startsWith('/') || (imgs.length > 0 && !steerAttachments))) {
+      showAttachmentNotice(imgs.length > 0 && !steerAttachments ? '此后端的当前轮引导不支持图片，请使用排到下一轮。' : '当前无法引导，内容已保留。');
+      return;
+    }
     followupRef.current.dismiss();
     if (isSkillCommand(text) && (isStreamingRef.current || seqCountRef.current > 0)) {
       showAttachmentNotice('Skill 命令尚未发送，请等待当前轮及队列结束；命令与参数已保留在输入框。');
@@ -1361,7 +1109,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     setShowFilePicker(false);
     setShowSessionPicker(false);
     const historyPersisted = text ? pushHistory(text) : true;
-    const harnessImage = imgs.length > 0 && backends.find(item => item.id === activeBackendId)?.type === 'deepseek-harness';
+    const harnessImage = !steer && imgs.length > 0 && backends.find(item => item.id === activeBackendId)?.type === 'deepseek-harness';
     const imageDraft = { scopeKey: imageScopeRef.current.key,
       draftRevision: saveSessionDraft(ref.current?.value || '', textFiles), originalContent: ref.current?.value || '' };
     if (!harnessImage && composerSubmissions.list(imageScopeRef.current).some(attempt =>
@@ -1375,7 +1123,10 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     // 默认序列行为：空闲且没有队列时直接发送；模型忙碌或已有待发项时，
     // 新输入自动排到队尾，不打断当前回答。
     let result: ChatSendResult | Promise<ChatSendResult>;
-    if ((isStreamingRef.current || seqCountRef.current > 0) && onQueueTaskRef.current) {
+    if (steer) {
+      result = composerSubmissions.submit(imageScopeRef.current, { content: text, images: imgs,
+        textAttachments: textFiles, backendId: activeBackendId, deliveryMode: 'steer' }, imageDraft, false);
+    } else if ((isStreamingRef.current || seqCountRef.current > 0) && onQueueTaskRef.current) {
       result = onQueueTaskRef.current(
         text,
         imgs.length > 0 ? imgs : undefined,
@@ -1430,7 +1181,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
     setTextAttachments([]);
     clearImagesRef.current();
     setShowCommands(false);
-  }, [pushHistory, scheduleTextareaResize, showAttachmentNotice, saveSessionDraft, backends, activeBackendId]);
+  }, [pushHistory, scheduleTextareaResize, showAttachmentNotice, saveSessionDraft, backends, activeBackendId, canSteer, steerAttachments]);
 
   // ── 键盘事件 ──
   const handleKeyDown = useCallback(
@@ -1672,13 +1423,13 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
         return;
       }
 
-      // 普通 Enter 发送（流式进行中也允许，sendMessage 内部处理中断续发）
+      // Enter 排队；当前轮可插话时 Ctrl/Cmd+Enter 使用原生下一步输入。
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        void handleSend();
+        void handleSend(Boolean((e.ctrlKey || e.metaKey) && isStreamingRef.current && canSteer));
       }
     },
-    [handleSend, saveSessionDraft, scheduleTextareaResize, applyComposerDraft, acceptFollowup]
+    [handleSend, saveSessionDraft, scheduleTextareaResize, applyComposerDraft, acceptFollowup, canSteer]
   );
 
   const handleCompositionStart = useCallback(() => {
@@ -1884,7 +1635,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   };
   const referenceMenus = <>
       {showSessionPicker && (
-        <div style={filePickerPopupStyle}>
+        <div data-session-ref-picker role="dialog" aria-label="引用会话" style={filePickerPopupStyle}>
           <div style={filePickerHeaderStyle}>
             {onOpenOpinions && <button type="button" style={fileActionStyle} onClick={openOpinionSelector}>@ 角色意见</button>}
             <span style={{ opacity: 0.6, fontSize: 10 }}>💬</span>
@@ -2152,9 +1903,12 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           composerDrafts.pack(draftKeyRef.current, { id: uuid(), name: `selected-text-${textAttachmentsRef.current.length + 1}.txt`, content, size: content.length, source: 'input' }, start, end);
           applyComposerDraft(); setMoreToolsOpen(false);
         }}>收纳正文为文本块</WorkflowButton>
-            <WorkflowButton icon="clear" onClick={() => { setMoreToolsOpen(false); handleCompact(); }}>新会话 · 同目录</WorkflowButton>
+            <WorkflowButton icon="plus" disabled={renewing || isStreaming || !onCompact}
+              title="保留当前记录，沿用目录和设置开启空白会话；可从历史回看"
+              onClick={() => { setMoreToolsOpen(false); onCompact?.(); }}>{renewing ? '正在开启…' : renewalUnknown ? '核对新会话' : '新会话 · 同目录'}</WorkflowButton>
           </div>
         </WorkflowPopover>
+        {sessionId && execKey && <SessionHistory key={`${historyKey}:${execKey}:${sessionId}`} sessionId={sessionId} executor={execKey} onOpenSession={onOpenSession} />}
         {workflowTools && <div aria-label="会话协作工具" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 4, minWidth: 0 }}>{workflowTools}</div>}
         {/* 截图按钮:桌面端独有,浏览器无法调起系统截图工具 */}
         {isTauri() && (
@@ -2178,7 +1932,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
         )}
         {/* ★ 流式进度指示器 */}
         {isStreaming && (
-          <div title="模型正在生成；可选择排队、当前轮引导或中断后重引导" style={{
+          <div title={canSteer ? '模型正在生成；可排到下一轮或引导当前轮' : '模型正在生成；新消息可排到下一轮'} style={{
             display: 'inline-flex',
             alignItems: 'center',
             padding: '7px',
@@ -2311,7 +2065,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           ref={ref}
           className="chat-textarea"
           placeholder={roleReview.review.roles.length ? '想重点核对什么？可留空，直接开始评议' : isStreaming || seqCount > 0
-            ? `继续输入，Enter 自动排队${seqCount ? ` · 待发 ${seqCount}` : ''}`
+            ? `继续输入，Enter 自动排队${canSteer && isStreaming ? ' · Ctrl/Cmd+Enter 引导当前轮' : ''}${seqCount ? ` · 待发 ${seqCount}` : ''}`
             : '输入消息，@ 引用文件 · # 召集角色'}
           onKeyDown={handleKeyDown}
           onCompositionStart={handleCompositionStart}
@@ -2323,7 +2077,11 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           style={{ ...textareaStyle, minWidth: 0, ...(isStreaming ? { opacity: 0.9 } : {}) }}
           rows={1}
         />
-        <button onClick={handleSend} style={{ ...sendBtnStyle, ...(roleReview.review.roles.length ? { width: 'auto', padding: '0 14px', whiteSpace: 'nowrap', fontSize: 13, fontWeight: 600 } : {}) }} disabled={roleReview.busy}
+        {isStreaming && canSteer && !roleReview.review.roles.length && <WorkflowButton
+          onClick={() => handleSend(true)} disabled={images.length > 0 && !steerAttachments}
+          title={images.length > 0 && !steerAttachments ? '此后端的当前轮引导不支持图片，请排到下一轮' : '插话引导当前轮，在后续步骤生效；不会中断正在执行的工具（Ctrl/Cmd+Enter）'}
+          style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>引导当前轮</WorkflowButton>}
+        <button onClick={() => handleSend()} style={{ ...sendBtnStyle, ...(roleReview.review.roles.length ? { width: 'auto', padding: '0 14px', whiteSpace: 'nowrap', fontSize: 13, fontWeight: 600 } : {}) }} disabled={roleReview.busy}
           aria-label={roleReview.review.roles.length ? '发起评议' : undefined}
           title={roleReview.review.roles.length ? '发起评议' : isStreaming
             ? '加入序列队列'
@@ -2331,85 +2089,15 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           {roleReview.review.roles.length ? roleReview.busy ? '提交中…' : '开始评议' : isStreaming || seqCount > 0 ? <WorkflowIcon name="plus" /> : <svg aria-hidden="true" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5m-6 6 6-6 6 6" /></svg>}
         </button>
         {isStreaming && <button onClick={onAbort} style={abortBtnStyle} title="停止当前回答">■</button>}
-        <button
-          onClick={toggleMic}
-          disabled={voiceConversationActive}
-          style={{
-            ...(micActive ? micRecordingStyle : micBtnStyle),
-            ...(voiceConversationActive ? { opacity: 0.38, cursor: 'not-allowed' } : {}),
-          }}
-          title={voiceConversationActive
-            ? '实时语音对话正在使用麦克风'
-            : micStatus === 'connecting'
-            ? '正在连接实时语音识别…'
-            : micStatus === 'reconnecting'
-              ? '实时语音正在重连…'
-              : micStatus === 'finalizing'
-                ? '正在确认最终转写…'
-                : micActive
-                  ? '停止实时语音输入'
-                  : '实时语音输入'}
-          aria-label={voiceConversationActive
-            ? '实时语音对话正在使用麦克风'
-            : micActive ? '停止实时语音输入' : '开始实时语音输入'}
-        >
-          <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v3m-4 0h8" /></svg>
-        </button>
+        <SpeechDictation key={draftKey} scope={draftKey} sessionId={sessionId} host={speechPanelHost}
+          visible={isVisible} disabled={voiceConversationActive} onApply={applyVoiceTranscript} />
       </div>
-      {(micActive || micError || micNotice) && (
-        <div style={{
-          marginTop: 4,
-          paddingLeft: 4,
-          minHeight: 16,
-          fontSize: 11,
-          color: micError
-            ? '#f85149'
-            : micNotice
-              ? '#d29922'
-              : 'var(--theme-text-muted)',
-        }}>
-          {micError || micNotice || (micStatus === 'connecting'
-            ? '正在连接百炼实时语音…'
-            : micStatus === 'reconnecting'
-              ? '连接中断，正在恢复…'
-              : micStatus === 'finalizing'
-                ? '正在确认最后一句…'
-                : '实时识别中，说话内容会立即写入输入框')}
-        </div>
-      )}
 
-      {/* 新会话确认对话框（风格与 Sidebar 删除会话保持一致） */}
-      {showNewSessionConfirm && (
-        <AppModalPortal>
-          <div style={confirmOverlayStyle} onClick={() => setShowNewSessionConfirm(false)}>
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="new-session-confirm-title"
-              style={{ ...confirmPanelStyle, animation: 'dialogSlideIn 0.28s cubic-bezier(0.22,0.61,0.36,1)' }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <h3 id="new-session-confirm-title" style={{ margin: '0 0 10px 0', fontSize: 16, fontWeight: 600, color: 'var(--theme-text, #1f2328)' }}>
-                开启新会话
-              </h3>
-              <p style={{ fontSize: 13, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 8px 0', lineHeight: 1.5 }}>
-                当前会话的上下文将被清空，模型不再保留之前的对话内容。
-              </p>
-              <p style={{ fontSize: 12, color: 'var(--theme-text-muted, #656d76)', margin: '0 0 14px 0' }}>
-                历史消息仍保留在侧边栏，可随时回看。
-              </p>
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-                <button onClick={() => setShowNewSessionConfirm(false)} style={cancelBtnStyle}>
-                  取消
-                </button>
-                <button onClick={confirmNewSession} style={confirmBtnStyle}>
-                  开始
-                </button>
-              </div>
-            </div>
-          </div>
-        </AppModalPortal>
-      )}
+      {renewalMessage && <div role="status" style={{ padding: '8px 12px', fontSize: 12, color: 'var(--theme-text-muted)', overflowWrap: 'anywhere' }}>
+        {renewalMessage}
+        {renewalUnknown && <WorkflowButton disabled={renewing} onClick={onCompact}>核对结果</WorkflowButton>}
+        {onRetryRenewal && <WorkflowButton disabled={renewing} onClick={onRetryRenewal}>继续开启同一新会话</WorkflowButton>}
+      </div>}
 
     </div>
   );
@@ -2454,24 +2142,6 @@ const btnBase: React.CSSProperties = {
 
 const sendBtnStyle: React.CSSProperties = { ...btnBase, background: 'var(--theme-accent, #0969da)', boxShadow: '0 5px 16px var(--theme-accent-bg)' };
 const abortBtnStyle: React.CSSProperties = { ...btnBase, background: 'var(--theme-error, #cf222e)', fontSize: 14 };
-const micBtnStyle: React.CSSProperties = {
-  ...btnBase,
-  background: 'var(--theme-bg-tertiary, #eaeef2)',
-  borderColor: 'var(--theme-border)',
-  color: 'var(--theme-text-muted)',
-  fontSize: 16,
-  padding: '0 8px',
-};
-
-const micRecordingStyle: React.CSSProperties = {
-  ...btnBase,
-  background: '#f85149',
-  color: '#fff',
-  fontSize: 16,
-  padding: '0 8px',
-  animation: 'mic-pulse 1.5s ease-in-out infinite',
-};
-
 const commandPopupStyle: React.CSSProperties = {
   position: 'absolute',
   bottom: '100%',
@@ -2552,34 +2222,6 @@ const filePickerFooterStyle: React.CSSProperties = {
   color: 'var(--theme-text-muted, #656d76)',
   borderTop: '1px solid var(--theme-border, rgba(0,0,0,0.08))',
   userSelect: 'none' as const,
-};
-
-// ── 确认对话框样式（与 Sidebar 删除会话保持一致）────────────────────────────
-const confirmOverlayStyle: React.CSSProperties = {
-  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
-  display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
-  padding: 16, boxSizing: 'border-box', overflow: 'auto',
-};
-
-const confirmPanelStyle: React.CSSProperties = {
-  background: 'var(--theme-bg-secondary, #ffffff)',
-  border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
-  borderRadius: 8,
-  padding: 18, width: '100%', maxWidth: 360,
-  maxHeight: 'calc(100dvh - 32px)', overflowY: 'auto', boxSizing: 'border-box',
-  boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
-};
-
-const confirmBtnStyle: React.CSSProperties = {
-  minWidth: 78, padding: '8px 14px', borderRadius: 5,
-  background: 'var(--theme-accent, #0969da)', border: 'none',
-  color: '#fff', fontSize: 14, fontWeight: 500, cursor: 'pointer',
-};
-
-const cancelBtnStyle: React.CSSProperties = {
-  minWidth: 78, padding: '8px 14px', borderRadius: 5,
-  background: 'var(--theme-bg-secondary, #f6f8fa)', border: '1px solid var(--theme-border, rgba(0,0,0,0.15))',
-  color: 'var(--theme-text, #1f2328)', fontSize: 14, cursor: 'pointer',
 };
 
 const runtimeSecondaryBtnStyle: React.CSSProperties = {

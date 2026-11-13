@@ -91,6 +91,41 @@ for (const width of [1280, 390]) test(`non Git project shows a normal prerequisi
   })).toEqual({ reads: 2, plans: 0, creates: 0, starts: 0 });
 });
 
+for (const width of [1280, 390]) for (const kind of ['init', 'initial_commit'])
+test(`uninitialized project creates in one explicit action (${kind}, ${width})`, async ({ page }) => {
+  await mount(page, width);
+  await page.evaluate(async kind => {
+    const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
+    const inspect = api.taskWorkspaceInspect, plan = api.taskWorkspacePlan;
+    api.taskWorkspaceInspect = async (...args) => {
+      const repo = await inspect(...args);
+      return { ...repo, head: '', dirty: [], initialization: { kind, branch: 'main' },
+        defaults: { ...repo.defaults!, initializeRepository: true } } as any;
+    };
+    api.taskWorkspacePlan = async (...args) => {
+      const row = await plan(...args);
+      row.repository = { ...row.repository, head: '', dirty: [], initialization: { kind, branch: 'main' } } as any;
+      return row;
+    };
+  }, kind);
+  await page.getByRole('button', { name: '分支副本与合并', exact: true }).click();
+  await page.getByRole('button', { name: '新建分支副本', exact: true }).click();
+  await expect(page.getByLabel('副本名称', { exact: true })).toBeVisible();
+  const dialog = page.getByRole('dialog', { name: '分支副本', exact: true });
+  await expect(dialog).toContainText('用所选文件建立首次提交');
+  expect(await page.evaluate(() => {
+    const f = (window as any).taskFixture;
+    return [f.plans.length, f.created.length, f.started.length];
+  })).toEqual([0, 0, 0]);
+  const action = dialog.getByRole('button', { name: kind === 'init' ? '启用 Git 并创建副本' : '建立首次提交并创建副本', exact: true });
+  await expect(action).toBeEnabled();
+  expect(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth)).toBeTruthy();
+  await action.click();
+  await expect.poll(() => page.evaluate(() => (window as any).taskFixture.created.length)).toBe(1);
+  expect(await page.evaluate(() => (window as any).taskFixture.plans[0].initializeRepository)).toBe(true);
+  expect(await page.evaluate(() => (window as any).taskFixture.started.length)).toBe(0);
+});
+
 test('inspection failures keep technical output in optional details', async ({ page }) => {
   await mount(page);
   await page.evaluate(async () => {

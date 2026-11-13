@@ -238,6 +238,12 @@ class SessionStore:
                         meta[key] = copy.deepcopy(current[key])
                 session.pinned = bool(current.get("pinned"))
                 session.favorite_revision = current["favoriteRevision"]
+            if current.get("privacyRevision", 0) > 0:
+                for key in ("isPrivate", "privacyRevision", "_privacyReceipt"):
+                    if key in current:
+                        meta[key] = copy.deepcopy(current[key])
+                session.is_private = bool(current.get("isPrivate"))
+                session.privacy_revision = current["privacyRevision"]
             self._index[session.id] = meta
 
     def favorite_state(self, sid: str) -> dict:
@@ -250,32 +256,46 @@ class SessionStore:
                 "favoriteRevision": meta.get("favoriteRevision", 0),
                 "lastRequestId": receipt.get("requestId", "")}
 
+    def privacy_state(self, sid: str) -> dict:
+        meta = self.get_meta(sid)
+        if meta is None:
+            return {"status": "not_found", "protocolVersion": 1}
+        receipt = meta.get("_privacyReceipt") or {}
+        return {"status": "ok", "protocolVersion": 1,
+                "isPrivate": bool(meta.get("isPrivate")),
+                "privacyRevision": meta.get("privacyRevision", 0),
+                "lastRequestId": receipt.get("requestId", "")}
+
     def commit_appearance(
         self, sid: str, patch: dict, *, expected_revision: Optional[int] = None,
         request_id: str = "",
     ) -> dict:
-        """收藏字段级 CAS；先提交磁盘，再发布内存。失败无未确认值供 timer 重放。"""
+        """收藏/私密独立字段级 CAS；先提交磁盘，再发布内存。失败无未确认值供 timer 重放。"""
+        private = "isPrivate" in patch
+        field = "isPrivate" if private else "pinned"
+        revision_field = "privacyRevision" if private else "favoriteRevision"
+        receipt_field = "_privacyReceipt" if private else "_favoriteReceipt"
         with self._index_write_lock:
             with self._lock:
                 current = copy.deepcopy(self._index.get(sid))
                 if current is None:
                     return {"status": "not_found", "protocolVersion": 1}
-                revision = current.get("favoriteRevision", 0)
-                receipt = current.get("_favoriteReceipt") or {}
-                signature = {"pinned": patch.get("pinned"), "expectedRevision": expected_revision}
+                revision = current.get(revision_field, 0)
+                receipt = current.get(receipt_field) or {}
+                signature = {field: patch.get(field), "expectedRevision": expected_revision}
                 if request_id and receipt.get("requestId") == request_id:
                     if receipt.get("signature") != signature:
                         return {"status": "error", "message": "requestId 参数不一致"}
-                    return {"status": "ok", "protocolVersion": 1, "pinned": bool(current.get("pinned")),
-                            "favoriteRevision": revision, "lastRequestId": request_id}
+                    return {"status": "ok", "protocolVersion": 1, field: bool(current.get(field)),
+                            revision_field: revision, "lastRequestId": request_id}
                 if expected_revision is not None and revision != expected_revision:
                     return {"status": "conflict", "protocolVersion": 1,
-                            "pinned": bool(current.get("pinned")), "favoriteRevision": revision}
+                            field: bool(current.get(field)), revision_field: revision}
                 fields = dict(patch)
-                if "pinned" in patch:
+                if field in patch:
                     # 首次显式提交也建立保护版本，随后相同值不推进。
-                    fields["favoriteRevision"] = revision + int(revision == 0 or patch["pinned"] != bool(current.get("pinned")))
-                    fields["_favoriteReceipt"] = ({"requestId": request_id, "signature": signature} if request_id else {})
+                    fields[revision_field] = revision + int(revision == 0 or patch[field] != bool(current.get(field)))
+                    fields[receipt_field] = ({"requestId": request_id, "signature": signature} if request_id else {})
                 candidate = {**current, **fields}
                 snapshot = copy.deepcopy(self._index)
                 snapshot[sid] = candidate
@@ -290,7 +310,9 @@ class SessionStore:
             return {"status": "ok", "protocolVersion": 1,
                     "pinned": bool(candidate.get("pinned")),
                     "sidebarColor": candidate.get("sidebarColor", ""),
-                    "favoriteRevision": candidate.get("favoriteRevision", 0), "lastRequestId": request_id}
+                    "favoriteRevision": candidate.get("favoriteRevision", 0),
+                    "isPrivate": bool(candidate.get("isPrivate")),
+                    "privacyRevision": candidate.get("privacyRevision", 0), "lastRequestId": request_id}
 
     def save_meta(
         self,
@@ -417,6 +439,8 @@ class SessionStore:
                 ),
                 pinned=bool(meta.get("pinned", data.get("pinned", False))),
                 favorite_revision=int(meta.get("favoriteRevision", data.get("favoriteRevision", 0)) or 0),
+                is_private=bool(meta.get("isPrivate", data.get("isPrivate", False))),
+                privacy_revision=int(meta.get("privacyRevision", data.get("privacyRevision", 0)) or 0),
                 sidebar_color=str(meta.get("sidebarColor", data.get("sidebarColor", "")) or ""),
                 auto_commit=data.get("autoCommit", False),
                 auto_commit_push=data.get("autoCommitPush", False),
@@ -428,6 +452,9 @@ class SessionStore:
                 role_id=data.get("roleId"),
                 workspace_id=data.get("workspaceId"),
                 followup_suggestions_enabled=data.get("followupSuggestionsEnabled") is True,
+                history_root_id=data.get("historyRootId"),
+                history_source_id=data.get("historySourceId"),
+                history_request_id=data.get("historyRequestId"),
                 followup_suggestions_config=dict(data.get("followupSuggestionsConfig") or {}) if isinstance(data.get("followupSuggestionsConfig"), dict) else {},
             )
             known_fields = session.to_dict().keys()

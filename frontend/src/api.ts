@@ -1,3 +1,4 @@
+import { showPrivateSessions } from './utils/sessionVisibility';
 /**
  * api.ts: Bridge between React and the Python backend over WebSocket.
  *
@@ -48,6 +49,7 @@ import { uuid } from './utils/uuid';
 import type { PreviewIdentity } from './utils/previewLifecycle';
 import { HarnessImageSubmissions, type ImageScope, type ImageInput, type ImageDraftContext, type ImageSendResult } from './utils/harnessImageSubmission';
 import { SessionFavorites, IndexedFavoriteRepository, favoriteKey, favoriteIdentityTarget, mergeFavoriteRemote, type FavoriteTarget } from './utils/sessionFavorites';
+import { SessionPrivacy, mergePrivacyRemote, type PrivacyRemote } from './utils/sessionPrivacy';
 import { deleteSessionOnTarget, type SessionDeletionResult } from './utils/sessionDeletion';
 
 type StreamDeltaCallback = (delta: any) => void;
@@ -696,7 +698,7 @@ export function getConnectionTarget(): ConnectionTarget {
   return connectionTarget;
 }
 
-export type CurrentUserProfile = RelayUserProfile & { mode: 'local' | 'relay' };
+export type CurrentUserProfile = RelayUserProfile & { mode: 'local' | 'relay'; realm?: string };
 type CurrentUserCallback = (profile: CurrentUserProfile, identityChanged: boolean) => void;
 let currentUserCallbacks: CurrentUserCallback[] = [];
 
@@ -705,10 +707,12 @@ export function getCurrentUserProfile(): CurrentUserProfile {
     return {
       ...normalizeRelayProfile(connectionTarget.user),
       mode: 'relay',
+      realm: (() => { const u = new URL(connectionTarget.url); return `${u.protocol}//${u.host}${u.pathname}`; })(),
     };
   }
   return {
     mode: 'local',
+    realm: window.location.origin,
     userId: 'local',
     username: 'local',
     displayName: '本机用户',
@@ -726,6 +730,7 @@ export function onCurrentUserChanged(callback: CurrentUserCallback): () => void 
 }
 
 function notifyCurrentUserChanged(identityChanged: boolean): void {
+  if (identityChanged) showPrivateSessions(false);
   const profile = getCurrentUserProfile();
   currentUserCallbacks.forEach((callback) => callback(profile, identityChanged));
 }
@@ -1018,7 +1023,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
         sessionUpdateCallbacks.forEach(cb => cb(data));
         return;
       }
-      if (source && data.summary) data.summary = mergeFavoriteRemote(
+      if (source && data.summary) data.summary = mergeSessionFlags(
         (sessionListCache.get(source.key) || []).find(item => item.id === sessionId), data.summary);
       if (sessionId && data.summary) sessionRoutingCache.update(sessionId, data.summary);
       if (source && sessionId) {
@@ -1030,7 +1035,7 @@ function handleMessage(e: MessageEvent, source?: Conn) {
         if (data.summary?.id) {
           const index = cached.findIndex((item) => item?.id === data.summary.id);
           const next = [...cached];
-          if (index >= 0) next[index] = { ...next[index], ...mergeFavoriteRemote(next[index], data.summary) };
+          if (index >= 0) next[index] = { ...next[index], ...mergeSessionFlags(next[index], data.summary) };
           else next.push(data.summary);
           sessionListCache.set(source.key, next);
         } else if (data.type === 'session_renamed') {
@@ -1147,9 +1152,11 @@ function handleMessage(e: MessageEvent, source?: Conn) {
       if (source && sessionExec.get(data.sessionId) !== source.key) return;
       kitGenerationUpdatedCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamText') {
+      if (!sttStreamExecKey || (source && source.key !== sttStreamExecKey)) return;
       const data = JSON.parse(msg.data);
       sttStreamCallbacks.forEach((cb) => cb(data));
     } else if (msg.event === 'sttStreamEnd') {
+      if (!sttStreamExecKey || (source && source.key !== sttStreamExecKey)) return;
       const data = JSON.parse(msg.data);
       sttStreamExecKey = undefined;
       sttStreamEndCallbacks.forEach((cb) => cb(data));
@@ -1414,7 +1421,8 @@ class Conn {
 
   /** 发起一次 RPC。home 离线时回落 mock(保持旧行为);其它节点离线则丢弃返回 null。 */
   async request(method: string, params: any[], timeoutMs?: number): Promise<any> {
-    const strictSession = ['sessionFavoriteGet', 'sessionFavoriteSet', 'deleteSession', 'destroySession', 'projectBufferReply',
+    const strictSession = ['sessionFavoriteGet', 'sessionFavoriteSet', 'sessionPrivacyGet', 'sessionPrivacySet', 'deleteSession', 'destroySession', 'projectBufferReply', 'syncTransferCommit',
+      'sessionRenew', 'sessionRenewStatus', 'sessionHistory', 'sessionNativeLogLocation',
       'harnessImageCapabilities', 'harnessImageSubmit', 'harnessImageQueue', 'harnessImageStatus', 'composerSubmit', 'composerStatus'].includes(method);
     const deadline = Date.now() + (timeoutMs || 10000), requestEpoch = relayIdentityEpoch, socket = this.ws;
     if (strictSession) {
@@ -1533,11 +1541,17 @@ function favoriteConnection(target: FavoriteTarget): Conn | undefined {
 function activeFavoriteScopes(): string[] {
   return [...new Set(Array.from(pool.values()).map(conn => favoriteTarget(conn, '').scope))];
 }
+const unavailableSessionMetadata = new Set<string>();
+function mergeSessionFlags(current: any, incoming: any): any {
+  return mergePrivacyRemote(current, mergeFavoriteRemote(current, incoming));
+}
 function projectFavorite(value: any, conn?: Conn): any {
   const connection = conn || pool.get(value?.execKey || sessionExec.get(value?.id) || '');
-  if (!value?.id || !connection) return value;
+  if (!value?.id || !connection) return value ? { ...value, privacyKnown: false } : value;
   const observed = (sessionListCache.get(connection.key) || []).find(row => row.id === value.id);
-  return sessionFavorites.project(favoriteTarget(connection, value.id), mergeFavoriteRemote(observed, value));
+  const target = favoriteTarget(connection, value.id);
+  const projected = sessionPrivacy.project(target, sessionFavorites.project(target, mergeSessionFlags(observed, value)));
+  return unavailableSessionMetadata.has(favoriteKey(target)) ? { ...projected, privacyKnown: false } : projected;
 }
 function recordRemoteFavorite(target: FavoriteTarget, value: import('./utils/sessionFavorites').FavoriteRemote): void {
   const conn = favoriteConnection(target); if (!conn) return;
@@ -1545,10 +1559,10 @@ function recordRemoteFavorite(target: FavoriteTarget, value: import('./utils/ses
   for (const alias of pool.values()) {
     if (favoriteKey(favoriteTarget(alias, target.session)) !== favoriteKey(target)) continue;
     const list = sessionListCache.get(alias.key) || [];
-    sessionListCache.set(alias.key, list.map(row => row.id === target.session ? { ...row, ...mergeFavoriteRemote(row, value) } : row));
+    sessionListCache.set(alias.key, list.map(row => row.id === target.session ? { ...row, ...mergeSessionFlags(row, value) } : row));
   }
   const previous = sessionRoutingCache.get(target.session);
-  if (previous?.execKey === conn.key) sessionRoutingCache.update(target.session, { ...previous, ...mergeFavoriteRemote(previous, value) });
+  if (previous?.execKey === conn.key) sessionRoutingCache.update(target.session, { ...previous, ...mergeSessionFlags(previous, value) });
   persistSessionListCache();
 }
 const favoriteChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('awu-session-favorites-v1') : null;
@@ -1590,6 +1604,58 @@ if (favoriteChannel) favoriteChannel.onmessage = ({ data }) => {
   }
   void sessionFavorites.reload().catch(() => {});
 };
+function recordRemotePrivacy(target: FavoriteTarget, value: PrivacyRemote): void {
+  const conn = favoriteConnection(target); if (!conn) return;
+  // 同一物理节点的已验证别名共用观察值，不能在清除覆盖层后回弹。
+  for (const alias of pool.values()) {
+    if (favoriteKey(favoriteTarget(alias, target.session)) !== favoriteKey(target)) continue;
+    const list = sessionListCache.get(alias.key) || [];
+    sessionListCache.set(alias.key, list.map(row => row.id === target.session ? { ...row, ...mergeSessionFlags(row, value) } : row));
+  }
+  const previous = sessionRoutingCache.get(target.session);
+  if (previous?.execKey === conn.key) sessionRoutingCache.update(target.session, { ...previous, ...mergeSessionFlags(previous, value) });
+  persistSessionListCache();
+}
+const privacyChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('awu-session-privacy-v1') : null;
+const sessionPrivacy = new SessionPrivacy(new IndexedFavoriteRepository('awu-session-privacy-v1'), {
+  available: target => {
+    const conn = favoriteConnection(target);
+    if (!conn) return activeFavoriteScopes().includes(target.scope) ? 'removed' : 'inactive';
+    if (conn.target.mode === 'relay' && (!conn.target.user?.userId || conn.target.user.userId === 'legacy')) return 'unsupported';
+    return conn.isOpen ? 'online' : 'offline';
+  },
+  call: async (target, method, params) => {
+    const conn = favoriteConnection(target), epoch = relayIdentityEpoch;
+    if (!conn || !conn.isOpen) throw new Error('所属节点离线，未提交收藏同步');
+    const result = await conn.request(method, params, 10000);
+    if (epoch !== relayIdentityEpoch || favoriteConnection(target) !== conn) throw new Error('收藏身份已变化');
+    return typeof result === 'string' ? JSON.parse(result) : result;
+  },
+  remote: (target, value) => {
+    recordRemotePrivacy(target, value);
+    privacyChannel?.postMessage({ type: 'remote', target, value });
+  },
+  changed: () => {
+    const summaries = Array.from(pool.values()).flatMap(conn => (sessionListCache.get(conn.key) || []).map(row => ({
+      ...projectFavorite(row, conn), execKey: conn.key,
+    })));
+    sessionUpdateCallbacks.forEach(callback => callback({ type: 'privacy_changed', summaries }));
+  },
+  broadcast: () => privacyChannel?.postMessage('changed'),
+});
+const privacyStorageFailure = () => sessionUpdateCallbacks.forEach(callback => callback({ type: 'privacy_storage_error', message: '本设备私密状态未能读取，Session 暂不显示。请检查本设备存储后重试。' }));
+const privacyReady = sessionPrivacy.reload().catch(privacyStorageFailure);
+if (privacyChannel) privacyChannel.onmessage = ({ data }) => {
+  if (data?.type === 'remote' && typeof data.target?.scope === 'string' && typeof data.target?.node === 'string'
+      && typeof data.target?.session === 'string' && typeof data.value?.isPrivate === 'boolean'
+      && Number.isSafeInteger(data.value?.privacyRevision) && data.value.privacyRevision >= 0)
+    recordRemotePrivacy(data.target, data.value);
+  if (data?.type === 'clearing' && Array.isArray(data.scopes)) {
+    if (data.scopes.some((scope: string) => activeFavoriteScopes().includes(scope))) sessionPrivacy.invalidate(data.scopes);
+    return;
+  }
+  void sessionPrivacy.reload().catch(privacyStorageFailure);
+};
 let favoriteOnline = new Set<string>();
 const confirmedSessionDeletions = new Set<string>();
 function observeSessionDeletion(conn: Conn, session: string): boolean {
@@ -1604,6 +1670,7 @@ function observeSessionDeletion(conn: Conn, session: string): boolean {
   if (sessionRoutingCache.get(session)?.execKey === conn.key) sessionRoutingCache.delete(session);
   persistSessionListCache(); persistSessionExec();
   void sessionFavorites.forget(target).catch(error => console.warn('[favorites] deletion cleanup failed', error));
+  void sessionPrivacy.forget(target).catch(error => console.warn('[privacy] deletion cleanup failed', error));
   return true;
 }
 async function requestSessionDeletion(session: string, destroy: boolean, executor?: string): Promise<SessionDeletionResult> {
@@ -1785,7 +1852,7 @@ function notifyExecStatus(): void {
   execStatusCallbacks.forEach((cb) => cb());
   const online = new Set(Array.from(pool.values()).filter(conn => conn.isOpen).map(conn => conn.key));
   if ([...online].some(key => !favoriteOnline.has(key)) || [...favoriteOnline].some(key => !pool.has(key)))
-    void favoritesReady.then(() => sessionFavorites.reconnect());
+    void Promise.all([favoritesReady, privacyReady]).then(() => { sessionFavorites.reconnect(); sessionPrivacy.reconnect(); });
   favoriteOnline = online;
 }
 
@@ -1912,11 +1979,16 @@ function clearRelaySessionCaches(): void {
 function clearRelayIdentityState(): void {
   harnessImageSubmissions.clear();
   confirmedSessionDeletions.clear();
+  unavailableSessionMetadata.clear();
   const scopes = activeFavoriteScopes();
   favoriteChannel?.postMessage({ type: 'clearing', scopes });
   void sessionFavorites.clear(scopes).then(() => favoriteChannel?.postMessage('changed')).catch(error => {
     console.warn('[favorites] identity cleanup failed', error);
     sessionUpdateCallbacks.forEach(callback => callback({ type: 'favorite_storage_error', message: '旧身份收藏记录未能清理，请检查浏览器存储；未继续同步。' }));
+  });
+  privacyChannel?.postMessage({ type: 'clearing', scopes });
+  void sessionPrivacy.clear(scopes).then(() => privacyChannel?.postMessage('changed')).catch(() => {
+    sessionUpdateCallbacks.forEach(callback => callback({ type: 'privacy_storage_error', message: '本设备私密选择未能清理，请检查存储。' }));
   });
   favoriteOnline.clear();
   windowTransport.clear();
@@ -2596,7 +2668,45 @@ async function nativeOpenAnyFile(): Promise<string | null> {
 // ═══════════════════════════════════════
 //  Exported API（接口与旧版完全相同）
 // ═══════════════════════════════════════
+async function sessionHistoryCall(sessionId: string, execKey: string | undefined, method: string, args: unknown[] = []): Promise<any> {
+  const target = execKey || sessionExec.get(sessionId);
+  if (!target) throw Object.assign(new Error('Session 的执行节点未知，未提交操作'), { notSubmitted: true });
+  const epoch = relayIdentityEpoch;
+  await privacyReady;
+  if (epoch !== relayIdentityEpoch) throw Object.assign(new Error('用户身份已变化'), { notSubmitted: true });
+  let conn: Conn;
+  try { conn = connByKey(target); }
+  catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { notSubmitted: true }); }
+  const raw = await callOnStrict(target, method, [sessionId, ...args], 15000);
+  if (epoch !== relayIdentityEpoch) throw new Error('用户身份已变化，请返回原身份核对结果');
+  const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  if (!result?.status) throw Object.assign(new Error('此节点尚不支持保留历史的新会话，请更新节点'), { notSubmitted: true });
+  const register = (row: any) => {
+    if (!row?.id) throw new Error('新会话回执无效');
+    sessionExec.set(row.id, target);
+    const meta = { ...row, execKey: target, execLabel: conn.label, execMode: conn.target.mode, execIsHome: isEffectiveHome(conn) };
+    sessionRoutingCache.update(row.id, meta);
+    return projectFavorite(meta, conn);
+  };
+  if (result.session) result.session = register(result.session);
+  if (result.items) result.items = result.items.map(register);
+  if (result.session || result.items) persistSessionExec();
+  return result;
+}
+
 export const api = {
+  sessionRenew(sessionId: string, requestId: string, execKey?: string) {
+    return sessionHistoryCall(sessionId, execKey, 'sessionRenew', [requestId]);
+  },
+  sessionRenewStatus(sessionId: string, requestId: string, execKey?: string) {
+    return sessionHistoryCall(sessionId, execKey, 'sessionRenewStatus', [requestId]);
+  },
+  sessionHistory(sessionId: string, offset = 0, execKey?: string) {
+    return sessionHistoryCall(sessionId, execKey, 'sessionHistory', [offset, 30]);
+  },
+  sessionNativeLogLocation(sessionId: string, execKey?: string) {
+    return sessionHistoryCall(sessionId, execKey, 'sessionNativeLogLocation');
+  },
   async readClipboardImage(): Promise<any | null> {
     // Tauri 桌面端:先读**本机**剪贴板。
     // 关键在客户端模式 —— 此时 WS bridge 指向远端执行节点,走 bridge 会
@@ -2648,6 +2758,8 @@ export const api = {
 
   async resolveWorkspaceSession(execKey: string, sessionId: string): Promise<any> {
     const epoch = relayIdentityEpoch;
+    await privacyReady;
+    if (epoch !== relayIdentityEpoch) throw new Error('用户已切换');
     if (!pool.has(execKey) && connectionTarget.mode === 'relay') {
       const target = connectionTarget;
       const inventory = await inspectRelay(target.url, target.token);
@@ -2660,12 +2772,13 @@ export const api = {
     const raw = await callOnStrict(execKey, 'loadSessionMeta', [sessionId], 15000);
     if (epoch !== relayIdentityEpoch) throw new Error('用户已切换');
     const session = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    if (!session?.id) throw new Error('Session 不可用或无访问权限');
+    if (session?.id !== sessionId) throw new Error('Session 不可用或无访问权限');
     sessionExec.set(session.id, execKey);
     persistSessionExec();
     const conn = connByKey(execKey);
+    unavailableSessionMetadata.delete(favoriteKey(favoriteTarget(conn, sessionId)));
     sessionRoutingCache.update(session.id, { ...session, execKey, execLabel: conn.label, execMode: conn.target.mode, execIsHome: isEffectiveHome(conn) });
-    return session;
+    return projectFavorite(sessionRoutingCache.get(session.id), conn);
   },
 
   async abortMessage(sessionId: string): Promise<void> {
@@ -2760,7 +2873,7 @@ export const api = {
    * roster 为空时即等价于「只列 home 的 session」(向后兼容)。
    */
   async listSessions(): Promise<any[]> {
-    await favoritesReady;
+    await Promise.all([favoritesReady, privacyReady]);
     // App 与 Sidebar 在启动时可能同时请求；共享同一轮多节点 RPC，避免双发。
     if (listSessionsInFlight) return listSessionsInFlight;
     const request = (async (): Promise<any[]> => {
@@ -2784,7 +2897,7 @@ export const api = {
           && !confirmedSessionDeletions.has(favoriteKey(favoriteTarget(c, row.id)))) : [];
         const previous = sessionListCache.get(c.key) || [];
         interactionIndex.replaceSessions(c.key, normalized, interactionRevision);
-        sessionListCache.set(c.key, normalized.map(row => mergeFavoriteRemote(previous.find(item => item.id === row.id), row)));
+        sessionListCache.set(c.key, normalized.map(row => mergeSessionFlags(previous.find(item => item.id === row.id), row)));
         persistSessionListCache();
         return { c, list: normalized, stale: false };
       } catch (error) {
@@ -2887,6 +3000,7 @@ export const api = {
 
   /** 只拉 index 元数据，不读取消息正文或 LOOP stage；用于 pane 首屏路由。 */
   async loadSessionMeta(id: string): Promise<any | null> {
+    await privacyReady;
     const connection = routeConn('loadSessionMeta', [id]);
     const epoch = relayIdentityEpoch;
     const key = `${epoch}:${connection.key}:${id}`;
@@ -2914,11 +3028,17 @@ export const api = {
         if (epoch !== relayIdentityEpoch) throw new Error('用户身份已切换');
         let parsed: any;
         try { parsed = JSON.parse(result); } catch { throw new Error('执行端返回的会话信息格式无效'); }
-        if (!parsed || parsed.id !== id) throw new Error('会话不可用，请检查执行节点、会话权限或刷新列表');
+        if (!parsed || parsed.id !== id) throw Object.assign(new Error('会话不可用，请检查执行节点、会话权限或刷新列表'), { serverRejected: true });
+        unavailableSessionMetadata.delete(favoriteKey(favoriteTarget(connection, id)));
         const session = sessionRoutingCache.loaded(id, attachSessionExecutor(parsed), revision);
         if (!isSessionMetaReady(session, id)) throw new Error('会话信息不完整：执行端未返回有效的会话类型或 LOOP 控制模式');
         return projectFavorite(session, connection);
       } catch (error) {
+        if (epoch === relayIdentityEpoch && (error as any)?.serverRejected) {
+          unavailableSessionMetadata.add(favoriteKey(favoriteTarget(connection, id)));
+          const summary = projectFavorite({ ...cachedSessionMeta(id), id }, connection);
+          sessionUpdateCallbacks.forEach(callback => callback({ type: 'privacy_changed', summaries: [summary] }));
+        }
         if (error instanceof Error && /RPC timeout/i.test(error.message)) throw new Error('会话信息加载超时，请重试');
         if (error instanceof Error && /WebSocket connection lost/i.test(error.message)) throw new Error('连接已中断，恢复连接后会自动重试');
         throw error;
@@ -3132,7 +3252,7 @@ export const api = {
   },
 
   async setSessionFavorite(sessionId: string, pinned: boolean, execKey?: string): Promise<void> {
-    await favoritesReady;
+    await Promise.all([favoritesReady, privacyReady]);
     const conn = pool.get(execKey || sessionExec.get(sessionId) || '');
     if (!conn) throw new Error('Session 执行节点未知，未保存收藏');
     const row = (sessionListCache.get(conn.key) || []).find(item => item.id === sessionId);
@@ -3145,6 +3265,24 @@ export const api = {
     const target = favoriteTarget(conn, sessionId);
     if (choice === 'retry') await sessionFavorites.sync(target);
     else await sessionFavorites.resolve(target, choice);
+  },
+
+  async retrySessionPrivacyStorage(): Promise<void> { await sessionPrivacy.reload(); },
+
+  async setSessionPrivacy(sessionId: string, isPrivate: boolean, execKey?: string): Promise<void> {
+    await Promise.all([favoritesReady, privacyReady]);
+    const conn = pool.get(execKey || sessionExec.get(sessionId) || '');
+    if (!conn) throw new Error('Session 执行节点未知，未保存私密状态');
+    const row = (sessionListCache.get(conn.key) || []).find(item => item.id === sessionId);
+    if (!row) throw new Error('没有该 Session 的可用缓存，未保存私密状态');
+    await sessionPrivacy.choose(favoriteTarget(conn, sessionId), isPrivate, row.privacyRevision);
+  },
+  async resolveSessionPrivacy(sessionId: string, choice: 'local' | 'remote' | 'retry', execKey?: string): Promise<void> {
+    const conn = pool.get(execKey || sessionExec.get(sessionId) || '');
+    if (!conn) throw new Error('所属节点已移除');
+    const target = favoriteTarget(conn, sessionId);
+    if (choice === 'retry') await sessionPrivacy.sync(target);
+    else await sessionPrivacy.resolve(target, choice);
   },
 
   async updateSessionConstraints(sessionId: string, constraints: string | { constraints: string }): Promise<{ status: string; message?: string }> {
@@ -3351,11 +3489,12 @@ export const api = {
   },
 
   async listSessionRefs(query = '', execKey?: string): Promise<any[]> {
-    // 引用上下文必须与当前 Session 位于同一执行节点；远端会话不能查询 home 清单。
-    const result = execKey
-      ? await callOn(execKey, 'listSessionRefs', query)
-      : await call('listSessionRefs', query);
-    try { return JSON.parse(result) || []; } catch { return []; }
+    await privacyReady;
+    const conn = connByKey(execKey || getHomeExecKey()), epoch = relayIdentityEpoch;
+    const result = await callOn(conn.key, 'listSessionRefs', query);
+    if (epoch !== relayIdentityEpoch) return [];
+    try { return (JSON.parse(result) || []).map((row: any) => projectFavorite({ ...row, execKey: conn.key }, conn)); }
+    catch { return []; }
   },
 
   async branchSession(sourceSessionId: string, afterMessageId?: string, titleSuffix = '分支'): Promise<any> {
@@ -3735,6 +3874,29 @@ export const api = {
   }> {
     const result = await call('kitGenerateCancel', sessionId, jobId);
     return parseRpcObject(result, { status: 'error', message: '停止 Kit 生成失败' });
+  },
+  async kitSshConnections(sessionId: string, kitId: string): Promise<{
+    status: string; mode?: string; profiles?: import('./types/sshConnections').SshProfile[]; message?: string;
+  }> {
+    return parseRpcObject(await callKitUpdate(sessionId, 'kitSshConnections', [kitId]), { status: 'error' });
+  },
+  async kitSshProbe(sessionId: string, data: import('./types/sshConnections').SshEndpoint): Promise<import('./types/sshConnections').SshProbe> {
+    return parseRpcObject(await callKitUpdate(sessionId, 'kitSshProbe', [JSON.stringify(data)]), {
+      status: 'error', probeId: '', fingerprint: '', algorithm: '', host: '', port: 0, user: '',
+    });
+  },
+  async kitSshSave(sessionId: string, data: import('./types/sshConnections').SshSave, requestId: string): Promise<{
+    status: string; profile?: import('./types/sshConnections').SshProfile; message?: string;
+  }> {
+    return parseRpcObject(await callKitUpdate(sessionId, 'kitSshSave', [JSON.stringify(data), requestId]), { status: 'error' });
+  },
+  async kitSshTest(sessionId: string, profileId: string): Promise<{ status: string; message?: string }> {
+    return parseRpcObject(await callKitUpdate(sessionId, 'kitSshTest', [profileId]), { status: 'error' });
+  },
+  async kitSshUse(sessionId: string, kitId: string, profileId: string, versionId: string): Promise<{
+    status: string; kit?: WorkspaceKit; message?: string;
+  }> {
+    return parseRpcObject(await callKitUpdate(sessionId, 'kitSshUse', [kitId, profileId, versionId]), { status: 'error' });
   },
   async kitUpdate(sessionId: string, kitId: string, patch: Partial<WorkspaceKit>): Promise<{ status: string; kit?: WorkspaceKit; message?: string }> {
     const result = await call('kitUpdate', sessionId, kitId, JSON.stringify(patch || {}));
@@ -5429,6 +5591,7 @@ export const api = {
   },
 
   sttStreamAudioBinary(pcmBuffer: ArrayBuffer): void {
+    if (!sttStreamExecKey) return;
     const conn = connByKey(sttStreamExecKey);
     if (conn?.isOpen) {
       conn.ws!.send(pcmBuffer);

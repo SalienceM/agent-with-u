@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createImageAdmission } from './image-admission.mjs'
+import { createSteering } from './steering.mjs'
 import { IMAGE_LIMITS, RUNTIME_VERSION, SOURCE_COMMIT } from './image-limits.mjs'
 export { RUNTIME_VERSION, SOURCE_COMMIT } from './image-limits.mjs'
 
@@ -32,6 +33,7 @@ export function installBridge(ctx, transport, server, config, io = process, exte
   if (!['read-only', 'workspace-write', 'danger-full-access'].includes(permissionMode)
       || !['ask', 'never'].includes(approvalPolicy)) throw new Error('Invalid AWU access policy')
   let exitTask
+  const steering = createSteering(config, extensions.createUserMessage)
   const images = createImageAdmission(ctx, config,
     { runtimeVersion: RUNTIME_VERSION, sourceCommit: SOURCE_COMMIT },
     { maxFrameBytes: MAX_FRAME, maxPendingBytes: MAX_PENDING }, extensions.imageCatalogProtocol)
@@ -61,6 +63,10 @@ export function installBridge(ctx, transport, server, config, io = process, exte
   // 上游的 committed/status 通知也走同一限额，而不仅是 AWU 实时帧。
   transport.notify = notify
   const identity = (sessionId) => ({ sessionId, generation: config.generation, configFingerprint: config.configFingerprint })
+  disposers.push(ctx.on('agent/pre-step', (payload, next) => {
+    steering.step(payload)
+    return next()
+  }))
   disposers.push(ctx.on('tools/execute', (execution, next) => toolExecution.run({
     sessionId: String(execution.agent?.session.id), callId: execution.callId,
   }, next)))
@@ -68,6 +74,7 @@ export function installBridge(ctx, transport, server, config, io = process, exte
     if (!belongs(String(agent.session.id))) return
     if (!configured) throw new Error('AWU turn configuration missing before agent creation')
     images.mount(agent)
+    steering.mount(agent)
     // resume 会恢复旧日志中的权限；每次创建/恢复都在输入前覆盖为当前冻结策略。
     agent.session.append('sandbox/mode', { mode: permissionMode })
     agent.session.append('approval/policy', { policy: approvalPolicy })
@@ -92,6 +99,7 @@ export function installBridge(ctx, transport, server, config, io = process, exte
   disposers.push(ctx.on('session/event', (session, event) => {
     const sessionId = String(session.id)
     if (!belongs(sessionId)) return
+    steering.observe(sessionId, event)
     if (event.type === 'tool/call') {
       const call = event.data
       if (typeof call.callId !== 'string' || typeof call.name !== 'string' || typeof call.arguments !== 'string') {
@@ -139,7 +147,12 @@ export function installBridge(ctx, transport, server, config, io = process, exte
       handshaken = true
       return { protocolVersion: PROTOCOL_VERSION, runtimeVersion: RUNTIME_VERSION, sourceCommit: SOURCE_COMMIT,
         ...identity(config.sessionId), realtime: true, approvals: true, questions: false,
-        questionProtocol: 'none', imageAdmission: images.descriptor }
+        questionProtocol: 'none', imageAdmission: images.descriptor,
+        steering: steering.supported ? { version: 1, text: true, images: false } : null }
+    }
+    if (method === 'awu/steer' || method === 'awu/steerStatus') {
+      if (!configured || textOnly) throw new Error('AWU steering unavailable for this invocation')
+      return steering.request(method, params)
     }
     if (method === 'awu/imageAdmission') {
       if (!configured || textOnly) return { version: images.descriptor.version, admitted: false,

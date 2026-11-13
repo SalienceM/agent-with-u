@@ -257,7 +257,7 @@ class EngineWorkbenchBridge:
         # 未接入的能力必须保持 0，不能凭存在类型或依赖包宣告可使用。
         return json.dumps({'status': 'ok', 'protocolVersion': PROTOCOL_VERSION,
                            'identity': identity.to_dict(), 'capabilities': {
-                               'viewMode': 1, 'windowHandoff': 1,
+                               'viewMode': 1, 'windowHandoff': 1, 'sessionPrivacy': 1,
                                'documents': int(os.name == 'nt' or Path('/proc/self/fd').is_dir()),
                                'languageServices': 1, 'terminal': int(bool(terminal_shells())),
                            }}, ensure_ascii=False)

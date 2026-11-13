@@ -37,6 +37,15 @@ test('read-only ownership refresh does not remove a local checkpoint recovery ho
   t.hold('e', 's', false); assert.equal(t.metadata('e', 'workspaceDocumentSave', ['s']).lease.generation, 1);
 });
 
+test('directory upload commit carries the owning window lease while status remains readable during handoff', () => {
+  const t = new WindowTransport(); t.activate({ clientId: 'client', windowId: 'source' }); t.observe('e', state());
+  assert.deepEqual(t.metadata('e', 'syncTransferCommit', ['s', '{}', '/qa', 'plan']).lease,
+    { sessionId: 's', generation: 1, workspaceRevision: workspace.workspaceRevision });
+  t.hold('e', 's', true);
+  assert.throws(() => t.metadata('e', 'syncTransferCommit', ['s']), /归属/);
+  assert.equal(t.metadata('e', 'syncTransferStatus', ['s']).lease, undefined);
+});
+
 function fixture() {
   const transport = new WindowTransport(), calls = [];
   let current = true, snapshot = state(), receipt, holdPrepare, dropCommit = false, unavailable = false;

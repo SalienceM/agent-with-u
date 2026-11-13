@@ -177,6 +177,41 @@ class DirectoryTransferBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.fixture.workspace / 'extra').exists())
         self.assertEqual((self.fixture.workspace / 'new').read_bytes(), b'new')
 
+    async def test_dispatch_requires_upload_window_lease_and_commits_with_it(self) -> None:
+        import json
+        from src.backend.workbench_windows import WINDOW_REQUEST
+        self.bridge._ensure_kit_scheduler = lambda: None
+        self.bridge._loop_control_reserved = lambda _: False
+        self.bridge._session_store = self.fixture.session_store()
+        self.bridge._session_store.save(self.session, async_=False)
+        workspace = self.bridge._workbench_identity(self.session.id)
+        self.bridge._windows().register(workspace, 'client', 'window')
+        row = await self.prepare()
+        args = [self.session.id, self.ident, self.session.working_dir, row['id']]
+        token = WINDOW_REQUEST.set({'clientId': 'client', 'windowId': 'window'})
+        try:
+            with self.assertRaisesRegex(Exception, 'window_lease_required'):
+                await self.bridge._dispatch_admitted('syncTransferCommit', args)
+            status = json.loads(self.bridge._rpc_syncTransferStatus(self.session.id, self.ident, row['id']))
+            self.assertEqual(status['state'], 'preview')
+            self.assertFalse((self.fixture.workspace / 'new').exists())
+            WINDOW_REQUEST.set({'clientId': 'client', 'windowId': 'window', 'lease': {
+                'sessionId': self.session.id, 'generation': 1, 'workspaceRevision': workspace.workspaceRevision}})
+            result = json.loads(await self.bridge._dispatch_admitted('syncTransferCommit', args))
+            self.assertEqual(result.get('state'), 'succeeded', result)
+        finally:
+            WINDOW_REQUEST.reset(token)
+
+    async def test_cancel_unstarted_upload_fences_a_late_commit(self) -> None:
+        import json
+        row = await self.prepare()
+        cancelled = json.loads(await self.bridge._rpc_syncTransferCancel(self.session.id, self.ident, row['id']))
+        self.assertEqual(cancelled['state'], 'cancelled')
+        result = json.loads(await self.bridge._rpc_syncTransferCommit(self.session.id, self.ident, self.session.working_dir, row['id']))
+        self.assertEqual(result['state'], 'cancelled')
+        self.assertFalse((self.fixture.workspace / 'new').exists())
+        self.assertTrue((self.fixture.workspace / 'extra').exists())
+
     async def test_active_project_refuses_and_identity_cannot_change(self) -> None:
         import json
         row = await self.prepare()

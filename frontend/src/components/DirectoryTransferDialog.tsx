@@ -66,7 +66,7 @@ export const DirectoryTransferDialog: React.FC<{ input: DirectoryTransferInput; 
         <WorkflowButton tone="primary" disabled={loading || !prepared} onClick={() => {
           if (!prepared) return;
           submitted.current = true; setLoading(true); setSending(true);
-          void submitDirectoryTransfer(prepared, onChanged).then(onClose).catch(reason => {
+          void submitDirectoryTransfer(prepared, onChanged, onClose).catch(reason => {
             submitted.current = false; setLoading(false); setSending(false); setError(String(reason.message || reason));
           });
         }}>{sending ? '正在传输…' : mirror && deletions.length ? '确认同步并删除' : '确认传输'}</WorkflowButton>

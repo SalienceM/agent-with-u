@@ -101,6 +101,8 @@ class SequenceDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
 
         bridge._handle_send_message = handle
+        bridge._active_sessions = {}
+        bridge._session_store = type('Store', (), {'load': lambda *_args: None})()
         bridge._rpc_sendMessage(json.dumps({
             "sessionId": "session-1",
             "messageId": "message-1",
@@ -159,7 +161,7 @@ class SequenceDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
         bridge._seq_dispatch_reservations = {}
         bridge._get_backend = lambda _backend_id: backend
         bridge._build_session_reference_context = lambda text, _sid: text
-        bridge._session_store = type("Store", (), {"save": lambda _self, *_args, **_kwargs: None})()
+        bridge._session_store = type("Store", (), {"save_confirmed": lambda _self, *_args: asyncio.sleep(0)})()
         bridge._emit_session_updated = events.append
         blocker = asyncio.Event()
         running = asyncio.create_task(blocker.wait())
@@ -198,7 +200,7 @@ class SequenceDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
         bridge._get_backend = lambda _backend_id: backend
         bridge._build_session_reference_context = lambda text, _sid: text
         bridge._session_store = type(
-            "Store", (), {"save": lambda _self, *_args, **_kwargs: None},
+            "Store", (), {"save_confirmed": lambda _self, *_args: asyncio.sleep(0)},
         )()
         bridge._emit_session_updated = lambda data: events.append(("session", data))
         bridge._chat_extras_save = lambda state: events.append(
@@ -270,6 +272,44 @@ class SequenceDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
             "id": "task-1", "text": "retry me", "status": "steering",
         })
         self.assertEqual(restored.status, "pending")
+
+    def test_new_steering_receipt_unknown_after_restart_never_requeues(self) -> None:
+        restored = SeqTask.from_dict({'id': 't', 'status': 'steering', 'steerRequestId': 'original'})
+        self.assertEqual(restored.status, 'interrupted')
+        self.assertIn('未自动重发', restored.error)
+
+    async def test_unknown_seq_steer_is_retained_without_automatic_queue_delivery(self) -> None:
+        bridge, extras = self._bridge_with_task()
+        backend = _FollowUpBackend(native=True, steer_result={'status': 'unknown', 'message': 'receipt lost'})
+        self._configure_seq_steer_bridge(bridge, backend, extras, [])
+        running = asyncio.create_task(asyncio.Event().wait())
+        bridge._chat_turn_tasks['session-1'] = {running}
+        try:
+            result = json.loads(await bridge._rpc_steerSeqTask('session-1', 'task-1'))
+            self.assertEqual(result['status'], 'unknown')
+            self.assertEqual(extras.seq_tasks[0].status, 'interrupted')
+            self.assertTrue(extras.seq_tasks[0].steer_request_id)
+        finally:
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+    async def test_turn_replaced_during_context_expansion_does_not_receive_old_steer(self) -> None:
+        bridge, extras = self._bridge_with_task()
+        backend = _FollowUpBackend(native=True)
+        self._configure_seq_steer_bridge(bridge, backend, extras, [])
+        original, newer = [asyncio.create_task(asyncio.Event().wait()) for _ in range(2)]
+        bridge._chat_turn_tasks['session-1'] = {original}
+        async def expand(content, *_args):
+            bridge._chat_turn_tasks['session-1'] = {newer}
+            return content, None
+        bridge._build_prov_reference_context = expand
+        try:
+            result = json.loads(await bridge._rpc_steerMessage('session-1', 'old correction'))
+            self.assertEqual(result['status'], 'turn_finished')
+            self.assertFalse(backend.events)
+        finally:
+            original.cancel(); newer.cancel()
+            await asyncio.gather(original, newer, return_exceptions=True)
 
 
 if __name__ == "__main__":

@@ -4,11 +4,37 @@ from __future__ import annotations
 import json
 import unittest
 
-from src.backend.harness_image_errors import harness_error_details, harness_error_text, terminal_error
+from src.backend.harness_image_errors import (harness_error_details, harness_error_text, terminal_error,
+                                             harness_projection_failure_metadata)
 from src.backend.deepseek_harness_images import ImagePolicyError
 
 
 class HarnessErrorDiagnosticsTests(unittest.TestCase):
+    def test_projection_metadata_keeps_shape_without_text_paths_or_custom_types(self) -> None:
+        marker = "PRIVATE_PAYLOAD_PATH_TOKEN"
+        note = {"method": "awu/assistantStream", "payload": {"sessionId": marker,
+            "frame": {"type": "chunk", "index": 2, "revision": 3, "attemptId": marker,
+                      "chunk": {"type": "tool-call-delta", "argumentsDelta": marker, "text": marker}}}}
+        metadata = harness_projection_failure_metadata(ValueError(marker), note)["projection"]
+        self.assertEqual(metadata["method"], "awu/assistantStream")
+        self.assertEqual(metadata["index"], 2)
+        self.assertEqual(metadata["chunkType"], "tool-call-delta")
+        self.assertEqual(metadata["exceptionType"], "ValueError")
+        self.assertNotIn(marker, json.dumps(metadata))
+        custom_error = type(marker, (ValueError,), {})(marker)
+        data = harness_projection_failure_metadata(custom_error, {"method": marker, "payload": {
+            "event": {"type": marker, "seq": marker}, "frame": {"type": marker, "revision": True,
+            "index": marker, "chunk": {"type": marker}}}})
+        self.assertNotIn(marker, json.dumps(data))
+        self.assertEqual(data["projection"]["exceptionType"], "other")
+
+    def test_controlled_projection_failures_are_no_longer_unknown(self) -> None:
+        for message, code in (("Harness 实时帧 index 无效", "protocol_error"),
+                              ("Harness 工具结果没有对应调用", "protocol_error"),
+                              ("Harness 本轮文本超出限额", "projection_limit"),
+                              ("Harness Session 已有运行", "session_busy")):
+            self.assertEqual(harness_error_details(ValueError(message))["errorCode"], code)
+
     def test_projection_and_backpressure_failures_keep_distinct_safe_reasons(self) -> None:
         for message, code in (("Harness 实时流有缺帧", "stream_gap"),
                               ("Harness 实时与已提交内容不一致", "stream_mismatch"),
@@ -59,6 +85,16 @@ class HarnessErrorDiagnosticsTests(unittest.TestCase):
             self.assertEqual(harness_error_details(error)["errorCode"], expected)
         error = terminal_error({"kind": "error", "error": {"code": "CONTEXT_WINDOW_EXCEEDED", "status": 400}})
         self.assertEqual(harness_error_details(error)["errorCode"], "context_limit")
+
+    def test_prepared_call_and_empty_response_keep_safe_classification(self) -> None:
+        for native, expected in (("INVALID_PREPARED_CALL", "call_config"),
+                                 ("UNSUPPORTED_REASONING_EFFORT", "call_config"),
+                                 ("NO_ADAPTER", "call_config"), ("EMPTY_RESPONSE", "empty_response"),
+                                 ("MISSING_CREDENTIAL", "auth"), ("ACCOUNT_QUOTA", "quota"),
+                                 ("ABORTED", "aborted")):
+            error = terminal_error({"kind": "error", "error": {"code": native, "message": "PRIVATE"}})
+            self.assertEqual(harness_error_details(error)["errorCode"], expected)
+            self.assertNotIn("PRIVATE", harness_error_text(error))
 
     def test_malformed_native_evidence_and_mutated_exception_do_not_escape(self) -> None:
         for value in (None, [], {}, {"kind": []}, {"kind": "error", "error": "PRIVATE"},

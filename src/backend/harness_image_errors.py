@@ -36,6 +36,8 @@ _ERRORS = {
     "timeout": ("timeout", "等待超时；请根据失败阶段核对运行时或服务响应。"),
     "transport_closed": ("network", "与 Harness 运行时的连接已关闭；请核对运行时是否正常启动和退出。"),
     "protocol_error": ("protocol", "运行时协议或事件不完整；请核对配套运行时与 AWU 版本。"),
+    "projection_limit": ("protocol", "本轮流式内容或工具记录超过处理上限；已接收的内容保留。"),
+    "session_busy": ("concurrency", "本 Session 的上一轮仍在执行或尚未确认退出。"),
     "event_overflow": ("protocol", "运行时事件积压超过接收容量，等待消化后仍未恢复；本轮已中断，已收到的内容保留。"),
     "stream_gap": ("protocol", "流式输出缺帧，无法确认回复完整；已收到的内容保留。"),
     "stream_mismatch": ("protocol", "实时输出与原生保存内容不一致，无法确认回复完整；已收到的内容保留。"),
@@ -51,6 +53,8 @@ _ERRORS = {
     "server_error": ("provider", "模型服务返回服务器错误；请检查服务状态。"),
     "network": ("network", "模型服务连接失败；请核对执行节点的网络、代理和服务地址。"),
     "malformed_response": ("protocol", "模型服务响应不符合当前 Harness 协议；请核对接口兼容性。"),
+    "empty_response": ("provider", "模型服务返回空响应，本轮未完成。"),
+    "call_config": ("protocol", "模型调用配置与运行时准备结果不一致或不受支持；请核对配套桥与模型配置。"),
     "runtime_error": ("unknown", "原生运行报告失败，但未提供可分类的错误信息。"),
     "aborted": ("cancelled", "本轮已中止，未完成任务。"),
     "blocked": ("blocked", "本轮被原生运行时阻止，未完成任务；请核对工具权限与运行限制。"),
@@ -62,6 +66,9 @@ _NATIVE_CODES = {
     "CONTEXT_WINDOW_EXCEEDED": "context_limit", "INVALID_REQUEST": "invalid_request",
     "SERVER": "server_error", "TRANSPORT": "network", "TIMEOUT": "timeout",
     "MALFORMED_RESPONSE": "malformed_response",
+    "EMPTY_RESPONSE": "empty_response", "INVALID_PREPARED_CALL": "call_config",
+    "UNSUPPORTED_REASONING_EFFORT": "call_config", "NO_ADAPTER": "call_config",
+    "MISSING_CREDENTIAL": "auth", "ACCOUNT_QUOTA": "quota", "ABORTED": "aborted",
 }
 _LOCAL_CODES = {
     "Harness 工作目录不是目录": "workspace_invalid",
@@ -74,6 +81,8 @@ _LOCAL_CODES = {
     "Harness 根空闲但缺少本轮终态": "protocol_error",
     "Harness turn/end 缺少有效结束原因": "protocol_error",
     "Harness 本轮收到重复终态": "protocol_error", "Harness 根事件序列无效": "protocol_error",
+    "Harness 原生轮次边界不匹配": "protocol_error",
+    "Harness Session 已有运行": "session_busy",
     "Harness 进程树退出未确认，活动保护保留": "exit_unknown",
     "Harness 实时流有缺帧": "stream_gap",
     "Harness 实时与已提交内容不一致": "stream_mismatch",
@@ -88,6 +97,25 @@ _LOCAL_CODES = {
     "Harness chunk 缺失": "protocol_error",
     "Harness 收到旧运行的实时帧": "protocol_error",
     "Harness 收到其他 Session 的事件": "protocol_error",
+    "Harness 子代理身份无效": "protocol_error",
+    "Harness 子代理工具关联无效": "protocol_error",
+    "Harness 已提交事件缺少 seq": "protocol_error",
+    "Harness 实时帧身份缺失": "protocol_error",
+    "Harness 实时帧 index 无效": "protocol_error",
+    "Harness 实时帧类型未知": "protocol_error",
+    "Harness 文本增量无效": "protocol_error",
+    "Harness 工具增量缺少身份/参数": "protocol_error",
+    "Harness 事件 data 无效": "protocol_error",
+    "Harness assistant/message 缺少内容": "protocol_error",
+    "Harness tool/call 缺少字段": "protocol_error",
+    "Harness tool/result 缺少 toolCallId": "protocol_error",
+    "Harness 工具结果没有对应调用": "protocol_error",
+    "Harness 上下文替换事件无效": "protocol_error",
+    "Harness 子代理数量超限": "projection_limit",
+    "Harness attempt 数量超限": "projection_limit",
+    "Harness 本轮文本超出限额": "projection_limit",
+    "Harness 本轮工具数量超限": "projection_limit",
+    "Harness 工具参数超限": "projection_limit",
 }
 
 
@@ -204,3 +232,40 @@ def harness_event_metadata(event: dict) -> dict:
     kind, seq = event.get("type"), event.get("seq")
     return {"type": kind if isinstance(kind, str) and kind in kinds else "other",
             "seq": seq if type(seq) is int and 0 <= seq <= 2**53 - 1 else None}
+
+
+def harness_projection_failure_metadata(error: Exception, note: dict) -> dict:
+    """投影失败只记录协议形状和本地代码位置，绝不保存帧正文或异常字符串。"""
+    method = note.get("method")
+    methods = {"session.event", "session.status", "awu/assistantStream", "awu/subagentLink",
+               "subagent.started", "subagent.finished"}
+    context: dict = {"method": method if isinstance(method, str) and method in methods else "other"}
+    body = note.get("payload")
+    body = body if isinstance(body, dict) else {}
+    event = body.get("event")
+    if isinstance(event, dict):
+        context["event"] = harness_event_metadata(event)
+    frame = body.get("frame")
+    if isinstance(frame, dict):
+        kind = frame.get("type")
+        context["frameType"] = kind if isinstance(kind, str) and kind in {"start", "chunk", "end"} else "other"
+        for key in ("index", "revision"):
+            value = frame.get(key)
+            context[key] = value if type(value) is int and 0 <= value <= 2**53 - 1 else None
+        chunk = frame.get("chunk")
+        if isinstance(chunk, dict):
+            kind = chunk.get("type")
+            kinds = {"text-delta", "reasoning-delta", "tool-call-delta", "block-start", "block-end", "usage", "finish"}
+            context["chunkType"] = kind if isinstance(kind, str) and kind in kinds else "other"
+    context["exceptionType"] = {ValueError: "ValueError", RuntimeError: "RuntimeError", TypeError: "TypeError",
+        KeyError: "KeyError", AttributeError: "AttributeError", IndexError: "IndexError"}.get(type(error), "other")
+    sites = []
+    trace = error.__traceback__
+    modules = {"deepseek_harness_events.py", "deepseek_harness_turn.py", "bridge_ws.py"}
+    while trace is not None:
+        name = trace.tb_frame.f_code.co_filename.replace("\\", "/").rsplit("/", 1)[-1]
+        if name in modules:
+            sites.append({"file": name, "line": trace.tb_lineno})
+        trace = trace.tb_next
+    context["sites"] = sites[-3:]
+    return {"projection": context}

@@ -1,8 +1,9 @@
 import React, { forwardRef, useContext, useLayoutEffect, useRef, useState } from 'react';
 import { AppModalPortal, AppModalVisibilityContext, WorkbenchInteractionContext } from './AppModalPortal';
 
-type IconName = 'branch' | 'review' | 'bell' | 'question' | 'more' | 'close' | 'refresh' | 'spark' | 'shield' | 'expand' | 'plus' | 'role' | 'clear' | 'settings' | 'block' | 'camera';
+type IconName = 'branch' | 'review' | 'bell' | 'question' | 'more' | 'close' | 'refresh' | 'spark' | 'shield' | 'expand' | 'plus' | 'role' | 'clear' | 'settings' | 'block' | 'camera' | 'history';
 const paths: Record<IconName, React.ReactNode> = {
+  history: <><path d="M3 4v5h5M3 9a9 9 0 1 1 1 8" /><path d="M12 7v5l3 2" /></>,
   branch: <><circle cx="6" cy="5" r="2" /><circle cx="6" cy="19" r="2" /><circle cx="18" cy="6" r="2" /><path d="M6 7v10M18 8c0 5-12 3-12 8" /></>,
   review: <><path d="M20 11a7 7 0 0 1-7 7H8l-5 3 1-6a7 7 0 0 1 6-11h3a7 7 0 0 1 7 7Z" /><path d="M8 10h7M8 13h4" /></>,
   bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9ZM10 21h4" /></>,

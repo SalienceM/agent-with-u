@@ -804,12 +804,14 @@ from .kit_update_template import validate_update_sequence
 from .harness_image_bridge import HarnessImageBridge
 from .aside_bridge import AsideInspectionBridge
 from .session_collaboration_bridge import SessionCollaborationBridge
+from .session_history import SessionHistoryBridge
+from .kit_ssh_connections import KitSshConnectionsBridge
 from .loop_control_persistence import OrderedLoopWrites
 from .loop_milestones import (MILESTONE_INSTRUCTIONS, register_plan, review_milestones,
                               milestone_progress, inherit_plan)
 
 
-class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, KitRunApprovalBridge, AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, SyncReviewBridge, DirectoryTransferBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
+class BridgeWS(KitSshConnectionsBridge, SessionHistoryBridge, SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, KitRunApprovalBridge, AimeinBridge, AsideInspectionBridge, LoopStartupBridge, LoopOpenSpecBridge, LoopSourceBridge, LoopEnvironmentBridge, LoopTaskBlockerBridge, LoopControlBridge, EngineWorkbenchBridge, WorkspaceDocumentBridge, SyncReviewBridge, DirectoryTransferBridge, WorkspaceSearchBridge, WorkbenchWindowBridge, WorkbenchStreamBridge, TerminalBridge, LanguageBridge):
     """WebSocket bridge，业务逻辑与 Bridge（Qt）完全相同，去掉 Qt 依赖。"""
 
     def __init__(self, cli_path: Optional[str] = None, auth_guard: Optional["AuthGuard"] = None):
@@ -2092,8 +2094,9 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
                     ):
                         try:
                             await self._stt_stream.send_audio(raw)
-                        except Exception:
-                            pass
+                        except Exception as error:
+                            # 不能把音频发送失败当作正常录音，直到 stop/Flash 才发现。
+                            print(f"[STT] 音频帧发送失败: {error}", file=sys.stderr, flush=True)
                     continue
                 req_id = None
                 try:
@@ -2227,7 +2230,7 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
                 'languageServiceStart', 'languageServiceRequest', 'languageServiceStop',
                 'steerMessage', 'redirectMessage', 'steerSeqTask', 'seqtaskAdd', 'seqtaskEdit',
                 'seqtaskRemove', 'seqtaskReorder', 'seqtaskSetAuto', 'seqtaskTakeNext', 'seqtaskClear',
-                'abortMessage', 'grantPermission', 'sessionFavoriteSet', 'updateSessionAppearance',
+                'abortMessage', 'grantPermission', 'sessionFavoriteSet', 'sessionPrivacySet', 'updateSessionAppearance', 'sessionRenew',
                 'loopControlRequest', 'loopTakeover', 'loopRelease',
                 'loopRepairTaskContract', 'loopCancelTaskContractRepair'}:
             self._window_guard(sid)
@@ -2244,7 +2247,7 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         }
         if sid and self._loop_control_reserved(sid) and (
                 method.startswith('loop') and method not in control_read_or_independent
-                or method in {'clearSessionContext', 'syncAttachedCodexSession', 'destroySession', 'deleteSession',
+                or method in {'clearSessionContext', 'sessionRenew', 'syncAttachedCodexSession', 'destroySession', 'deleteSession',
                               'updateSessionRuntime', 'updateSessionAbilities', 'updateSessionConstraints'}):
             return self._control_error('handoff_busy')
         if asyncio.iscoroutinefunction(handler):
@@ -3209,13 +3212,14 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
                 }))
 
             def on_end():
-                if self._stt_stream_owner_id == owner_id:
-                    self._stt_stream = None
-                    self._stt_stream_cfg = None
-                    self._stt_stream_owner_id = None
+                if self._stt_stream is not session:
+                    return
+                self._stt_stream = None
+                self._stt_stream_cfg = None
+                self._stt_stream_owner_id = None
                 asyncio.ensure_future(self._send_to_owner(owner_id, {
                     "event": "sttStreamEnd",
-                    "data": json.dumps({"reason": "disconnected"}, ensure_ascii=False),
+                    "data": json.dumps({"reason": "disconnected", "error": getattr(session, "error", "")}, ensure_ascii=False),
                 }))
 
             if not cfg.api_key:
@@ -3279,6 +3283,7 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         realtime_error = ""
         try:
             realtime_text = await session.stop()
+            realtime_error = getattr(session, "error", "")
         except Exception as e:
             realtime_error = str(e)
             import traceback
@@ -3309,6 +3314,11 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
             payload["refineSkipped"] = "没有可用于 Flash 精校的音频"
             if not realtime_text and realtime_error:
                 payload["error"] = realtime_error
+            return json.dumps(payload, ensure_ascii=False)
+
+        if not realtime_text and getattr(session, "has_audio_signal", True) is False:
+            payload["error"] = "没有采到麦克风声音，请检查输入设备或麦克风静音开关"
+            payload["refineSkipped"] = "完全静音的音频不进行 Flash 精校"
             return json.dumps(payload, ensure_ascii=False)
 
         from .stt_service import transcribe_fun_asr_flash
@@ -3468,6 +3478,8 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
                 "updatedAt": item.get("updatedAt", 0),
                 "backendId": item.get("backendId", ""),
                 "sessionType": item.get("sessionType", "normal"),
+                "isPrivate": bool(item.get("isPrivate", False)),
+                "privacyRevision": item.get("privacyRevision", 0),
             }
             for item in self._filter_sessions_for_current_owner(
                 self._session_store.list()
@@ -3757,11 +3769,14 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         session = self._active_sessions.get(session_id) or self._session_store.load(session_id)
         if not session:
             return json.dumps({"status": "error", "message": "Session 不存在"}, ensure_ascii=False)
-        if not self._active_chat_turn_tasks(session_id):
+        active_turns = set(self._active_chat_turn_tasks(session_id))
+        if not active_turns:
             return json.dumps({
                 "status": "turn_finished", "message": "当前回答已经结束，未执行引导",
             }, ensure_ascii=False)
 
+        active_assistant_id = next((message.id for message in reversed(session.messages)
+                                    if message.role == "assistant" and message.streaming), "")
         images = self._parse_images_json(images_json)
         text_attachments = self._parse_text_attachments_json(text_attachments_json)
         display_text = str(text or "").strip()
@@ -3773,6 +3788,9 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
             content, session, images, display_text,
         )
 
+        if set(self._active_chat_turn_tasks(session_id)) != active_turns:
+            return json.dumps({"status": "turn_finished", "message": "原回答已结束，未将插话发送到后续轮次"}, ensure_ascii=False)
+        steer_attempted = False
         try:
             backend = self._get_backend(session.backend_id)
             capabilities = backend.follow_up_capabilities()
@@ -3780,7 +3798,10 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
                 return json.dumps({
                     "status": "unsupported", "message": "当前后端不支持原生同轮引导",
                 }, ensure_ascii=False)
+            if model_images and not capabilities.get("steerAttachments"):
+                return json.dumps({"status": "unsupported", "message": "此后端的插话不支持图片，请使用排到下一轮"}, ensure_ascii=False)
             message_id = client_message_id or new_id()
+            steer_attempted = True
             result = await backend.steer_message(
                 session_id=session_id,
                 content=content,
@@ -3788,7 +3809,8 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
                 client_message_id=message_id,
             )
         except Exception as exc:
-            result = {"status": "error", "message": str(exc)}
+            result = {"status": "unknown" if steer_attempted else "error",
+                      "message": "插话回执未能核对，请核对原对话；未自动重发" if steer_attempted else str(exc)}
         if result.get("status") != "ok":
             return json.dumps(result, ensure_ascii=False)
 
@@ -3796,7 +3818,7 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         # inserting the steer message immediately before the active bubble.
         insert_at = next((
             index for index in range(len(session.messages) - 1, -1, -1)
-            if session.messages[index].role == "assistant" and session.messages[index].streaming
+            if session.messages[index].id == active_assistant_id
         ), len(session.messages))
         before_message_id = (
             session.messages[insert_at].id if insert_at < len(session.messages) else ""
@@ -3809,10 +3831,16 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
             text_attachments=text_attachments,
             delivery_mode="steer",
         )
+        if any(item.id == message_id for item in session.messages):
+            return json.dumps({"status": "ok", "message": user_message.to_dict()}, ensure_ascii=False)
         session.messages.insert(insert_at, user_message)
         session.updated_at = time.time()
         self._active_sessions[session_id] = session
-        self._session_store.save(session, async_=True)
+        # 原生已接收；磁盘失败属于未知结果，不能把同一内容重新派发。
+        try:
+            await self._session_store.save_confirmed(session)
+        except Exception:
+            return json.dumps({"status": "unknown", "message": "原生已接收插话，但会话保存失败；请核对原对话，未重发"}, ensure_ascii=False)
         self._emit_session_updated({
             "type": "follow_up_added",
             "sessionId": session_id,
@@ -5008,6 +5036,8 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         if session:
             session.pinned = bool(meta.get("pinned"))
             session.favorite_revision = meta.get("favoriteRevision", 0)
+            session.is_private = bool(meta.get("isPrivate"))
+            session.privacy_revision = meta.get("privacyRevision", 0)
             session.sidebar_color = meta.get("sidebarColor", "")
         self._emit_session_updated({"type": "session_changed", "sessionId": session_id, "summary": summary})
         return summary
@@ -5026,6 +5056,27 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
             if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
                 raise ValueError("requestId 无效")
             result = self._session_store.commit_appearance(session_id, {"pinned": payload["pinned"]},
+                                                          expected_revision=revision, request_id=request_id)
+            if result["status"] == "ok":
+                result["summary"] = self._publish_session_appearance(session_id)
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False)
+
+    def _rpc_sessionPrivacyGet(self, session_id: str) -> str:
+        return json.dumps(self._session_store.privacy_state(session_id), ensure_ascii=False)
+
+    def _rpc_sessionPrivacySet(self, session_id: str, payload_json: str) -> str:
+        try:
+            payload = json.loads(payload_json)
+            if not isinstance(payload, dict) or set(payload) != {"isPrivate", "expectedRevision", "requestId"}:
+                raise ValueError("私密参数不完整或含未知字段")
+            revision, request_id = payload["expectedRevision"], payload["requestId"]
+            if type(payload["isPrivate"]) is not bool or type(revision) is not int or not 0 <= revision <= 9007199254740991:
+                raise ValueError("私密值或修订无效")
+            if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
+                raise ValueError("requestId 无效")
+            result = self._session_store.commit_appearance(session_id, {"isPrivate": payload["isPrivate"]},
                                                           expected_revision=revision, request_id=request_id)
             if result["status"] == "ok":
                 result["summary"] = self._publish_session_appearance(session_id)
@@ -9004,11 +9055,11 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
         return self._seqtask_payload(ex)
 
     async def _rpc_steerSeqTask(self, session_id: str, task_id: str) -> str:
-        """将一条待发 Seq 原子转换成当前 Codex turn 的原生引导。
+        """将一条待发 Seq 原子转换成当前运行后端的原生引导。
 
         先同步持久化 ``steering``，让普通队列派发无法同时领取；只有 steer
-        被后端确认接受后才删除任务。失败则恢复 pending，保证既不丢消息也不
-        会在 steer 成功后由队列重复发送。
+        被后端确认接受后才删除任务。明确拒绝恢复 pending；未知结果保留为
+        interrupted，不在重启或 Auto 中重复派发。
         """
         ex = self._chat_extras_get(session_id)
         task = next((item for item in ex.seq_tasks if item.id == task_id), None)
@@ -9021,6 +9072,7 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
             return json.dumps({"status": "busy", "message": message}, ensure_ascii=False)
 
         task.status = "steering"
+        task.steer_request_id = new_id()
         task.updated_at = time.time()
         self._chat_extras_save(ex)
         self._emit_seqtask_updated(ex)
@@ -9031,11 +9083,11 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
                 task.text,
                 json.dumps(task.images or [], ensure_ascii=False),
                 json.dumps(task.text_attachments or [], ensure_ascii=False),
-                new_id(),
+                task.steer_request_id,
             )
             result = json.loads(result_raw)
-        except Exception as exc:
-            result = {"status": "error", "message": str(exc)}
+        except Exception:
+            result = {"status": "unknown", "message": "插话接收未确认，请核对原对话；未自动重发"}
 
         # await 期间清空队列等显式用户动作可能已经移除了任务；不要把它复活。
         current_ex = self._chat_extras_get(session_id)
@@ -9055,7 +9107,12 @@ class BridgeWS(SessionCollaborationBridge, HarnessImageBridge, KitUpdateBridge, 
             }, ensure_ascii=False)
 
         if current and current.status == "steering":
-            current.status = "pending"
+            current.status = "interrupted" if result.get("status") == "unknown" else "pending"
+            current.error = str(result.get("message") or "")
+            if current.status == "interrupted":
+                current_ex.seq_error = "插话接收未确认，原内容保留在队列历史；请核对原对话，未自动重发"
+            if current.status == "pending":
+                current.steer_request_id = ""
             current.updated_at = time.time()
             self._chat_extras_save(current_ex)
             self._emit_seqtask_updated(current_ex)
@@ -10008,7 +10065,7 @@ public static class AwuSshAskPass {
   if ($askPassDir) { Remove-Item -LiteralPath $askPassDir -Recurse -Force -ErrorAction SilentlyContinue }
   Remove-Item Env:SSH_ASKPASS, Env:SSH_ASKPASS_REQUIRE, Env:DISPLAY -ErrorAction SilentlyContinue
 }'''
-        return {
+        candidate = {
             "title": "SSH 一键更新 AgentWithU Docker",
             "description": "由当前 Windows 执行端通过 SSH 登录 Linux 宿主机，更新并验收 AgentWithU Backend/Web",
             "executionTarget": "executor",
@@ -10042,6 +10099,11 @@ public static class AwuSshAskPass {
             "view": {"default": "summary", "showLogs": True, "showData": True, "showTerminal": False},
             "enabled": True, "controlMode": "shared",
         }
+
+        if any(token in lowered for token in ("免密", "密钥", "指纹", "ssh agent")):
+            from .kit_ssh_connections import key_candidate
+            return key_candidate(candidate)
+        return candidate
 
     def _kit_builtin_release_candidate(
         self, objective: str, success_criteria: str = "",
@@ -12069,6 +12131,13 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                     shell=shell,
                 )
                 rendered, input_env = render_kit_command(command_kit, current_inputs)
+                ssh_snapshot = None
+                if (spec.get("config") or {}).get("sshConnection"):
+                    try:
+                        ssh_snapshot = self._ssh_freeze(current, spec, current_inputs)
+                    except (ValueError, PermissionError, OSError) as error:
+                        errors.append(f"步骤“{title}”：{error}")
+                        continue
                 try:
                     timeout = min(86_400, max(1, int(
                         spec.get("timeoutSeconds") or current.timeout_seconds,
@@ -12086,6 +12155,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                     cwd=str(spec.get("cwd") or current.cwd or "."),
                     timeout_seconds=timeout,
                     config={
+                        **({"sshConnection": ssh_snapshot} if ssh_snapshot else {}),
                         "env": input_env,
                         "assertions": [
                             dict(item) for item in (spec.get("assertions") or [])
@@ -12821,6 +12891,8 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
                         env.pop(key, None)
                 env.update({str(k): str(v) for k, v in (step.config.get("env") or {}).items()})
                 env.update(self._kit_run_secret_env.get(run.id) or {})
+                if step.config.get("sshConnection"):
+                    env.update(self._ssh_runtime_env(step.config["sshConnection"]))
                 env.update({
                     "KIT_SESSION_ID": session_id,
                     "KIT_ID": step.source_kit_id or kit.id,
@@ -12984,7 +13056,7 @@ Kit 版本账本（版本属于 Kit，不属于 AI）：
             run.status = "error"
             run.verdict = "error"
             run.error = self._redact_kit_secret_text(run.id, exc)
-            if any(s.config.get("capability") in LOCAL_UPDATE_CAPABILITIES for s in run.steps):
+            if any(s.config.get("capability") in LOCAL_UPDATE_CAPABILITIES or s.config.get("sshConnection") for s in run.steps):
                 # 构建回执/预检异常同样必须明确停止余下链路，不能留成可继续的 pending。
                 if 0 <= run.current_step < len(run.steps):
                     failed = run.steps[run.current_step]

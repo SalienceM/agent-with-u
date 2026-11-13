@@ -118,7 +118,7 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/skill', description: '显式调用当前 Session 已启用的 Skill：技能名 参数', shortDesc: '调用 Skill', requiresArguments: true },
   { name: '/help',          description: '显示可用命令列表',                     shortDesc: '帮助' },
-  { name: '/new',           description: '清空对话上下文（session不变，重置下游agent session）', shortDesc: '清空上下文' },
+  { name: '/new',           description: '保留旧记录，沿用目录与设置开启新会话', shortDesc: '新会话 · 同目录' },
   { name: '/clear',         description: '清空当前对话历史',                     shortDesc: '清空' },
   { name: '/compact',       description: '压缩早期消息以节省上下文窗口',         shortDesc: '压缩' },
   { name: '/cost',          description: '显示本次会话的 Token 用量与估算费用',  shortDesc: '费用' },
@@ -237,7 +237,7 @@ export function useChat(
   backends?: any[],
   skipPermissions: boolean = true,
   onNewSession?: () => void,
-  onClearContext?: () => void,
+  onRenewSession?: () => void | Promise<void>,
   sessionRuntime?: { modelOverride?: string; reasoningEffort?: string },
   hydrationEnabled: boolean = true,
 ) {
@@ -1050,14 +1050,14 @@ export function useChat(
           sys(HELP_TEXT);
           break;
 
-        // ── 清空上下文（同 session，重置 agent 下游 session）──
+        // ── 保留旧记录，开启同目录的新 Session ──
         case '/new':
-          if (onClearContext) {
-            onClearContext();
+          if (onRenewSession) {
+            await onRenewSession();
           } else if (onNewSession) {
             onNewSession();  // 降级兼容
           } else {
-            sys('⚠️ 无法清空上下文：未注册 onClearContext 回调。');
+            sys('⚠️ 当前窗口无法开启新会话。');
           }
           break;
 
@@ -1324,7 +1324,7 @@ export function useChat(
           break;
       }
     },
-    [sessionId, backendId, backends, sessionRuntime?.modelOverride, sessionRuntime?.reasoningEffort]
+    [sessionId, backendId, backends, sessionRuntime?.modelOverride, sessionRuntime?.reasoningEffort, onNewSession, onRenewSession]
   );
 
   // ── 公开的 sendMessage（含斜杠命令拦截）──

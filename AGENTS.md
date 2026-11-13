@@ -209,6 +209,44 @@ PyInstaller backend above as its sidecar (`agent-with-u-backend`).
    - Index file at `~/.agent-with-u/sessions/index.json` for fast listing
    - Auto-save after each message completion
 
+### Client navigation and private Sessions
+
+`clientNavigation.ts` and `workbench.ts` persist bounded navigation-only snapshots by
+client ID, user and realm. Group collapse keys use executor identity. Each window keeps
+its own snapshot; only explicit main-window navigation updates the cold-start fallback.
+Detached windows and background events never replace it. Restore before writing, retain
+offline IDs, and never infer deletion from an empty/failed list. Old relay snapshots require
+a matching configured identity/realm and one-time migration claim.
+
+Session `is_private` / `privacy_revision` are independent of favorites. `sessionPrivacyGet/Set`
+use field CAS and requestId with the existing owner/window boundary, disk-before-publish
+and stale-body protection. `SessionPrivacy` adapts the favorite coordinator using a separate
+IndexedDB repository; storage must load before visibility is known. Unknown receipts only
+read until resolved. Do not route private metadata through unversioned appearance updates.
+
+`sessionVisibility.ts` owns the in-memory, window-local reveal switch (default false; reset
+on identity changes). Apply presentation projections without filtering the authoritative API
+inventory or mutating tab membership. Hidden mounted workbenches retain drafts/jobs but lose
+visible panes, toolbar context, keyboard focus and portals. Both prompt composers, homepage,
+Session selectors and notifications use the same gate; unreadable metadata stays neutral.
+Revealing restores tab order without stealing focus. This is UI privacy, not encryption or
+API access control; old clients may ignore it. See `docs/session-navigation-privacy.md`.
+
+### Same-directory conversation history
+
+`session_history.py` implements `sessionRenew` / read-only status/history/log-location RPCs.
+The composer “新会话 · 同目录” and `/new` create a fresh Session and replace this window's
+tab only after confirmed persistence; they never call the destructive legacy clear RPC.
+Keep the source transcript, native binding, title, drafts and jobs intact. New Sessions
+inherit an explicit settings whitelist and current private/favorite metadata, never native
+thread IDs, token usage, task workspace identity or transient grants. `historyRootId` /
+`historySourceId` form a separate time axis; no title rewrite or collaboration-parent reuse.
+Requests persist window-scoped IDs before sending; lost replies get one automatic read,
+manual continuation reuses the same ID, and late results never steal focus. Keep owner,
+executor, window and active-process guards. History is lazy/paged and uses the shared private
+visibility projection. DSH log-location reads only binding metadata on the owning executor,
+never start/resume the native runtime. See `docs/session-history.md`.
+
 ### Model Backends
 
 The `ModelBackend` abstract class supports multiple implementations:
@@ -290,6 +328,25 @@ priority `SeqTask`, then aborts the current query and resumes with that task aft
 authoritative chat-turn registry becomes idle. Plain **排到下一轮** remains available
 for every Backend. `ChatMessage.delivery_mode` (`steer` / `redirect`) records the
 visible provenance; the two stronger semantics must never be presented as equivalent.
+
+DSH rc.3 now provides native text steering through the trusted `awu/steer` bridge,
+calling the active root Agent's `steer()`; SDK `session/prompt` is followup, never steer.
+Identity, generation, config, current native turn and cancellation signal are checked
+before insertion. One SDK stdout reader remains authoritative; independent response
+waiters do not consume notifications. Receipt loss triggers at most one read-only
+`awu/steerStatus`, never a write retry. Pending receipt work holds normal worker exit.
+The composer offers **引导当前轮** / Ctrl-or-Cmd+Enter for capable running backends;
+Enter still queues. Text attachments work; DSH images remain queue-only. Composer
+receipts persist before submission and clear only the accepted matching draft revision.
+New Seq conversions persist a request ID; unknown/restart conversions stay interrupted
+with visible context rather than auto-requeue. Real rc.3 plus loopback fake-model tests
+verify one native turn, one initial prompt and correction in the next request.
+Codex and DSH share the same composer, Seq conversion, `steerMessage` RPC and
+`follow_up_added` / `deliveryMode=steer` rendering, with matching draft receipts.
+DSH serializes consecutive steer deliveries in admission order like Codex's control
+queue, rechecking turn/stop before each write; its SDK reader continues draining
+notifications independently. UI differences are capability-driven (DSH text only,
+Codex text/images), not a separate DSH interaction mode.
 
 ### Visualized Loop Integration (loop sessions)
 
@@ -1330,6 +1387,17 @@ Workspace Kits are Session-level standard accessories stored separately in
   only with `--ff-only`. Normal file transfers still use `file_push`; an unspecified destination
   defaults to the same filename in the Session workspace root, with size and SHA-256
   verified before atomic replace.
+- Linux SSH Kits also expose saved, owner/executor-scoped connections in their input
+  panel (`kit_ssh_connections.py`, `ssh_connections.py`). These store only public host
+  keys/fingerprints and private-key paths or an Agent choice, never credentials. A bounded
+  keyscan is discovery only; saving requires explicit human fingerprint verification.
+  Exact built-in password templates can switch to a new key-only version only while
+  disabled and idle; custom commands are never silently replaced. Preserve deploy input
+  defaults and old versions. The key-only template has no secret inputs, freezes the
+  immutable profile in the Kit plan and rechecks it before spawning the ordinary runner.
+  Keep node-management/Session ownership guards, strict executor routing, independent
+  known_hosts, StrictHostKeyChecking=yes, disabled password fallback and existing chat
+  secret-input rejection. Connection tests never deploy. See `docs/kit-ssh-connections.md`.
 - Kit inputs support `secret` for one-run passwords and keys. Secret specs cannot retain
   `default` or `sourceKey`; the UI uses a password field and clears it immediately after
   the run RPC. The executor keeps values only in an in-memory per-run environment map,
@@ -1845,6 +1913,37 @@ UI surfaces (config UX kept minimal — invisible to single-node users):
 
 ### Experimental realtime voice conversation
 
+`fun_asr_stream.py` owns the native DashScope inference duplex connection. Await
+`task-started` before accepting PCM16 frames; send binary audio directly and keep one
+independent bounded WebSocket reader for partial/final results. Do not restore the
+threaded Recognition SDK queue or mutate its global API settings. Stop flushes
+`finish-task`, preserves final plus unfinished text, and bounds connection cleanup;
+Flash refinement remains separate. Log frame/byte/event counts, not transcript content.
+Inactive ChatInput microphones never react to another stream's disconnect; one retry
+without a text event is the limit. Frontend audio/events require the bound executor,
+with no home fallback while disconnected. See `tests/test_stt_realtime.py` and
+`frontend/tests/engine/stt-streaming.spec.ts` for pre-stop rendering regressions.
+
+`SpeechDictation` stages ordinary microphone input in a narrow, nonmodal panel inside
+the owning ChatPane's message area. Partials and stop/Flash results update that panel,
+never the composer. Its scrollbar follows the latest text only while already at the
+bottom. Explicit Apply appends once to the current draft, preserving intervening edits
+and existing attachments; long speech uses the existing composer packing rules. Stop
+finalization disables Apply. Collapse retains text; Discard clears only staged speech.
+`useSpeechDictation` retains unapplied text in window memory by owner/executor/Session,
+clears it on identity change, and stops capture when hidden or unmounted. Key the
+component by that scope. Late start/stop callbacks never write a different Session;
+one owned cleanup waits for pending startup/reconnect before releasing the microphone.
+Staged speech is not persisted across window reloads. It never auto-sends a message.
+Dictation capture uses the device's native AudioContext clock and the shared Worklet
+resamples to 16 kHz PCM16; do not force a 16 kHz device context on Windows/WebView2.
+The panel shows the actual microphone, permits switching it while stopped, and reports
+local input level separately from recognition progress. A stale saved device ID may
+fall back only on not-found/constraint errors, with a visible notice; permission failures
+never retry another microphone. Backend diagnostics retain only PCM peak/RMS/counts.
+Completely zero PCM must not call Flash refinement or claim a transcript. Synthetic
+audio/isolated-package success does not prove a user's physical microphone works.
+
 Ordinary chat panes expose a compact `RealtimeVoiceBar`: persistent browser mic
 capture and client RMS/VAD feed Fun-ASR Realtime (Flash refinement is explicitly
 disabled per turn). A configurable wake phrase (default `小U`, including common
@@ -2097,8 +2196,14 @@ platform boundaries. Windows and Linux native document cores are tested directly
 requires `/proc/self/fd` and `FS_IOC_GETVERSION` (verified on WSL2/ext4), refusing safe editing
 when object identity cannot be proven. The headless Cargo harness compiles the production
 core, not a substitute; it does not verify Tauri window IPC or other POSIX platforms.
-Explicit file transfers retain their
-original APIs. **CodeMirror is `React.lazy`-loaded** (`lazy(() => import('./CodeEditor'))`
+Explicit file transfers retain their original APIs. Checked uploads send
+`syncTransferCommit` through window ownership admission and include the current lease;
+status reads stay available during handoff. After a failed submit, a `preview` plan
+is closed through Cancel before releasing the transfer, fencing a queued late commit.
+`committing` remains active; unavailable receipts retain the actual failure reason.
+Confirmation closes the preview while progress continues in the transfer center.
+Transport regressions exercise the real frontend request envelope and backend dispatcher.
+**CodeMirror is `React.lazy`-loaded** (`lazy(() => import('./CodeEditor'))`
 + `Suspense`) so it + its language packs land in a separate ~360KB-gzip chunk fetched
 only on first edit — the main bundle is unchanged (chose this over Monaco, which is ~1MB+
 gzip plus workers). Section headers stay minimal for the narrow
@@ -2150,11 +2255,16 @@ source IDs and evidence constraints. `reviewRevalidate` explicitly parses saved 
 against its frozen snapshot, retaining the artifact/old validation and never calling a model.
 
 `task_git.py` / `task_workspaces.py` create unique managed branches/worktrees using fixed argv and
-private-index selected-path snapshots. Source index/HEAD/files are not mutated. Credentials,
+private-index selected-path snapshots. Committed sources keep their index/HEAD/files unchanged. Credentials,
 links, external objects, oversized files and unsupported repositories are rejected.
-Inspection checks repository identity before local filter configuration. Missing Git, non-Git
-folders and repositories without commits return distinct prerequisite states; the copy dialog
-shows a short explanation and explicit recheck, without initializing or committing automatically.
+Inspection checks repository identity before local filter configuration. Missing Git remains a
+prerequisite; non-Git folders and unborn repositories expose a read-only initialization plan.
+`task_git_initialization.py` uses temporary Git metadata to honor ignore rules without changing
+the source during inspection. The explicit create action freezes `initializeRepository` and
+the file/index scope, reserves the source, establishes its first commit, then creates the copy.
+New repositories use `main`; unborn ones keep their branch and selected staged versions, with
+working edits and unselected staged files retained. Existing .git damage is never reinitialized.
+Late failures retain created metadata/baselines and receipts; no rollback or automatic replay.
 Other inspection failures retain technical details on demand and never suggest Git initialization
 as a generic fix for permissions or repository errors.
 Git metadata checks use bounded `scandir` with no-follow entry attributes and directory-boundary
@@ -2341,6 +2451,33 @@ pending questions, timeout/unknown/reconnect and non-secret drafts. The capabili
 `docs/native-user-interactions.md`: no invented Qwen/Harness/legacy-exec answer channel. Skip uses
 proven native semantics, never a recommended option; old Boolean approvals retain compatibility.
 Kit opt-in freezes at send; message/run receipts and reminder preferences are not new authorization.
+
+DSH may run multiple native turns for one AWU submission through its goal/inbox continuation.
+`deepseek_harness_turn.py` matches monotonic root `turn/start`/`turn/end` identities and retains
+failures across continuations. `session/wait` uses the remaining 30-minute call budget, with no
+separate 120-second cutoff after the first idle. Success still requires native root/descendant
+quiescence, a completed final turn and confirmed owned-process exit. Never replay a prompt or
+remove activity guards to recover a timed-out turn. Tests use fake runtimes and real rc.3 with
+loopback-only models and temporary homes; they do not resume production Sessions.
+If a projection failure/cancellation returns before the owning worker exits, retire its Backend
+cache entry on task completion only after confirmed exit, comparing object identity. Submission
+also retires already settled legacy entries; running/unknown records and replacement workers
+remain protected. Projection diagnostics log bounded protocol shape and allowlisted local sites,
+never exception strings/frame contents. Tool argument fragments use the shared `inputDelta` field.
+DSH rc.3 compaction re-emits historical surface messages with a new seq and `surfaceOp` replace.
+Validate backward ranges and source references, then exclude replacements from chat output/tool
+completion and usage accounting. They may arrive before the first model request and reference
+calls from prior invocations; do not demand a current call or erase the original visible output.
+Ordinary unmatched results and malformed replacements still fail. Regression fixtures contain no
+user history; an isolated state-copy diagnosis uses loopback-only models with all tools disabled.
+
+The image-aware model bridge passes all native call controls to `prepareCall` and dispatches its
+resolved defaults, including auxiliary compaction calls. Preserve the original frozen Agent request
+when configs match; never mutate it or silently omit temperature/stop. Model failures use the mounted
+runtime's `LlmError` constructor (not a bundled duplicate) with allowlisted code/HTTP status only.
+No provider text, request IDs, causes or retry/offload directives escape. Throwing preserves the
+no-replay boundary; `IMAGE_OFFLOAD_REQUIRED` stays refused. Native regressions use synthetic image
+history, actual compaction and loopback HTTP failures, with no production Session resume.
 
 Validation uses fake Backends, temporary users/repos and isolated browser fixtures. The native smoke
 script checks installed CLI startup and Codex initialization only, without production models or Sessions.

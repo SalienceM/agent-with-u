@@ -17,6 +17,139 @@ from unittest.mock import patch
 @unittest.skipUnless(os.environ.get("AWU_TEST_NATIVE_DSH") == "1", "Native Harness check is opt-in")
 class HarnessNativeInitializationTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("AWU_TEST_DSH_BRIDGE"), "Build the AWU bridge explicitly first")
+    def test_native_steer_changes_next_step_without_new_prompt_or_process(self) -> None:
+        from src.backend.deepseek_harness import DeepSeekHarnessBackend
+        from src.backend.deepseek_harness_events import HarnessProjection
+        from src.backend.deepseek_harness_sdk import create_client
+        from src.types import BackendType, ModelBackendConfig
+        from tests.fixtures.deepseek_harness_http import LocalModel
+
+        with tempfile.TemporaryDirectory(prefix='awu-harness-steer-') as temporary, LocalModel(['first step', 'corrected to San Francisco']) as model:
+            root = Path(temporary)
+            model.first_response_gate = threading.Event()
+            requests, clients, turns, deltas = [], [], [], []
+            def observed_client(**kwargs):
+                client = create_client(**kwargs)
+                clients.append(client)
+                original = client.request
+                def request(method, params=None, **options):
+                    requests.append(method)
+                    return original(method, params, **options)
+                client.request = request
+                return client
+            observe = HarnessProjection.observe
+            def capture(projection, note):
+                event = note['payload'].get('event', {})
+                if event.get('type') == 'turn/start': turns.append(event['data']['turn'])
+                return observe(projection, note)
+            with patch.dict(os.environ, {'AGENT_WITH_U_DATA_ROOT': str(root / 'data')}), \
+                    patch('src.backend.deepseek_harness_turn.create_client', observed_client), \
+                    patch.object(HarnessProjection, 'observe', capture):
+                backend = DeepSeekHarnessBackend(ModelBackendConfig(id='test', label='test', type=BackendType.DEEPSEEK_HARNESS,
+                    model='smoke-model', api_key='fixture-key', base_url=model.url))
+                async def run():
+                    task = asyncio.create_task(backend.send_message([], 'Check New York weather', None,
+                        'test-session', 'message', deltas.append, working_dir=str(root)))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(model.first_request.wait, 15))
+                        for _ in range(200):
+                            worker = backend._harness_workers.get('test-session')
+                            if worker and worker.steering.turn is not None: break
+                            await asyncio.sleep(.01)
+                        result = await backend.steer_message(session_id='test-session', content='Correction: check San Francisco instead.', client_message_id='steer-1')
+                        self.assertEqual(result['status'], 'ok', result)
+                        duplicate = await backend.steer_message(session_id='test-session', content='Correction: check San Francisco instead.', client_message_id='steer-1')
+                        self.assertEqual(duplicate, result)
+                    finally:
+                        model.first_response_gate.set()
+                    return await asyncio.wait_for(task, 20)
+                result = asyncio.run(run())
+                self.assertTrue(result.get('success'), [d.to_dict() for d in deltas])
+            self.assertEqual(len(clients), 1)
+            self.assertEqual(requests.count('session/prompt'), 1)
+            self.assertEqual(requests.count('awu/steer'), 1)
+            self.assertEqual(turns, [1])
+            self.assertEqual(len(model.posts), 2)
+            self.assertIn('Correction: check San Francisco instead.', json.dumps(model.posts[1]))
+            self.assertEqual([d.type for d in deltas].count('done'), 1)
+            self.assertFalse(backend._harness_workers)
+
+    @unittest.skipUnless(os.environ.get("AWU_TEST_DSH_BRIDGE"), "Build the AWU bridge explicitly first")
+    def test_unread_edit_rejection_can_read_then_retry_without_ending_chat(self) -> None:
+        from src.backend.deepseek_harness import DeepSeekHarnessBackend
+        from src.types import BackendType, ModelBackendConfig
+        from tests.fixtures.deepseek_harness_http import LocalModel
+
+        with tempfile.TemporaryDirectory(prefix="awu-harness-unread-edit-") as temporary:
+            root = Path(temporary)
+            target = root / "fixture.txt"
+            target.write_text("old\n", encoding="utf-8")
+            edit = {"file_path": str(target), "old_string": "old", "new_string": "new"}
+            with LocalModel([("edit", edit), ("read", {"file_path": str(target)}),
+                             ("edit", edit), "recovered after reading"]) as model, \
+                    patch.dict(os.environ, {"AGENT_WITH_U_DATA_ROOT": str(root / "data")}), \
+                    patch("src.backend.deepseek_harness_turn.TURN_TIMEOUT_SECONDS", 15):
+                backend = DeepSeekHarnessBackend(ModelBackendConfig(id="test", label="test",
+                    type=BackendType.DEEPSEEK_HARNESS, model="smoke-model", api_key="fixture-key", base_url=model.url))
+                deltas = []
+                result = asyncio.run(backend.send_message([], "Isolated file edit fixture", None,
+                    "test-session", "test-message", deltas.append, working_dir=str(root)))
+                self.assertTrue(result.get("success"), [d.to_dict() for d in deltas])
+                results = [d.tool_call for d in deltas if d.type == "tool_result"]
+                self.assertEqual([r["status"] for r in results], ["error", "done", "done"])
+                self.assertIn("file has not been read", results[0]["output"])
+                self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
+                self.assertEqual(len(model.posts), 4)
+                self.assertNotIn("error", [d.type for d in deltas])
+                self.assertFalse(backend._harness_workers)
+
+    @unittest.skipUnless(os.environ.get("AWU_TEST_DSH_BRIDGE"), "Build the AWU bridge explicitly first")
+    def test_native_goal_continuation_finishes_with_one_prompt(self) -> None:
+        from src.backend.deepseek_harness import DeepSeekHarnessBackend
+        from src.backend.deepseek_harness_events import HarnessProjection
+        from src.backend.deepseek_harness_sdk import create_client
+        from src.types import BackendType, ModelBackendConfig
+        from tests.fixtures.deepseek_harness_http import LocalModel
+
+        with tempfile.TemporaryDirectory(prefix="awu-harness-goal-") as temporary, LocalModel([
+            ("create_goal", {"objective": "Complete the isolated continuation fixture", "max_goal_rounds": 1}),
+            "first native turn", "continued native turn",
+        ]) as model:
+            root = Path(temporary)
+            turns, requests, deltas = [], [], []
+            observe = HarnessProjection.observe
+            def capture(projection, note):
+                event = note["payload"].get("event", {})
+                if note["method"] == "session.event" and event.get("type") in {"turn/start", "turn/end"}:
+                    turns.append((event["type"], event["data"]["turn"], event["data"].get("reason", {}).get("kind")))
+                return observe(projection, note)
+            def observed_client(**kwargs):
+                client = create_client(**kwargs)
+                request = client.request
+                def capture_request(method, params=None, **options):
+                    requests.append(method)
+                    return request(method, params, **options)
+                client.request = capture_request
+                return client
+            with patch.dict(os.environ, {"AGENT_WITH_U_DATA_ROOT": str(root / "data")}), \
+                    patch("src.backend.deepseek_harness_turn.TURN_TIMEOUT_SECONDS", 15), \
+                    patch("src.backend.deepseek_harness_turn.create_client", observed_client), \
+                    patch.object(HarnessProjection, "observe", capture):
+                backend = DeepSeekHarnessBackend(ModelBackendConfig(id="test", label="test",
+                    type=BackendType.DEEPSEEK_HARNESS, model="smoke-model", api_key="fixture-key", base_url=model.url))
+                result = asyncio.run(backend.send_message([], "Run the isolated continuation fixture", None,
+                    "test-session", "test-message", deltas.append, working_dir=str(root)))
+                self.assertTrue(result.get("success"), [d.to_dict() for d in deltas])
+                self.assertFalse(backend.has_unconfirmed_activity("test-session"))
+            self.assertEqual(turns, [("turn/start", 1, None), ("turn/end", 1, "completed"),
+                                     ("turn/start", 2, None), ("turn/end", 2, "completed")])
+            self.assertEqual(requests.count("session/prompt"), 1)
+            self.assertEqual(requests.count("session/wait"), 1)
+            self.assertEqual(len(model.posts), 3)
+            self.assertEqual("".join(d.text or "" for d in deltas), "first native turncontinued native turn")
+            self.assertEqual([d.type for d in deltas].count("done"), 1)
+
+    @unittest.skipUnless(os.environ.get("AWU_TEST_DSH_BRIDGE"), "Build the AWU bridge explicitly first")
     def test_native_file_escalation_uses_real_permission_callback_and_never_means_reject(self) -> None:
         from src.backend.deepseek_harness import DeepSeekHarnessBackend
         from src.types import BackendType, ModelBackendConfig

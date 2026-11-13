@@ -283,7 +283,7 @@ export const SessionWorkbench: React.FC<Props> = props => {
       {engine && !narrow && !layout.conversationCollapsed && <WorkbenchResizeHandle label="对话宽度" value={layout.conversationWidth} min={280} max={720} reverse onChange={conversationWidth => updateLayout({ conversationWidth })} />}
       <div data-workbench-conversation hidden={!conversationVisible} style={{ ...fill, display: conversationVisible ? 'flex' : 'none',
         flex: engine && !narrow ? `0 0 ${widths.conversation}px` : 1, borderLeft: engine ? '1px solid var(--theme-border)' : undefined }}>
-        <ChatPane {...props} isVisible={isVisible && conversationVisible} isFocused={props.isFocused && conversationVisible} onRequestFileFocus={focusFile} />
+        <ChatPane {...props} canRenewSession={!engine} isVisible={isVisible && conversationVisible} isFocused={props.isFocused && conversationVisible} onRequestFileFocus={focusFile} />
       </div>
     </div>
     {terminalVisible && !narrow && <WorkbenchResizeHandle label="终端高度" value={terminalHeight} min={100} max={Math.max(100, Math.min(600, height - 220))} horizontal reverse onChange={terminalHeight => updateLayout({ terminalHeight })} />}

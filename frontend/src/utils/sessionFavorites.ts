@@ -44,10 +44,11 @@ export interface FavoriteRepository {
 /** 同 origin 多窗口事务串行化；不使用整表 localStorage 读改写。 */
 export class IndexedFavoriteRepository implements FavoriteRepository {
   private database?: Promise<IDBDatabase>;
+  constructor(private readonly databaseName = 'awu-session-favorites-v1') {}
   private open(): Promise<IDBDatabase> {
     if (!this.database) this.database = new Promise<IDBDatabase>((resolve, reject) => {
       if (typeof indexedDB === 'undefined') { reject(new Error('本设备收藏存储不可用')); return; }
-      const request = indexedDB.open('awu-session-favorites-v1', 1);
+      const request = indexedDB.open(this.databaseName, 1);
       request.onupgradeneeded = () => {
         const store = request.result.createObjectStore('choices', { keyPath: 'key' });
         store.createIndex('scope', 'scope');
@@ -109,7 +110,7 @@ export class IndexedFavoriteRepository implements FavoriteRepository {
   }
 }
 
-interface FavoriteIO {
+export interface FavoriteIO {
   available(target: FavoriteTarget): 'online' | 'offline' | 'removed' | 'unsupported' | 'inactive';
   call(target: FavoriteTarget, method: string, params: any[]): Promise<any>;
   remote(target: FavoriteTarget, value: FavoriteRemote): void;
@@ -258,6 +259,9 @@ export class SessionFavorites {
       if (epoch !== this.epoch || latest?.requestId !== row.requestId) return;
       if (remote.pinned === row.pinned) { await this.edit(target, current => current?.requestId === row.requestId ? null : current); return; }
       if (remote.favoriteRevision !== row.baseRevision) { await this.mark(row, 'conflict', '远端收藏已变化，请选择采用哪一边'); return; }
+      if (row.phase === 'unknown') {
+        await this.mark(row, 'unknown', '写入结果仍未知，请继续只读核对'); return;
+      }
       submitting = true;
       const result = await this.io.call(target, 'sessionFavoriteSet', [target.session, JSON.stringify({
         pinned: row.pinned, expectedRevision: row.baseRevision, requestId: row.requestId,

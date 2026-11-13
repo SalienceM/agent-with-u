@@ -21,7 +21,19 @@ from .deepseek_harness_worker import HarnessWorker
 from .deepseek_harness_images import (ImagePolicyError, admission_request, admitted_image_token,
     check_request_budget, content_blocks, image_admission_error, is_image_prompt_rejection, validate_images)
 from .call_trace import trace_request, trace_response
-from .harness_image_errors import harness_error_details, harness_error_text, harness_event_metadata, terminal_error
+from .harness_image_errors import (harness_error_details, harness_error_text, harness_event_metadata,
+                                  harness_projection_failure_metadata, terminal_error)
+
+TURN_TIMEOUT_SECONDS = 1800
+
+
+def _retire_finished_worker(backend: Any, session_id: str, worker: HarnessWorker) -> None:
+    # 聊天消费者可先因投影失败/取消返回，实际 worker 稍后才退出。只在退出和任务
+    # 完成都已确认后移除同一对象；旧回调不能移除后续运行，unknown 仍保留保护。
+    running = getattr(backend, "_harness_workers", {})
+    if (worker.confirmed and worker.task is not None and worker.task.done()
+            and running.get(session_id) is worker):
+        running.pop(session_id, None)
 
 
 async def send_turn(backend: Any, *, messages: list, content: str, images: list | None,
@@ -49,6 +61,7 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
     observer_failed = False
     generation = ""
     failure_stage = "preflight"
+    failure_context: dict[str, Any] = {}
 
     def submission(state: str, reason: str = "") -> None:
         nonlocal observer_failed, receipt_observed
@@ -106,6 +119,9 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
         running = getattr(backend, "_harness_workers", None)
         if running is None:
             running = backend._harness_workers = {}
+        previous_worker = running.get(session_id)
+        if previous_worker is not None:
+            _retire_finished_worker(backend, session_id, previous_worker)
         if session_id in running:
             raise RuntimeError("Harness Session 已有运行")
         running[session_id] = worker
@@ -135,6 +151,7 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
                 questions: bool = False
                 questionProtocol: str = 'none'
                 imageAdmission: dict[str, Any] | None = None
+                steering: dict[str, Any] | None = None
 
             class ImageReply(BaseModel):
                 model_config = ConfigDict(extra="allow")
@@ -195,6 +212,8 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
                 options["allowedTools"] = config.allowed_tools
             failure_stage = "configure"
             client.request("awu/configure", options, response_model=Empty, timeout_seconds=20)
+            if not isolated_context and not text_only:
+                owned.steering.configure(identity, cap.steering)
             publish({"method": "awu/ready", "payload": {**identity}})
             if meta.get("submitted") or agent_session_id:
                 failure_stage = "resume"
@@ -246,11 +265,13 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
             failure_stage = "execution"
             publish({"method": "awu/receipt", "payload": {**identity, "messageId": receipt}})
             received = False
+            native_turn: int | None = None
             ended: str | None = None
             end_error: Exception | None = None
+            root_idle = False
             last_root_seq = -1
             wait_result: concurrent.futures.Future | None = None
-            deadline = time.monotonic() + 1800
+            deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 if owned.stop_requested.is_set():
                     raise RuntimeError("Harness 已取消")
@@ -259,10 +280,11 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
                 except queue.Empty:
                     if wait_result is not None and wait_result.done():
                         wait_result.result()
-                        if ended != "completed":
+                        if not root_idle or ended != "completed" or end_error is not None:
                             failure_stage = "execution"
                             raise end_error or terminal_error(None)
-                        return {"agentSessionId": native, "success": True, "stopReason": "end_turn"}
+                        if owned.steering.finish():
+                            return {"agentSessionId": native, "success": True, "stopReason": "end_turn"}
                     continue
                 payload = note.payload
                 event = payload.get("event", {})
@@ -281,26 +303,54 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
                                 for item in event.get("data", {}).get("inserted", [])))
                     if not received:
                         continue
-                if note.method == "session.event" and payload.get("sessionId") == native and event.get("type") == "turn/end":
+                if root_event and event.get("type") == "turn/start":
+                    data = event.get("data")
+                    turn = data.get("turn") if isinstance(data, dict) else None
+                    # 一次 AWU 提交可由原生 goal/inbox 驱动多个轮次；只有真实的新 start
+                    # 才能清除上一轮终态，不能把同一轮的重复/不匹配终态当成续跑。
+                    if (type(turn) is not int or turn < 0
+                            or (native_turn is not None and (turn <= native_turn or ended is None))):
+                        raise RuntimeError("Harness 原生轮次边界不匹配")
+                    native_turn, ended, root_idle = turn, None, False
+                    owned.steering.observe_turn(turn)
+                    failure_stage = "execution"
+                if root_event and event.get("type") == "turn/end":
+                    owned.steering.observe_turn(None)
                     if ended is not None:
                         raise RuntimeError("Harness 本轮收到重复终态")
                     data = event.get("data")
+                    turn = data.get("turn") if isinstance(data, dict) else None
+                    if type(turn) is not int or native_turn is None or turn != native_turn:
+                        raise RuntimeError("Harness 原生轮次边界不匹配")
                     reason = data.get("reason") if isinstance(data, dict) else None
                     ended = reason.get("kind") if isinstance(reason, dict) else None
                     if not isinstance(ended, str):
                         raise RuntimeError("Harness turn/end 缺少有效结束原因")
-                    if ended != "completed":
+                    if ended != "completed" and end_error is None:
+                        # 后续轮次成功不能抹掉已确认的失败。
                         end_error = terminal_error(reason)
                 publish({"method": note.method, "payload": payload})
-                if (note.method == "session.status" and payload.get("sessionId") == native
-                        and payload.get("status") == "idle" and wait_result is None):
+                if note.method != "session.status" or payload.get("sessionId") != native:
+                    continue
+                root_idle = payload.get("status") == "idle"
+                if not root_idle:
+                    failure_stage = "execution"
+                else:
                     if ended is None:
                         raise RuntimeError("Harness 根空闲但缺少本轮终态")
                     failure_stage = "wait"
+                    if wait_result is not None:
+                        continue
                     wait_result = concurrent.futures.Future()
                     def wait_owned() -> None:
                         try:
-                            client.request("session/wait", {"sessionId": native}, response_model=Empty, timeout_seconds=120)
+                            # rc.3 wait 等根与受管子任务稳定空闲；goal 续跑也属于等待范围。
+                            # 复用本次调用的剩余总预算，不在首次短暂 idle 后另加 120 秒截止。
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError("Harness 本轮等待超时，不自动重放")
+                            client.request("session/wait", {"sessionId": native}, response_model=Empty,
+                                           timeout_seconds=remaining)
                             wait_result.set_result(None)
                         except BaseException as exc:
                             wait_result.set_exception(exc)
@@ -373,11 +423,13 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
             elif projection:
                 try:
                     projection.observe(note)
-                except Exception:
+                except Exception as exc:
                     failure_stage = "projection"
+                    failure_context.update(harness_projection_failure_metadata(exc, note))
                     raise
 
         worker.start(work)
+        worker.task.add_done_callback(lambda _task: _retire_finished_worker(backend, session_id, worker))
         result = await worker.consume(event)
         submission("succeeded")
         emit("diagnostic", diagnostic={"phase": "sdk_response"})
@@ -402,9 +454,9 @@ async def send_turn(backend: Any, *, messages: list, content: str, images: list 
         details = harness_error_details(exc, stage=failure_stage)
         # 即使未开启正文采集也能追查失败；仅记录安全类别与本轮关联，不存原始响应/思考/凭据。
         print("[HarnessTurn] " + json.dumps({"sessionId": session_id, "messageId": message_id,
-              **details}, ensure_ascii=False), file=sys.stderr, flush=True)
+              **details, **failure_context}, ensure_ascii=False), file=sys.stderr, flush=True)
         emit("diagnostic", diagnostic={"phase": "backend_error", **details})
-        trace_response("harness-failure", details, "安全错误类别与失败阶段；不包含原始异常、凭据或路径。")
+        trace_response("harness-failure", {**details, **failure_context}, "安全错误类别与失败阶段；不包含原始异常、凭据或路径。")
         # RuntimeError 等内建异常也可能包装上游正文；只允许受控类别／精确常量。
         message = harness_error_text(exc, stage=failure_stage)
         emit("error", error=message[:1000])

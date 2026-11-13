@@ -5,6 +5,32 @@ import json
 from typing import Any, Callable
 
 
+def _is_surface_replacement(event: dict) -> bool:
+    """rc.3 surface replace 是上下文改写，不是再次执行工具或再次生成回复。"""
+    if "surfaceOp" not in event or event["surfaceOp"] == "append":
+        return False
+    op, seq, kind = event["surfaceOp"], event.get("seq"), event.get("type")
+    surfaces = {"system/message", "developer/message", "user/message", "assistant/message", "tool/result"}
+    if (kind not in surfaces or not isinstance(op, dict) or op.get("op") != "replace"
+            or type(seq) is not int):
+        raise ValueError("Harness 上下文替换事件无效")
+    start, end = op.get("startSeq"), op.get("endSeq")
+    if type(start) is not int or type(end) is not int or not 0 <= start <= end < seq:
+        raise ValueError("Harness 上下文替换事件无效")
+    # assistant replacement 嵌入自己的 stream，不带 sourceEventSeqs；其他 surface
+    # replacement 由原生 Session 校验完整来源，这里仅核对有界、向后的引用形状。
+    if kind == "assistant/message":
+        if "sourceEventSeqs" in event:
+            raise ValueError("Harness 上下文替换事件无效")
+    else:
+        sources = event.get("sourceEventSeqs")
+        if (not isinstance(sources, list) or not sources
+                or any(type(value) is not int or not 0 <= value < seq for value in sources)
+                or len(set(sources)) != len(sources) or start not in sources or end not in sources):
+            raise ValueError("Harness 上下文替换事件无效")
+    return True
+
+
 class HarnessProjection:
     def __init__(self, native: str, generation: str, fingerprint: str, emit: Callable[..., None]) -> None:
         self.native, self.generation, self.fingerprint, self.emit = native, generation, fingerprint, emit
@@ -154,7 +180,7 @@ class HarnessProjection:
                 self.emit("tool_start", tool_call={"id": tool["id"], "name": tool["name"], "input": tool["input"],
                     "parentToolUseId": self.parent_tools.get(sid)})
             elif tool["started"]:
-                self.emit("tool_input", tool_call={"id": tool["id"], "input": fragment,
+                self.emit("tool_input", tool_call={"id": tool["id"], "inputDelta": fragment,
                     "parentToolUseId": self.parent_tools.get(sid)})
         elif chunk_type not in {"block-start", "block-end", "usage", "finish"}:
             raise ValueError("Harness chunk 类型未知")
@@ -166,6 +192,10 @@ class HarnessProjection:
         data, kind = event.get("data"), event.get("type")
         if not isinstance(data, dict):
             raise ValueError("Harness 事件 data 无效")
+        if _is_surface_replacement(event):
+            # 压缩可重发本次提交前的 tool/result，甚至发生在首个模型请求前。
+            # 原始结果和使用量仍保留；不要求本轮有历史 call，也不重新展示或累加用量。
+            return
         if kind in {"assistant/message", "assistant/attempt"}:
             if kind == "assistant/message":
                 message = data.get("message")

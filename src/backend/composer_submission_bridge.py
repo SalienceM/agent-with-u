@@ -1,6 +1,7 @@
 """普通输入与队列接收回执：落盘后清稿，未知请求只查不重放。"""
 from __future__ import annotations
 
+import asyncio
 import json
 from .session_collaboration_store import CollaborationError, fingerprint, identifier
 
@@ -44,6 +45,30 @@ class ComposerSubmissionBridge:
         self._declare_interaction_client(payload.get('userInteractionVersion'))
         try:
             self._require_update_work_allowed()
+            if payload.get('deliveryMode') == 'steer' and not queue:
+                if payload.get('kitApprovalDelegation') or payload.get('skillInvocation') or payload.get('interactionMode'):
+                    raise CollaborationError('插话不接受 Kit 委托、Skill 命令或语音控制字段')
+                if str(payload.get('content') or '').lstrip().startswith('/'):
+                    raise CollaborationError('斜杠命令不能作为插话发送')
+                async def steer() -> None:
+                    try:
+                        result = json.loads(await self._rpc_steerMessage(session_id, str(payload.get('content') or ''),
+                            json.dumps(payload.get('images') or [], ensure_ascii=False),
+                            json.dumps(payload.get('textAttachments') or [], ensure_ascii=False), user_id))
+                        state = 'accepted' if result.get('status') == 'ok' else 'unknown' if result.get('status') == 'unknown' else 'rejected'
+                        self._finish_composer_submission(session_id, request_id, state, str(result.get('message') or '') if state != 'accepted' else '')
+                    except BaseException:
+                        self._finish_composer_submission(session_id, request_id, 'unknown', '插话回执未能核对，请核对原对话；未重发。')
+                tasks = getattr(self, '_composer_steer_tasks', None)
+                if tasks is None:
+                    tasks = self._composer_steer_tasks = set()
+                task = asyncio.create_task(steer(), name='awu-composer-steer')
+                tasks.add(task)
+                def settled(done: asyncio.Task) -> None:
+                    tasks.discard(done)
+                    if not done.cancelled(): done.exception()
+                task.add_done_callback(settled)
+                return json.dumps(self._composer_view(row), ensure_ascii=False)
             if queue:
                 if payload.get('kitApprovalDelegation') is True or payload.get('deliveryMode') or payload.get('interactionMode'):
                     raise CollaborationError('队列不接受本次委托、引导或语音控制字段')

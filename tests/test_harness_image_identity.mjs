@@ -20,11 +20,12 @@ function fixture() {
   const module = { name: 'llm-deepseek-api-key', apply() {}, plainOptions: value => ({ ...value }),
     resolveAdapterOptions: (value, env) => ({ baseURL: value.baseURL ?? env.get('DEEPSEEK_BASE_URL').value, apiKeyEnv: value.apiKeyEnv }) }
   class LlmRuntime {}
+  class LlmError extends Error {}
   const entries = [
     { options: { id: 'llm-deepseek' }, disabled: false, moduleNamespace: module,
       fiber: { state: 2, uid: 'adapter', runtime: { name: module.name, callback: module.apply }, config: settings,
         ctx: { get(name) { return name === 'credentials' ? credentials : environment } } } },
-    { disabled: false, options: { id: 'llm' }, moduleNamespace: { LlmRuntime, assertUsableApiKey(value) {
+    { disabled: false, options: { id: 'llm' }, moduleNamespace: { LlmRuntime, LlmError, assertUsableApiKey(value) {
       if (!/^[!-~]+$/u.test(value.trim())) throw Error('private error text')
       return value.trim()
     } }, fiber: { state: 2, uid: 'llm', runtime: { name: 'LlmRuntime', callback: LlmRuntime } } },

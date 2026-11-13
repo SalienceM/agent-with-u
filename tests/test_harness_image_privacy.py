@@ -36,15 +36,19 @@ class ImagePrivacyTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.rows = iter([json.dumps({"id": 1, "method": "harnessImageSubmit", "params": []})])
                 self.sent = []
+                self.replied = asyncio.Event()
             def __aiter__(self):
                 return self
             async def __anext__(self):
                 try:
                     return next(self.rows)
                 except StopIteration:
+                    # 接收循环现已异步分派；等 RPC 回应后再模拟断线，避免先取消排队的请求。
+                    await self.replied.wait()
                     raise StopAsyncIteration
             async def send(self, raw):
                 self.sent.append(json.loads(raw))
+                self.replied.set()
         bridge = BridgeWS.__new__(BridgeWS)
         bridge._clients, bridge._client_meta = set(), {}
         bridge._update_manager = SimpleNamespace(journal=SimpleNamespace(active=lambda: {}))

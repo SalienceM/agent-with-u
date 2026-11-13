@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useVisibleSessionCandidates } from '../hooks/useSessionVisibility';
 import { api, getExecutors, getHomeExecKey, onExecStatus, onCurrentUserChanged,
   type GitCommitRule, type GitCommitRuleState, type GitCommitPromptPreview } from '../api';
 
@@ -14,6 +15,7 @@ export const GitCommitSettings: React.FC<Props> = ({ initialExecKey, initialWork
   const [workingDir, setWorkingDir] = useState(initialWorkingDir || '');
   const [scope, setScope] = useState<'default' | 'project'>('default');
   const [sessions, setSessions] = useState<any[]>([]);
+  const visibleSessions = useVisibleSessionCandidates(sessions);
   const [state, setState] = useState<GitCommitRuleState | null>(null);
   const [draft, setDraft] = useState<GitCommitRule | null>(null);
   const [templates, setTemplates] = useState<any[]>([]);
@@ -31,8 +33,8 @@ export const GitCommitSettings: React.FC<Props> = ({ initialExecKey, initialWork
   const loadedTarget = useRef('');
   const online = executors.some(item => item.key === execKey && item.connected);
   const effective = draft || state?.inherited;
-  const projects = useMemo(() => [...new Set(sessions.filter(item => item.execKey === execKey && item.workingDir)
-    .map(item => String(item.workingDir)))], [sessions, execKey]);
+  const projects = useMemo(() => [...new Set(visibleSessions.filter(item => item.execKey === execKey && item.workingDir)
+    .map(item => String(item.workingDir)))], [visibleSessions, execKey]);
   const prompt = !draft ? state?.inheritedPrompt || '' : draft.mode === 'builtin' ? state?.defaultPrompt || ''
     : draft.mode === 'library' ? templates.find(item => item.name === draft.promptName)?.content || '' : draft.prompt;
 
@@ -88,6 +90,8 @@ export const GitCommitSettings: React.FC<Props> = ({ initialExecKey, initialWork
     finally { if (id === version.current) setBusy(false); }
   }, [workingDir, stagedOnly, execKey]);
 
+  if (workingDir && sessions.some(item => item.execKey === execKey && item.workingDir === workingDir) && !projects.includes(workingDir))
+    return <section aria-label="Git 提交生成规则"><p>该 Session 项目暂不可显示；请在 Session 栏开启私密显示后继续。</p></section>;
   return <section aria-label="Git 提交生成规则" style={{ display: 'grid', gap: 14, minWidth: 0, fontSize: 12 }}>
     <p style={hint}>统一用于提交面板的 AI 生成、/commit 和自动提交。规则保存在执行端，按当前用户隔离；不会开启提交或推送。</p>
     <label style={label}>执行节点

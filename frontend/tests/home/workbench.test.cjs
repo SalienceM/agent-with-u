@@ -3,6 +3,16 @@ const assert = require('node:assert/strict');
 const { workbenchReducer, initialWorkbench, selectSessionPane, sessionWorkbenchTab, workbenchSessionId, isConversationTab } = require('../../.home-test-dist/utils/workbench.js');
 const { filterMarketItems, marketVersion } = require('../../.home-test-dist/utils/skillMarketView.js');
 const { normalizeWorkbenchSnapshot, workbenchStorageKey, loadWorkbenchSnapshot, saveWorkbenchSnapshot } = require('../../.home-test-dist/utils/workbench.js');
+
+test('same-directory renewal replaces the tab in place without removing other tabs or sidebar data', () => {
+  const state = { tabs: ['chat', 'session:old', 'library', 'session:other'], active: 'session:old' };
+  const opened = workbenchReducer(state, { type: 'open', tab: 'session:new' });
+  const next = workbenchReducer(opened, { type: 'renewSession', source: 'old', session: 'new' });
+  assert.deepEqual(next, { tabs: ['chat', 'session:new', 'library', 'session:other'], active: 'session:new' });
+  const reopened = workbenchReducer(next, { type: 'open', tab: 'session:old' });
+  assert.equal(reopened.active, 'session:old');
+  assert.ok(reopened.tabs.includes('session:new'));
+});
 test('workbench opens unique tabs and restores previous neighbor on close', () => {
   let state = workbenchReducer(initialWorkbench, { type: 'open', tab: 'library' });
   state = workbenchReducer(state, { type: 'open', tab: 'market' });

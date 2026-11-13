@@ -20,7 +20,7 @@ HANDOFF_RPC = {
     "ping", "getSession", "listSessions", "getBackends", "getAppConfig", "getUserProfile",
     "listConnectedClients", "getNodeInfo", "getNodeCapabilities", "nodeUpdateStatus",
     "loadSession", "loadSessionMeta", "loadSessionMessages", "getSessionTokenUsage", "getStatus",
-    "sessionFavoriteGet", "getDefaultAbilities", "kitGenerationGet", "getConfig",
+    "sessionFavoriteGet", "sessionPrivacyGet", "getDefaultAbilities", "kitGenerationGet", "getConfig",
     "kitGetState", "kitCapabilityList", "kitCancel", "kitResume", "kitCapabilityRespond",
     "kitUpdateReconcile", "kitDesktopReady", "kitInstallHandoffFailed",
     "loopGetState", "loopGetRecord", "loopStop", "abortMessage", "getSessionRunState",

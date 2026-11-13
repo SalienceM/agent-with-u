@@ -49,6 +49,7 @@ class SeqTask:
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
     image_request_id: str = ""
+    steer_request_id: str = ""
     revision: int = 1
     schedule_ref: Optional[dict] = None
 
@@ -66,6 +67,7 @@ class SeqTask:
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "imageRequestId": self.image_request_id,
+            "steerRequestId": self.steer_request_id,
             "revision": self.revision,
             "scheduleRef": self.schedule_ref,
         }
@@ -81,13 +83,13 @@ class SeqTask:
             images=list(d.get("images") or []),
             text_attachments=list(d.get("textAttachments") or []),
             delivery_mode=("redirect" if d.get("deliveryMode") == "redirect" else ""),
-            # ``steering`` 是进程内的短暂租约；服务重启说明该 steer 已无法
-            # 完成，必须恢复为 pending，避免消息永久卡死。
-            status=('error' if invalid_schedule else "pending" if d.get("status") == "steering" else d.get("status", "pending")),
-            error=('定时来源损坏，不能作为普通队列执行' if invalid_schedule else str(d.get("error") or "")),
+            # 新请求可能已被原生接收；重启不能自动变成下一轮的重复输入。
+            status=('error' if invalid_schedule else ("interrupted" if d.get("steerRequestId") else "pending") if d.get("status") == "steering" else d.get("status", "pending")),
+            error=('定时来源损坏，不能作为普通队列执行' if invalid_schedule else '插话回执在重启前未确认，请核对原对话；未自动重发' if d.get('status') == 'steering' and d.get('steerRequestId') else str(d.get("error") or "")),
             created_at=d.get("createdAt", _now()),
             updated_at=d.get("updatedAt", _now()),
             image_request_id=str(d.get("imageRequestId") or ""),
+            steer_request_id=str(d.get("steerRequestId") or ""),
             revision=int(d.get("revision", 1)),
             schedule_ref=ref,
         )

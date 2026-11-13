@@ -138,6 +138,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
     onOpenSession(shown.sessionId); setOpen(false); onClose?.();
   }, [open, editing, mode, initialAction, shown, onOpenSession, onClose]);
   const creationView = mode === 'tasks' && (!!unavailable || initialAction === 'create' || editing || shown?.status === 'preview' || !!shown && shown.id === createdHere.current);
+  const initialization = (editing ? repo : shown?.repository)?.initialization;
   const createBlocked = busy || uncertain || (editing && (!config.title.trim() || !runtimeBackend || runtimeBackend.enabled === false || config.snapshotMode === 'current' && !!repo?.dirty.some(row => !!row.blocked)));
   const checkStatus = () => { setRevision(n => n + 1); setReadNonce(n => n + 1); };
   return <>
@@ -215,7 +216,7 @@ export const ProjectTasksPanel: React.FC<Props> = ({ session, executor, backendI
             {!editing && shown?.status === 'preview' && <WorkflowButton disabled={busy || uncertain} onClick={() => { setRepo(shown.repository); setConfig(shown.config); setEditing(true); }} style={copyActionStyle}>修改配置</WorkflowButton>}
             <WorkflowButton onClick={close} style={copyActionStyle}>{unavailable ? '知道了' : shown?.status === 'creating' || uncertain ? '关闭' : '取消'}</WorkflowButton>
             {unavailable && <WorkflowButton icon="refresh" disabled={busy} onClick={newTask} style={copyActionStyle}>重新检查</WorkflowButton>}
-            {(editing || shown?.status === 'preview') && <WorkflowButton tone="primary" disabled={createBlocked} onClick={create} style={copyActionStyle}>{busy ? '正在创建…' : '创建副本'}</WorkflowButton>}
+            {(editing || shown?.status === 'preview') && <WorkflowButton tone="primary" disabled={createBlocked} onClick={create} style={copyActionStyle}>{busy ? '正在创建…' : initialization?.kind === 'init' ? '启用 Git 并创建副本' : initialization ? '建立首次提交并创建副本' : '创建副本'}</WorkflowButton>}
           </div>
           {!editing && shown?.status === 'preview' && <WorkflowButton tone="quiet" disabled={busy || uncertain} onClick={discardPreview} style={{ marginTop: 10 }}>移除预览</WorkflowButton>}
         </footer>}

@@ -45,7 +45,8 @@ export function createNativeImageConnection(ctx) {
       }
       const llmEntries = entries.filter(row => active(row) && row.fiber.runtime?.name === 'LlmRuntime'
         && row.moduleNamespace?.LlmRuntime === row.fiber.runtime.callback
-        && typeof row.moduleNamespace?.assertUsableApiKey === 'function')
+        && typeof row.moduleNamespace?.assertUsableApiKey === 'function'
+        && typeof row.moduleNamespace?.LlmError === 'function')
       if (llmEntries.length !== 1) fail('connection_unavailable')
       const environment = entry.fiber.ctx.get('launchEnvironment')
       // 产品 CLI 必须提供启动快照；缺失时不从 UI 或本轮 process.env 猜测。
@@ -78,6 +79,7 @@ export function createNativeImageConnection(ctx) {
       const revision = stamp([provider, model, entry.fiber.uid, objectId(module),
         config, connection, credentialSource, apiKey])
       return Object.freeze({ endpoint, listingURL: new URL('/models', base.origin).href,
+        LlmError: llmEntries[0].moduleNamespace.LlmError,
         headers: Object.freeze({ 'x-api-key': apiKey }), revision,
         models: Object.freeze(structuredClone(connection.models)), maxTokens: connection.maxTokens,
         // 这是来源类别，不携带变量名、文件路径、端点或凭据指纹。

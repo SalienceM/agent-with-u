@@ -29,6 +29,10 @@ export const TaskWorkspaceForm: React.FC<Props> = ({ config, repo, backends, exe
   const blocked = config.snapshotMode === 'current' && repo.dirty.some(row => !!row.blocked);
   const [filesOpen, setFilesOpen] = useState(blocked);
   return <fieldset disabled={busy} style={{ ...fieldsStyle, padding: 0, margin: 0, border: 0 }}>
+    {repo.initialization && <p role="status" style={{ margin: 0, fontSize: 13, lineHeight: 1.7 }}>
+      {repo.initialization.kind === 'init' ? '此项目尚未启用 Git。' : '此项目还没有 Git 提交。'}
+      创建时会{repo.initialization.kind === 'init' ? '启用 Git，并' : ''}用所选文件建立首次提交，再创建分支副本。源文件保留。
+    </p>}
     <label style={labelStyle}>副本名称
       <input ref={nameInput} aria-label="副本名称" style={workflowFieldStyle} value={config.title} onChange={e => setConfig(old => ({ ...old, title: e.target.value }))} />
     </label>
@@ -85,7 +89,9 @@ export const TaskWorkspaceForm: React.FC<Props> = ({ config, repo, backends, exe
 export const TaskWorkspaceDetails: React.FC<{ task: TaskWorkspace }> = ({ task }) => <details style={sectionStyle}>
   <summary style={summaryStyle}>创建详情</summary>
   <div style={{ fontSize: 12, overflowWrap: 'anywhere' }}>
-    <p>目录：{task.root}</p><p>分支：{task.branch}</p><p>来源提交：{task.repository.head.slice(0, 12)}</p>
+    <p>目录：{task.root}</p><p>分支：{task.branch}</p>
+    <p>来源提交：{task.repository.initialization ? `创建时建立首次提交（${task.repository.initialization.branch}）` : task.repository.head.slice(0, 12)}</p>
+    {task.repository.initialization && <p>{task.notice}</p>}
     <p>Skills：{task.config.skills.filter(Boolean).join('、') || '无'}</p>
     <p style={{ whiteSpace: 'pre-wrap' }}>约束：{task.config.constraints || '无附加约束'}</p>
     {task.inherited && <>

@@ -249,7 +249,8 @@ class ImageWorkspace:
     @contextmanager
     def client(self, model: LocalImageModel, *, route: str = "deepseek-flash", session: str = "image-fixture",
                probe: str = "observe", egress: str = "", bridge: Path | None = None,
-               provider_options: dict[str, Any] | None = None, environment_url: str | None = None) -> Iterator[Any]:
+               provider_options: dict[str, Any] | None = None, environment_url: str | None = None,
+               compaction_options: dict[str, Any] | None = None) -> Iterator[Any]:
         from pydantic import BaseModel
         from src.backend.deepseek_harness_sdk import SyncOwner, bridge_path, create_client, create_harness_config
         from src.backend.deepseek_harness_state import atomic_json, make_profile_patch
@@ -267,6 +268,8 @@ class ImageWorkspace:
                 "provider": "deepseek-official", "model": route})
         if provider_options is not None:
             rows.append({"id": "llm-deepseek", "config": provider_options})
+        if compaction_options is not None:
+            rows.append({"id": "compaction-basic", "config": compaction_options})
         rows.append({"insert": [{"id": "awu-image-contract-fixture", "name":
             Path(__file__).with_name("harness_image_probe.mjs").resolve().as_uri(), "inject": ["llm", "agents"],
             "config": {"origin": model.url, "output": str(self.root / "probe.jsonl"), "mode": probe,

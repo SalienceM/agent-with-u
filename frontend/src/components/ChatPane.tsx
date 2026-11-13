@@ -7,6 +7,7 @@ import { mergeSessionRouting, isSessionMetaReady } from '../utils/sessionRouting
 import type { CurrentUserProfile, FollowUpCapabilities } from '../api';
 import { MessageBubble } from './MessageBubble';
 import { ChatInput, type ChatInputHandle } from './ChatInput';
+import { speechPanelHostStyle } from './SpeechDictation';
 import { PermissionGate } from './PermissionGate';
 import { UserInteractionsPanel, focusUserInteraction } from './UserInteractionsPanel';
 import { KitDelegationStatus } from './KitDelegationFeedback';
@@ -32,6 +33,7 @@ import { buildMessageRedoPayload } from '../utils/messageRedo';
 import { TokenUsageMonitor } from './TokenUsageMonitor';
 import { uuid } from '../utils/uuid';
 import { inputHistoryKey, normalizeInputHistory } from '../utils/inputHistory';
+import { useSessionRenewal } from '../hooks/useSessionRenewal';
 
 function mergeAuthoritativeSeqTasks(authoritative: SeqTaskT[], current: SeqTaskT[]): SeqTaskT[] {
   const canonical = (authoritative || []).map((task) => ({ ...task, syncing: false }));
@@ -148,6 +150,8 @@ export interface ChatPaneProps {
   onRequestNewSession: () => void;          // 用户在这个 pane 想新建 session 时
   onSessionDeleted?: (id: string) => void;  // 删除 session 后回调,清掉这个 pane
   onOpenSession?: (id: string) => void;
+  onRenewSession?: (sourceId: string, next: any) => void;
+  canRenewSession?: boolean;
   // 系统级 toast / 错误提示(预留, 当前未使用)
   onToast?: (type: 'success' | 'error' | 'info', message: string) => void;
   // 流式状态变化回调,App 用来聚合所有 pane 的 streaming 状态
@@ -182,6 +186,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onAdjustFontSize,
   onRequestFileFocus,
   onOpenSession,
+  onRenewSession,
+  canRenewSession = true,
 }) => {
   // ── pane 自己的 session 详情(workingDir / backendId / skip / sandbox) ──
   const [activeSession, setActiveSession] = useState<any | null>(() => sessionId ? api.peekSessionMeta(sessionId) : null);
@@ -212,6 +218,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const prevSessionRef = useRef<string | null>(sessionId);
   const onFocusRef = useRef(onFocus);
   const chatInputRef = useRef<ChatInputHandle>(null);
+  const [speechPanelHost, setSpeechPanelHost] = useState<HTMLDivElement | null>(null);
   const handleReviewAnswer = useCallback((messageId: string) => { chatInputRef.current?.startReview([messageId]); }, []);
   const onRequestFileFocusRef = useRef(onRequestFileFocus);
   onFocusRef.current = onFocus;
@@ -371,10 +378,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     onRequestNewSession();
   }, [onRequestNewSession]);
 
-  const handleClearContext = useCallback(async () => {
-    if (!sessionId) return;
-    await api.clearSessionContext(sessionId);
-  }, [sessionId]);
+  const renewal = useSessionRenewal(currentUser.userId, sessionId || '', activeSession?.execKey || '',
+    isVisible && isFocused && canRenewSession, next => {
+      if (onRenewSession && sessionId) onRenewSession(sessionId, next);
+      else onOpenSession?.(next.id);
+      onToast?.('success', '已开启新会话，旧记录可从“历史”回看。');
+    });
+  const handleRenewSession = useCallback(async () => {
+    if (!canRenewSession) { onToast?.('info', '请先返回 Chat，再开启同目录的新会话。'); return; }
+    await renewal.start();
+  }, [canRenewSession, onToast, renewal.start]);
 
   // ── 核心 useChat 调用 ──
   const chat = useChat(
@@ -383,7 +396,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     effectiveBackends,
     skipPermissions,
     handleQuickNewSession,
-    handleClearContext,
+    handleRenewSession,
     {
       modelOverride: activeSession?.modelOverride,
       reasoningEffort: activeSession?.reasoningEffort,
@@ -720,10 +733,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     [sessionId, activeBackendId],
   );
 
-  const handleCompact = useCallback(() => {
-    handleClearContext();
-  }, [handleClearContext]);
-
   // ── 全部消息直接渲染。
   //   早先版本用 visibleCount 在前端折叠成最近 N 条,但那只是「不渲染」,
   //   loadSession 仍然把全部消息塞过来——session 大 + 远程经中继时,首屏延迟
@@ -992,7 +1001,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       {handoffStatus}
       {nodeBackendsError && <div role="alert" style={{ padding: 8, color: '#f85149', fontSize: 12 }}>{nodeBackendsError}</div>}
       {/* ---- 消息列表 ---- */}
-      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+      <div style={{ flex: 1, minHeight: 0, position: 'relative', overflow: 'hidden', isolation: 'isolate' }}>
+        <div ref={setSpeechPanelHost} style={speechPanelHostStyle} />
         <div
           className="awu-message-scroll"
           ref={scrollContainerRef}
@@ -1233,6 +1243,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           onSendNext={() => void setSequenceAuto(true)}
           onPause={() => void setSequenceAuto(false)}
           canSteer={chat.isStreaming && followUpCapabilities.nativeSteer}
+          steerAttachments={followUpCapabilities.steerAttachments}
           steerCapabilityError={followUpCapabilities.status === 'error' ? followUpCapabilities.message : undefined}
           onRefreshSteerCapabilities={() => setFollowUpRefresh(value => value + 1)}
           onSteerTask={handleSteerSeqTask}
@@ -1246,6 +1257,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         {chat.messages.length > 0 && <RoleSessionNotice onReturn={activeSession.parentSessionId && onOpenSession ? () => onOpenSession(activeSession.parentSessionId) : undefined} />}
       </div> : <ChatInput
         ref={chatInputRef}
+        speechPanelHost={speechPanelHost}
+        isVisible={isVisible}
         workflowTools={sessionId ? <>
           <RoleReviewPanel session={sessionId} executor={activeSession?.execKey || 'local'}
             open={reviewOpen} onOpen={() => setReviewOpen(true)} onClose={() => setReviewOpen(false)} latestRequest={latestReview}
@@ -1255,6 +1268,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           <KitDelegationStatus sessionId={sessionId} executor={activeSession?.execKey || 'local'} compact />
         </> : undefined}
         onSend={handleUserSend}
+        canSteer={followUpCapabilities.nativeSteer}
+        steerAttachments={followUpCapabilities.steerAttachments}
         onAbort={chat.abort}
         onReviewSubmitted={setLatestReview}
         onOpenOpinions={() => setReviewOpen(true)}
@@ -1270,7 +1285,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         isMobile={isMobile}
         onQueueTask={handleQueueTask}
         seqCount={seqTasks.filter((t) => ['pending', 'running', 'error'].includes(t.status)).length}
-        onCompact={handleCompact}
+        onCompact={canRenewSession ? handleRenewSession : undefined}
+        renewing={renewal.busy}
+        renewalUnknown={renewal.unknown}
+        renewalMessage={renewal.message}
+        onRetryRenewal={renewal.retryable ? () => void renewal.start(true) : undefined}
+        onOpenSession={onOpenSession}
         fontSize={config.fontSize}
         onAdjustFontSize={onAdjustFontSize}
         isFocused={isFocused}

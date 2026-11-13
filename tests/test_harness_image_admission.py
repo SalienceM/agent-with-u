@@ -194,6 +194,52 @@ class HarnessImageAdmissionTests(unittest.TestCase):
                 self.assertEqual(model.errors, [])
                 self.assertTrue(list((workspace.home / "sessions").rglob("*.jsonl*")))
 
+    def test_native_compaction_with_image_history_uses_resolved_call_defaults(self) -> None:
+        from tests.test_harness_image_native_contract import evidence
+        with ImageWorkspace() as workspace, LocalImageModel() as model:
+            with workspace.client(model, bridge=self.bridge, compaction_options={
+                "thresholdRatio": 0.001, "retainTokens": 0, "headroomTokens": 256,
+                "maxTokens": 512, "compactionRetries": 0,
+            }) as client:
+                blocks = [{"type": "text", "text": "Synthetic compaction history. " * 2500}, image_block()]
+                admitted = admit_images(client, blocks)
+                self.assertTrue(admitted["admitted"], admitted.get("reason"))
+                first = run_prompt(client, blocks, admission=admitted["admissionId"])
+                self.assertEqual(terminal_reasons(first), ["completed"])
+                notes = run_prompt(client, [{"type": "text", "text": "Continue after the compacted history."}])
+                self.assertEqual(terminal_reasons(notes), ["completed"])
+            ends = [n.payload["event"]["data"] for n in first + notes
+                    if n.payload.get("event", {}).get("type") == "compaction/end"]
+            self.assertTrue(ends, "Test must exercise actual native compaction, not only ordinary chat")
+            self.assertTrue(all("error" not in end for end in ends), ends)
+            summaries = [row for row in evidence(workspace) if row.get("purpose") == "compaction"]
+            self.assertTrue(summaries)
+            self.assertTrue(all(row.get("reasoningEffort") == "high" and row["maxTokens"] == 512 for row in summaries))
+            self.assertEqual(model.deleted, [])
+            self.assertEqual(model.errors, [])
+
+    def test_native_image_history_failures_keep_safe_http_reason_without_retry(self) -> None:
+        from src.backend.harness_image_errors import terminal_error, harness_error_details
+        for status, expected in ((401, "auth"), (429, "rate_limit"), (503, "server_error"),
+                                 (400, "invalid_request"), (400, "context_limit")):
+            with self.subTest(status=status), ImageWorkspace() as workspace, LocalImageModel() as model:
+                with workspace.client(model, bridge=self.bridge) as client:
+                    blocks = [image_block()]
+                    admitted = admit_images(client, blocks)
+                    self.assertEqual(terminal_reasons(run_prompt(client, blocks, admission=admitted["admissionId"])), ["completed"])
+                    model.message_status = status
+                    model.error_message = ("context window exceeded; " if expected == "context_limit" else "") + "PRIVATE_PROVIDER_BODY token=fixture-secret"
+                    notes = run_prompt(client, [{"type": "text", "text": "Only text, with historical image."}])
+                self.assertEqual(terminal_reasons(notes), ["error"])
+                reason = next(n.payload["event"]["data"]["reason"] for n in notes
+                              if n.payload.get("event", {}).get("type") == "turn/end")
+                self.assertEqual(harness_error_details(terminal_error(reason))["errorCode"], expected)
+                self.assertEqual(reason["error"]["status"], status)
+                self.assertNotIn("PRIVATE", json.dumps(reason))
+                self.assertEqual(len(model.posts), 2, "Model failure must not cause automatic retry")
+                self.assertEqual(model.deleted, [])
+                self.assertEqual(model.errors, [])
+
     def test_actual_bridge_offload_request_fails_without_silent_image_removal(self) -> None:
         bridge = self.bridge
         with ImageWorkspace() as workspace, LocalImageModel() as model:

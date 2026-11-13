@@ -65,7 +65,8 @@ export function apply(ctx, config) {
         yield* next()
         return
       }
-      record({ type: 'stream', provider: options.provider, model: options.model,
+      record({ type: 'stream', provider: options.provider, model: options.model, purpose: options.purpose,
+        reasoningEffort: options.reasoningEffort, maxTokens: options.maxTokens,
         images: options.messages.flatMap(message => message.content).filter(block => block.type === 'image').length })
       if (config.mode === 'catalog') {
         const { imageCatalogProtocol } = await import('../../build/deepseek-harness/bridge/lib/index.mjs')

@@ -101,6 +101,7 @@ class TaskGit:
         if Path(self.root) in binary.parents or os.name == 'nt' and binary.suffix.lower() != '.exe':
             raise CollaborationError('Git 启动程序不可信')
         self.overrides: list[str] = []
+        self.environment: dict[str, str] = {}
 
     def run(self, *args: str, data: bytes | None = None, env: dict[str, str] | None = None,
             allowed: tuple[int, ...] = (0,), timeout: float = 30, lifecycle: Any = None) -> bytes:
@@ -110,6 +111,7 @@ class TaskGit:
             GIT_TERMINAL_PROMPT='0', GIT_NO_REPLACE_OBJECTS='1', GIT_NO_LAZY_FETCH='1', GIT_LITERAL_PATHSPECS='1', GIT_OPTIONAL_LOCKS='0',
             GIT_AUTHOR_NAME='AWU Task', GIT_AUTHOR_EMAIL='task@agentwithu.local',
             GIT_COMMITTER_NAME='AWU Task', GIT_COMMITTER_EMAIL='task@agentwithu.local', LC_ALL='C')
+        environment.update(self.environment)
         environment.update(env or {})
         argv = [self.executable, '--no-pager', '-c', 'core.fsmonitor=false', '-c', f'core.hooksPath={os.devnull}',
             '-c', 'protocol.allow=never', '-c', 'maintenance.auto=false', '-c', 'gc.auto=0',
@@ -152,7 +154,7 @@ class TaskGit:
         self.overrides = [value for name in names for prop in ('smudge=', 'clean=', 'process=', 'required=false')
                           for value in ('-c', name + '.' + prop)]
 
-    def repository(self) -> dict[str, Any]:
+    def repository(self, *, allow_unborn: bool = False) -> dict[str, Any]:
         try:
             root = canonical_path(self.run('rev-parse', '--show-toplevel').decode('utf-8').strip())
         except CollaborationError as error:
@@ -167,9 +169,10 @@ class TaskGit:
         git_dir = canonical_path(self.run('rev-parse', '--absolute-git-dir').decode('utf-8').strip())
         _check_git_metadata(common, git_dir)
         head = self.run('rev-parse', '--verify', '--quiet', 'HEAD^{commit}', allowed=(0, 1)).decode().strip()
-        if not head and not self.run('rev-parse', '--verify', '--quiet', 'HEAD', allowed=(0, 1)).strip():
+        unborn = not head and not self.run('rev-parse', '--verify', '--quiet', 'HEAD', allowed=(0, 1)).strip()
+        if unborn and not allow_unborn:
             raise TaskRepositoryUnavailable('no_commits', '当前项目还没有 Git 提交', '完成首次提交后，即可创建分支副本。')
-        if not OID.fullmatch(head):
+        if not OID.fullmatch(head) and not (allow_unborn and unborn):
             raise CollaborationError('没有可用基线提交，请先明确准备仓库')
         branch = self.run('symbolic-ref', '--quiet', '--short', 'HEAD', allowed=(0, 1)).decode('utf-8').strip()
         stat = Path(common).stat()
@@ -211,6 +214,16 @@ class TaskGit:
         view = {**repo, 'dirty': dirty}
         view['fingerprint'] = fingerprint(view)
         return view
+
+    def inspect_for_copy(self) -> dict:
+        """只读发现可初始化项目；普通 Git 读取仍要求真实 HEAD。"""
+        try:
+            return self.inspect()
+        except TaskRepositoryUnavailable as error:
+            if error.reason not in {'not_git', 'no_commits'}:
+                raise
+            from .task_git_initialization import inspect_initial
+            return inspect_initial(self, error.reason)
 
     def skill_files(self) -> list[dict]:
         """忽略的项目 Skill 另行复制，不强制提交到分支或借用父目录。"""
@@ -293,6 +306,17 @@ class TaskGit:
         if root.exists(): raise CollaborationError('任务目录已存在，保留原输出；未认领或覆盖')
         reject_links(root)
         self.run('check-ref-format', '--branch', branch)
+        if expected.get('initialization'):
+            from .task_git_initialization import initialize_for_copy
+            prepared = initialize_for_copy(self, expected, selected, scratch, skill_files)
+            # 首次提交已经带入基线；仅剩工作区与原暂存内容不同的路径需要副本快照。
+            remaining = [name for name in selected if any(row['path'] == name for row in prepared['dirty'])]
+            try:
+                result = self.create(prepared, root, branch, remaining, scratch, skill_files)
+            except (ValueError, OSError) as error:
+                raise CollaborationError('主项目的首次 Git 提交已建立，副本创建未完成；'
+                                         '源文件和已生成目录保留。' + str(error)) from error
+            return {**result, 'initializedSource': {key: prepared[key] for key in ('root', 'head', 'branch')}}
         if self.run('show-ref', '--verify', '--hash', 'refs/heads/' + branch, allowed=(0, 1, 128)):
             raise CollaborationError('任务分支已存在，未覆盖')
         if skill_files is not None and self.skill_files() != skill_files:
