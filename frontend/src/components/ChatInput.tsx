@@ -29,6 +29,7 @@ import type { RealtimeVoiceInteractionMode } from '../utils/realtimeVoice';
 import { uuid } from '../utils/uuid';
 import { inputHistoryStore, normalizeInputHistory } from '../utils/inputHistory';
 import { fileReferenceLocation, formatFileReference } from '../utils/promptReferences';
+import { referenceSelectedStyle, referenceSelectedActionStyle } from './referencePickerStyles';
 import {
   BackendRuntimeFields,
   formatRuntimeLabel,
@@ -1649,7 +1650,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
               key={s.id}
               style={{
                 ...fileItemStyle,
-                background: i === sessionSelectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
+                ...(i === sessionSelectedIndex ? referenceSelectedStyle : { background: 'transparent' }),
               }}
               onClick={() => insertSessionRefRef.current(s)}
               onMouseEnter={() => setSessionSelectedIndex(i)}
@@ -1697,19 +1698,19 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
               data-file-index={i}
               style={{
                 ...fileItemStyle,
-                background: i === fileSelectedIndex ? 'var(--theme-bg-tertiary, #eaeef2)' : 'transparent',
+                ...(i === fileSelectedIndex ? referenceSelectedStyle : { background: 'transparent' }),
               }}
               onMouseEnter={() => setFileSelectedIndex(i)}
             >
               <button type="button" tabIndex={-1} aria-label={`引用${entry.isDir ? '目录' : '文件'} ${entry.name}`}
                 title={`${entry.path} · 点击引用，不发送`}
-                style={{ ...fileActionStyle, flex: 1, minWidth: 0, display: 'flex', gap: 8, textAlign: 'left', border: 0, background: 'transparent' }}
+                style={{ ...fileActionStyle, flex: 1, minWidth: 0, display: 'flex', gap: 8, textAlign: 'left', border: 0, background: 'transparent', color: 'inherit' }}
                 onClick={() => insertFileRefRef.current(entry.path, entry.isDir)}>
                 <span>{entry.isDir ? '📁' : '📄'}</span>
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.name}</span>
               </button>
               {entry.isDir && <button type="button" tabIndex={-1} aria-label={`进入目录 ${entry.name}`}
-                title="进入目录（Tab / →）" style={fileActionStyle}
+                title="进入目录（Tab / →）" style={{ ...fileActionStyle, ...(i === fileSelectedIndex ? referenceSelectedActionStyle : {}) }}
                 onClick={() => navigateToDirRef.current(entry.path)}>进入 ›</button>}
             </div>
           ))}
