@@ -10,6 +10,7 @@ import {
   type PromptReferenceTrigger,
 } from '../utils/promptReferences';
 import { AppModalPortal } from './AppModalPortal';
+import { referenceSelectedStyle, referenceSelectedActionStyle } from './referencePickerStyles';
 import { skillReferenceText, type SkillManualSummary } from '../utils/skillManual';
 
 type FileEntry = { name: string; path: string; isDir: boolean };
@@ -550,29 +551,31 @@ const ReferenceOption: React.FC<{
   index: number; selected: boolean; icon: string; label: string; hint?: string;
   onChoose: () => void; onHover: (index: number) => void; onBrowse?: () => void;
 }> = ({ index, selected, icon, label, hint, onChoose, onHover, onBrowse }) => (
-  <div style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
+  <div onMouseEnter={() => onHover(index)} style={{
+    display: 'flex', alignItems: 'center', minWidth: 0, color: 'var(--theme-text)',
+    ...(selected ? referenceSelectedStyle : { background: 'transparent' }),
+  }}>
   <button
     type="button"
     tabIndex={-1}
     role="option"
     aria-selected={selected}
     data-ref-index={index}
-    onMouseEnter={() => onHover(index)}
     onClick={onChoose}
     style={{
       display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0, width: '100%', minHeight: 34,
       padding: '6px 10px', border: 0, textAlign: 'left', cursor: 'pointer',
-      color: 'var(--theme-text)',
-      background: selected ? 'var(--theme-accent-bg, rgba(9,105,218,.12))' : 'transparent',
+      color: 'inherit',
+      background: 'transparent',
       font: 'inherit', fontSize: 12,
     }}
   >
     <span aria-hidden="true">{icon}</span>
     <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
-    {hint && <span style={{ maxWidth: '45%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--theme-text-muted)', fontSize: 10 }}>{hint}</span>}
+    {hint && <span style={{ maxWidth: '45%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: selected ? '#dbeafe' : 'var(--theme-text-muted)', fontSize: 10 }}>{hint}</span>}
   </button>
   {onBrowse && <button type="button" tabIndex={-1} aria-label={`进入目录 ${label}`}
-    title="进入目录（Tab / →）" style={directoryActionStyle} onClick={onBrowse}>进入 ›</button>}
+    title="进入目录（Tab / →）" style={{ ...directoryActionStyle, ...(selected ? referenceSelectedActionStyle : {}) }} onClick={onBrowse}>进入 ›</button>}
   </div>
 );
 
