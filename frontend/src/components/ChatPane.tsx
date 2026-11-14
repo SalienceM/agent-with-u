@@ -34,6 +34,7 @@ import { TokenUsageMonitor } from './TokenUsageMonitor';
 import { uuid } from '../utils/uuid';
 import { inputHistoryKey, normalizeInputHistory } from '../utils/inputHistory';
 import { useSessionRenewal } from '../hooks/useSessionRenewal';
+import { ArchivedSessionNotice } from './ArchivedSessionNotice';
 
 function mergeAuthoritativeSeqTasks(authoritative: SeqTaskT[], current: SeqTaskT[]): SeqTaskT[] {
   const canonical = (authoritative || []).map((task) => ({ ...task, syncing: false }));
@@ -382,7 +383,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     isVisible && isFocused && canRenewSession, next => {
       if (onRenewSession && sessionId) onRenewSession(sessionId, next);
       else onOpenSession?.(next.id);
-      onToast?.('success', '已开启新会话，旧记录可从“历史”回看。');
+      onToast?.('success', next.historyArchiveCompleted
+        ? '已开启新会话，旧会话已归档，可从左侧“归档”或“历史”回看。'
+        : '已开启新会话，旧记录可从“历史”回看。');
     });
   const handleRenewSession = useCallback(async () => {
     if (!canRenewSession) { onToast?.('info', '请先返回 Chat，再开启同目录的新会话。'); return; }
@@ -991,7 +994,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     >
       <TokenUsageMonitor sessionId={sessionId} placement="floating" />
       {activeSession?.relationKind === 'integration' && <MergeSessionNotice key={historyKey} session={activeSession} onOpenSession={onOpenSession} />}
-      {sessionId && activeSession?.sessionType !== 'loop' && activeSession?.relationKind !== 'review' &&
+      {sessionId && !activeSession?.isArchived && activeSession?.sessionType !== 'loop' && activeSession?.relationKind !== 'review' &&
         <SessionSchedules key={historyKey} session={sessionId} executor={activeSession?.execKey || 'local'} owner={currentUser.userId} onStop={chat.abort}
           onLocate={messageId => {
             const target = scrollContainerRef.current?.querySelector<HTMLElement>(`[data-schedule-message="${CSS.escape(messageId)}"]`);
@@ -1114,9 +1117,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   ttsRate={config.ttsRate}
                   workingDir={activeSession?.workingDir}
                   onFocusFile={handleFocusLinkedFile}
-                  onRedoMessage={handleRedoMessage}
-                  onInsertCommand={handleInsertCommand}
-                  onReviewAnswer={activeSession?.relationKind !== 'review' ? handleReviewAnswer : undefined}
+                  onRedoMessage={activeSession?.isArchived ? undefined : handleRedoMessage}
+                  onInsertCommand={activeSession?.isArchived ? undefined : handleInsertCommand}
+                  onReviewAnswer={!activeSession?.isArchived && activeSession?.relationKind !== 'review' ? handleReviewAnswer : undefined}
                 />
               </React.Fragment>
             );
@@ -1233,7 +1236,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           <button onClick={() => setSeqQueueError('')} style={seqQueueErrorCloseStyle}>✕</button>
         </div>
       )}
-      {sessionId && (!!seqStateError || seqTasks.some((t) => ['pending', 'steering', 'running', 'error'].includes(t.status))) && (
+      {sessionId && !activeSession?.isArchived && (!!seqStateError || seqTasks.some((t) => ['pending', 'steering', 'running', 'error'].includes(t.status))) && (
         <SeqTaskPanel
           sessionId={sessionId}
           tasks={seqTasks}
@@ -1252,7 +1255,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       )}
 
       {/* ---- 输入栏 ---- */}
-      {activeSession?.relationKind === 'review' ? <div>
+      {activeSession?.isArchived ? <ArchivedSessionNotice key={historyKey} session={activeSession} onOpenSession={onOpenSession} renewal={renewal} /> : activeSession?.relationKind === 'review' ? <div>
         {sessionId && <UserInteractionsPanel key={sessionId} sessionId={sessionId} runtimeKey={`${activeBackendId}:${skipPermissions}`} compact />}
         {chat.messages.length > 0 && <RoleSessionNotice onReturn={activeSession.parentSessionId && onOpenSession ? () => onOpenSession(activeSession.parentSessionId) : undefined} />}
       </div> : <ChatInput

@@ -102,7 +102,7 @@ class SequenceDispatchGuardTests(unittest.IsolatedAsyncioTestCase):
 
         bridge._handle_send_message = handle
         bridge._active_sessions = {}
-        bridge._session_store = type('Store', (), {'load': lambda *_args: None})()
+        bridge._session_store = type('Store', (), {'load': lambda *_args: None, 'get_meta': lambda *_args: None})()
         bridge._rpc_sendMessage(json.dumps({
             "sessionId": "session-1",
             "messageId": "message-1",

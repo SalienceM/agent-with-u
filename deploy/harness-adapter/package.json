@@ -1,0 +1,11 @@
+{
+  "name": "awu-docker-harness",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.1-rc.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

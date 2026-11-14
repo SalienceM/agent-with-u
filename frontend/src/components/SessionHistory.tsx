@@ -37,18 +37,18 @@ export const SessionHistory: React.FC<Props> = ({ sessionId, executor, onOpenSes
     finally { if (scope.current === identity) setLogBusy(false); }
   };
   return <WorkflowPopover label="会话历史" title="历史" icon="history" open={open} onOpenChange={setOpen} width={400}>
-    <div style={{ color: 'var(--theme-text-muted)', marginBottom: 12 }}>同目录开启的新会话会留在这里。点击即可回看，原记录完整保留。</div>
+    <div style={{ color: 'var(--theme-text-muted)', marginBottom: 12 }}>同目录会话的历史记录。点击即可回看；已归档会话恢复后才能继续对话。</div>
     {error && <div role="alert" style={workflowNoticeStyle}>{error} <WorkflowButton onClick={() => void load()}>重试</WorkflowButton></div>}
     <ol aria-label="会话时间轴" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
       {visible.map(row => <li key={row.id} style={{ paddingLeft: 12, borderLeft: '2px solid var(--theme-border)', marginLeft: 3, paddingBottom: 8 }}>
         <button type="button" aria-current={row.id === sessionId ? 'page' : undefined}
-          disabled={!onOpenSession && row.id !== sessionId} onClick={() => { setOpen(false); if (row.id !== sessionId) onOpenSession?.(row.id); }}
+          disabled={!onOpenSession && row.id !== sessionId} onClick={event => { event.stopPropagation(); setOpen(false); if (row.id !== sessionId) onOpenSession?.(row.id); }}
           style={{ width: '100%', textAlign: 'left', display: 'grid', gap: 3, padding: '8px 10px', borderRadius: 8,
             border: '1px solid var(--theme-border)', cursor: 'pointer', font: 'inherit', color: 'var(--theme-text)',
             background: row.id === sessionId ? 'var(--theme-accent-bg)' : 'transparent' }}>
           <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{new Date(row.createdAt * 1000).toLocaleString('zh-CN', { hour12: false })}{row.id === sessionId ? ' · 当前' : ''}</span>
           <span style={{ overflowWrap: 'anywhere', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{row.title || '会话'}</span>
-          <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{row.messageCount || 0} 条消息{row.isPrivate ? ' · 私密' : ''}</span>
+          <span style={{ fontSize: 11, color: 'var(--theme-text-muted)' }}>{row.messageCount || 0} 条消息{row.isArchived ? ' · 已归档 · 只读' : ''}{row.isPrivate ? ' · 私密' : ''}</span>
         </button>
       </li>)}
     </ol>

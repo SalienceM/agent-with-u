@@ -144,6 +144,11 @@ class SequenceScheduler:
                 if getattr(self.bridge, '_loop_control_reserved', lambda _: False)(sid):
                     return  # 转交不领取、不清空队列，交还本身也不自动重启派发。
                 ex = self.bridge._chat_extras_get(sid)
+                # 归档不丢弃排队内容，也不能把它领取成新的对话。
+                meta = self.bridge._session_store.get_meta(sid) or {}
+                lock = getattr(self.bridge, '_session_renew_locks', {}).get(sid)
+                if meta.get('isArchived') or lock and lock.locked():
+                    return
                 if not ex.seq_auto or getattr(self.bridge, "_chat_turn_tasks", {}).get(sid):
                     return
                 if getattr(self.bridge, "_has_native_session_activity", lambda _: False)(sid):

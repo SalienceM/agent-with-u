@@ -237,7 +237,15 @@ API access control; old clients may ignore it. See `docs/session-navigation-priv
 `session_history.py` implements `sessionRenew` / read-only status/history/log-location RPCs.
 The composer “新会话 · 同目录” and `/new` create a fresh Session and replace this window's
 tab only after confirmed persistence; they never call the destructive legacy clear RPC.
-Keep the source transcript, native binding, title, drafts and jobs intact. New Sessions
+Keep the source transcript, native binding, title, drafts and jobs intact. Successful renewal
+archives the source using versioned index metadata; archive and the candidate completion receipt
+commit in one atomic index write. Never rewrite the source body to archive it. Status is read-only;
+unfinished renewal retries reuse the request ID. Cancellation holds the conversation guard until
+the archive writer settles. Old successful receipts never re-archive an explicitly restored source.
+`sessionArchiveRestore/Status` use owner/window boundaries and revision checks. Archived Sessions
+remain readable under a peer Sidebar archive group with the existing private visibility gate,
+but have no composer/redo/queue actions; executor turn admission and scheduling also enforce this.
+History selection stops portal click propagation so the old pane cannot override navigation. New Sessions
 inherit an explicit settings whitelist and current private/favorite metadata, never native
 thread IDs, token usage, task workspace identity or transient grants. `historyRootId` /
 `historySourceId` form a separate time axis; no title rewrite or collaboration-parent reuse.
@@ -1519,6 +1527,15 @@ to `http://192.168.50.156:7890`) plus internal `NO_PROXY`; dedicated
 gets the intended custom/force-HTTP behavior without copying settings into every Backend.
 
 Docker updates are image/container updates, never in-container file replacement.
+The backend Dockerfile builds the Harness SDK/bridge/manifest in its `harness-build`
+stage from the locked upstream commit and `deploy/harness-adapter/package-lock.json`;
+no host `build/deepseek-harness` files are required. The SDK wheel must match the
+audited Linux receipt and the npm installation must satisfy the external resource
+contract. The image uses Node 24 and `AGENT_WITH_U_HARNESS_EXTERNAL=1`; explicit
+Backend CLI paths retain priority and missing/invalid external CLI never falls back.
+Plain source runs retain their paired-runtime default. See `docs/docker-harness-build.md`.
+The pinned Docker requirements include workspace-search `pathspec`; final image gates
+also import `src.ws_main` so missing startup dependencies fail before container replacement.
 `UpdateManager` reports `runtime=docker`, requires a manifest artifact with
 `target=docker` and `kind=docker-bundle`, and after SHA-256 verification atomically writes
 an `agentwithu-docker-update-request-v1` under the shared data root. The executing backend
@@ -2433,6 +2450,10 @@ or persistent gate, and unchanged source/target fingerprints. Unknown exits rema
 retains the failed request receipt and never applies without a new independent confirmation.
 
 `composerDrafts` / `ComposerEditor` share main text, ordered blocks, references, selection and undo.
+The expanded editor uses solid document surfaces with edit/split/preview modes; narrow windows
+use edit/preview, and the block navigator appears only when attachments exist. Mode switches keep
+the CodeMirror instance and shared draft alive. `ComposerPreview` renders Markdown without executing
+raw HTML or fetching embedded resources; formatting tools edit the original text, never a second draft.
 Accepted unchanged revisions clear the old draft; late replies never clear newer edits. Handoff is a
 whitelist without authorization. IME and open selectors precede Tab suggestions and send shortcuts.
 `followup_suggestions.py` uses bounded isolated `text_only`, no native tools/main-thread resume,

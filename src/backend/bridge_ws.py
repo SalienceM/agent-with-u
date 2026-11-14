@@ -2219,6 +2219,9 @@ class BridgeWS(KitSshConnectionsBridge, SessionHistoryBridge, SessionCollaborati
         self._authorize_rpc(method, handler, params)
         bound = inspect.signature(handler).bind_partial(*params)
         sid = str(bound.arguments.get('session_id') or bound.arguments.get('sid') or '')
+        if sid and method in {'steerMessage', 'redirectMessage', 'steerSeqTask', 'seqtaskAdd', 'seqtaskEdit',
+                              'seqtaskSetAuto', 'seqtaskTakeNext', 'clearSessionContext', 'compactSessionContext'}:
+            self._require_session_conversation(sid)
         project_path_writes = {'gitStage', 'gitUnstage', 'gitDiscard', 'gitIgnore', 'gitCommit', 'gitBranchCreate',
             'gitBranchSwitch', 'gitBranchDelete', 'gitPull', 'gitPush', 'gitStashPush', 'gitStashPop', 'gitStashDrop',
             'syncWriteStart', 'syncWriteChunk', 'syncWriteFinish', 'syncWriteAbort', 'syncWriteFile', 'syncDeleteFile', 'syncDeleteEntry', 'provSave'}
@@ -2230,7 +2233,7 @@ class BridgeWS(KitSshConnectionsBridge, SessionHistoryBridge, SessionCollaborati
                 'languageServiceStart', 'languageServiceRequest', 'languageServiceStop',
                 'steerMessage', 'redirectMessage', 'steerSeqTask', 'seqtaskAdd', 'seqtaskEdit',
                 'seqtaskRemove', 'seqtaskReorder', 'seqtaskSetAuto', 'seqtaskTakeNext', 'seqtaskClear',
-                'abortMessage', 'grantPermission', 'sessionFavoriteSet', 'sessionPrivacySet', 'updateSessionAppearance', 'sessionRenew',
+                'abortMessage', 'grantPermission', 'sessionFavoriteSet', 'sessionPrivacySet', 'updateSessionAppearance', 'sessionRenew', 'sessionArchiveRestore',
                 'loopControlRequest', 'loopTakeover', 'loopRelease',
                 'loopRepairTaskContract', 'loopCancelTaskContractRepair'}:
             self._window_guard(sid)
@@ -2238,6 +2241,7 @@ class BridgeWS(KitSshConnectionsBridge, SessionHistoryBridge, SessionCollaborati
             payload = json.loads(params[0]) if isinstance(params[0], str) else params[0]
             if isinstance(payload, dict) and payload.get('sessionId'):
                 self._window_guard(payload['sessionId'])
+                self._require_session_conversation(payload['sessionId'])
         control_read_or_independent = {
             'loopControlGet', 'loopControlRequest', 'loopTakeover', 'loopRelease',
             'loopGetState', 'loopGetRecord', 'loopExecutionEnvironmentGet', 'loopAimeinGet',
@@ -3929,6 +3933,7 @@ class BridgeWS(KitSshConnectionsBridge, SessionHistoryBridge, SessionCollaborati
 
     def _check_chat_turn_allowed(self, session_id: str) -> None:
         self._require_update_work_allowed()
+        self._require_session_conversation(session_id)
         schedules = getattr(self, '_session_prompt_scheduler', None)
         if schedules and session_id in schedules.unknown:
             raise ValueError('定时运行结果未知，请在定时历史核对原输出后结束本次')

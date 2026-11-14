@@ -14,6 +14,28 @@ async function setup(page: Page, options: any = {}, url = '/') {
   });
   await page.goto(url); await mount(page, options);
 }
+test('archived sessions occupy one peer group, retain private visibility and open on selection', async ({ page }, info) => {
+  await setup(page);
+  await page.evaluate(() => {
+    const f = (window as any).privacyFixture;
+    Object.assign(f.rows.find((row: any) => row.id === 'b'), { isArchived: true, archivedAt: 20, pinned: true });
+    Object.assign(f.rows.find((row: any) => row.id === 'secret'), { isArchived: true, archivedAt: 10 });
+    f.publish();
+  });
+  const side = page.locator('[data-session-sidebar]');
+  const archive = page.locator('section').filter({ has: page.locator('.awu-session-group-toggle').filter({ hasText: '归档' }) });
+  await expect(archive.getByText('公开 B', { exact: true })).toBeVisible();
+  await expect(archive.getByText('私密标题 X', { exact: true })).toHaveCount(0);
+  await archive.getByText('公开 B', { exact: true }).click();
+  await expect(page.getByRole('tab', { name: '公开 B', exact: true })).toBeVisible();
+  await show(page);
+  await expect(archive.getByText('私密标题 X', { exact: true })).toBeVisible();
+  await archive.screenshot({ path: info.outputPath('archive-group.png') });
+  expect(await archive.evaluate(el => !!el.parentElement?.querySelector(':scope > section .awu-session-group-toggle'))).toBe(true);
+  await show(page);
+  await expect(archive.getByText('私密标题 X', { exact: true })).toHaveCount(0);
+});
+
 async function mount(page: Page, options: any = {}) {
   await page.waitForFunction(() => (window as any).__vite_plugin_react_preamble_installed__);
   await page.evaluate(async opts => { const source='/tests/engine/session-privacy-harness.tsx'; const { mountPrivacyFixture }=await import(/* @vite-ignore */ source); mountPrivacyFixture(opts); }, options);

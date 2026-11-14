@@ -36,6 +36,9 @@ for (const width of [1280, 390]) test(`renewal preserves drafts and history; bou
   await page.screenshot({ path: info.outputPath(`history-${width}.png`), fullPage: true });
   await page.getByRole('button').filter({ hasText: '原会话：需要保留的线索' }).click();
   await expect(page.getByTestId('selected')).toHaveText('old');
+  await expect(page.getByRole('region', { name: '已归档会话' })).toBeVisible();
+  await expect(page.locator('.chat-textarea')).toHaveCount(0);
+  await page.getByRole('button', { name: '恢复归档', exact: true }).click();
   await expect(page.locator('.chat-textarea')).toHaveValue('旧会话中尚未发送的重要草稿');
   expect(await page.evaluate(() => (window as any).historyFixture.writes.length)).toBe(1);
 });
@@ -74,6 +77,7 @@ test('late result does not steal focus; explicit retry uses the original request
   await page.evaluate(() => (window as any).historyFixture.finish());
   await expect(page.getByTestId('selected')).toHaveText('old');
   expect(await page.evaluate(() => (window as any).historyFixture.opens)).toEqual([]);
+  await page.getByRole('button', { name: '恢复归档', exact: true }).click();
   await page.evaluate(() => { const f = (window as any).historyFixture; f.focus(true); f.mode = 'unknown'; f.status = 'not_found'; });
   await renew(page);
   await expect(page.getByRole('button', { name: '继续开启同一新会话' })).toBeVisible();

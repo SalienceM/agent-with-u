@@ -46,6 +46,8 @@ interface Session extends SessionViewMetadata {
   mergeLink?: import('../types/taskWorkspaces').MergeLink;
   loopExecutionMode?: 'loop' | 'aimein';
   pinned?: boolean;
+  isArchived?: boolean;
+  archivedAt?: number;
   isPrivate?: boolean; privacyKnown?: boolean; privacyStatus?: FavoritePhase; privacyMessage?: string;
   favoriteStatus?: FavoritePhase;
   favoriteMessage?: string;
@@ -705,9 +707,11 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
       isDefault: boolean;
       sessions: Session[];
     }>();
-    const privateSessions = visibleSessions.filter(row => row.isPrivate);
+    const archivedSessions = visibleSessions.filter(row => row.isArchived).sort((a, b) => (b.archivedAt || b.updatedAt) - (a.archivedAt || a.updatedAt));
+    if (archivedSessions.length) map.set('__archived__', { key: '__archived__', label: '归档', isLocal: false, isDefault: false, sessions: archivedSessions });
+    const privateSessions = visibleSessions.filter(row => row.isPrivate && !row.isArchived);
     if (privateSessions.length) map.set('__private__', { key: '__private__', label: '私密', isLocal: false, isDefault: false, sessions: privateSessions });
-    const families = taskSessionTree(visibleSessions.filter(row => !row.isPrivate), new Set(), true).filter(row => row.depth === 0);
+    const families = taskSessionTree(visibleSessions.filter(row => !row.isPrivate && !row.isArchived), new Set(), true).filter(row => row.depth === 0);
     const isFavorite = (row: typeof families[number]) => row.item.pinned || row.children.some(child => child.pinned);
     const pinnedSessions = families.filter(isFavorite).flatMap(row => [row.item, ...row.children]);
     if (pinnedSessions.length) {
@@ -738,6 +742,8 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
     // 物理本机在前，其次是默认远端节点，再按节点名排序。
     const arr = Array.from(map.values());
     arr.sort((a, b) => {
+      if (a.key === '__archived__') return 1;
+      if (b.key === '__archived__') return -1;
       if (a.key === '__pinned__') return -1;
       if (b.key === '__pinned__') return 1;
       if (a.key === '__private__') return -1;
@@ -1001,6 +1007,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
         {groups.map(group => {
           // 多组时显示组头；单组（仅本机）不显示
           const isPrivateGroup = group.key === '__private__';
+          const isArchivedGroup = group.key === '__archived__';
           const isPinnedGroup = group.key === '__pinned__';
           const showGroupHeader = true;
           // 只有标题可见时才允许折叠，避免分组数量变化后留下一个无法展开的隐藏组。
@@ -1008,12 +1015,12 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
           const groupTone = isPinnedGroup
             ? { accent: '#d9ad45', iconBackground: 'rgba(217,173,69,.13)' }
             : { accent: 'var(--theme-accent, #7aa2f7)', iconBackground: 'var(--theme-accent-bg, rgba(122,162,247,.13))' };
-          const groupLabel = isPrivateGroup ? '私密' : isPinnedGroup
+          const groupLabel = isArchivedGroup ? '归档' : isPrivateGroup ? '私密' : isPinnedGroup
             ? '收藏'
             : group.isLocal
               ? (isTauri() ? '本机' : '当前 Web 节点')
               : group.label;
-          const groupDescription = isPrivateGroup ? '仅开启时显示' : isPinnedGroup
+          const groupDescription = isArchivedGroup ? '历史会话 · 只读' : isPrivateGroup ? '仅开启时显示' : isPinnedGroup
             ? '置顶会话'
             : group.isLocal
               ? '此设备执行'
@@ -1037,7 +1044,7 @@ export const Sidebar: React.FC<Props> = memo(({ activeSessionId, onSelectSession
                     color: groupTone.accent,
                     background: groupTone.iconBackground,
                   }} aria-hidden="true">
-                    {isPrivateGroup ? '◈' : isPinnedGroup ? (
+                    {isArchivedGroup ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M4 8h16v12H4zM3 4h18v4H3zM9 12h6" /></svg> : isPrivateGroup ? '◈' : isPinnedGroup ? (
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
                         <path d="m12 2.8 2.72 5.52 6.09.88-4.4 4.29 1.04 6.06L12 16.68l-5.45 2.87 1.04-6.06-4.4-4.29 6.09-.88L12 2.8Z" />
                       </svg>

@@ -72,6 +72,33 @@ for (const width of [1366, 390]) for (const dark of [true, false]) test(`compact
   await expect(page.locator('.chat-textarea')).toHaveValue('保留我的草稿');
 });
 
+for (const width of [1366, 390]) for (const dark of [true, false]) test(`document composer ${width} ${dark ? 'dark' : 'light'}`, async ({ page }, info) => {
+  await mount(page, width, dark);
+  await page.evaluate(({ dark }) => {
+    const root = document.querySelector<HTMLElement>('.app-root')!;
+    root.style.setProperty('--theme-panel-solid', dark ? '#10171f' : '#ffffff');
+    root.style.setProperty('--theme-bg', dark ? 'rgba(16,23,31,.6)' : 'rgba(255,255,255,.6)');
+  }, { dark });
+  await page.locator('.chat-textarea').fill('# 控制台改造计划\n\n先整理目前的配置和运行状态，让日常操作更清楚。\n\n## 本次调整\n\n- 配置查看与修改\n- 计划详情和依赖关系\n- 运行干预与局部重跑\n\n保持现有目录和工作成果，逐步验证每个操作。');
+  await page.getByRole('button', { name: '展开编辑消息和文本块' }).click();
+  const panel = page.getByRole('dialog', { name: '展开编辑消息' });
+  expect(await panel.evaluate(el => getComputedStyle(el).backgroundColor)).toBe(dark ? 'rgb(16, 23, 31)' : 'rgb(255, 255, 255)');
+  if (width > 760) await panel.getByRole('button', { name: '对照', exact: true }).click();
+  await panel.screenshot({ path: info.outputPath('document-editor.png') });
+  await panel.getByRole('button', { name: '预览', exact: true }).click();
+  await expect(panel.getByRole('heading', { name: '本次调整' })).toBeVisible();
+  await panel.screenshot({ path: info.outputPath('document-preview.png') });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  const box = await panel.boundingBox();
+  expect(box!.x + box!.width).toBeLessThanOrEqual(width);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(800);
+  await panel.getByRole('button', { name: '发送当前消息' }).focus();
+  await page.keyboard.press('Tab');
+  await expect(panel.getByRole('button', { name: '返回输入框' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.chat-textarea')).toBeFocused();
+});
+
 test('new question opens compact panel without stealing draft focus; collapsing and reopening preserves answer', async ({ page }, info) => {
   await mount(page, 390, true);
   const input = page.locator('.chat-textarea'); await input.fill('正在编辑'); await input.focus();

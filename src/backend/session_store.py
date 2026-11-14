@@ -244,7 +244,55 @@ class SessionStore:
                         meta[key] = copy.deepcopy(current[key])
                 session.is_private = bool(current.get("isPrivate"))
                 session.privacy_revision = current["privacyRevision"]
+            if current.get("archiveRevision", 0) > 0:
+                for key in ("isArchived", "archiveRevision", "archivedAt", "_archiveReceipt"):
+                    if key in current:
+                        meta[key] = copy.deepcopy(current[key])
+                session.is_archived = bool(current.get("isArchived"))
+                session.archive_revision = current["archiveRevision"]
+                session.archived_at = current.get("archivedAt", 0)
+            # 新会话落盘与来源归档是两个阶段；已确认的收尾不能被旧正文保存回滚。
+            if current.get("historyArchiveCompleted"):
+                meta["historyArchiveCompleted"] = True
+                session.history_archive_completed = True
             self._index[session.id] = meta
+
+    def commit_archive(self, sid: str, *, archived: bool, request_id: str,
+                       expected_revision: Optional[int] = None, renewal_id: str = "") -> dict:
+        """只提交归档元数据；续建时在同一次原子索引写入中确认新会话回执。"""
+        with self._index_write_lock:
+            with self._lock:
+                current = copy.deepcopy(self._index.get(sid))
+                if current is None:
+                    raise ValueError("会话不存在")
+                revision = current.get("archiveRevision", 0)
+                signature = [archived, expected_revision, renewal_id]
+                receipt = current.get("_archiveReceipt") or {}
+                if receipt.get("requestId") == request_id:
+                    if receipt.get("signature") != signature:
+                        raise ValueError("requestId 参数不一致")
+                    return {"status": "ok"}
+                if expected_revision is not None and expected_revision != revision:
+                    return {"status": "conflict", "message": "归档状态已变化，请核对当前状态"}
+                fields = {"isArchived": archived, "archiveRevision": revision + 1,
+                          "archivedAt": time.time() if archived else 0,
+                          "_archiveReceipt": {"requestId": request_id, "signature": signature}}
+                snapshot = copy.deepcopy(self._index)
+                snapshot[sid].update(fields)
+                if renewal_id:
+                    candidate = snapshot.get(renewal_id)
+                    if not archived or not candidate or candidate.get("historySourceId") != sid:
+                        raise ValueError("新会话与来源不匹配")
+                    candidate["historyArchiveCompleted"] = True
+            entries = sorted(snapshot.values(), key=lambda x: x.get("updatedAt", 0), reverse=True)
+            self._atomic_write_text(self._index_path, json.dumps(entries, ensure_ascii=False, indent=2))
+            with self._lock:
+                if sid in self._index:
+                    self._index[sid].update(fields)
+                if renewal_id in self._index:
+                    self._index[renewal_id]["historyArchiveCompleted"] = True
+                self._index_dirty = self._index != snapshot
+            return {"status": "ok"}
 
     def favorite_state(self, sid: str) -> dict:
         meta = self.get_meta(sid)
@@ -441,6 +489,9 @@ class SessionStore:
                 favorite_revision=int(meta.get("favoriteRevision", data.get("favoriteRevision", 0)) or 0),
                 is_private=bool(meta.get("isPrivate", data.get("isPrivate", False))),
                 privacy_revision=int(meta.get("privacyRevision", data.get("privacyRevision", 0)) or 0),
+                is_archived=bool(meta.get("isArchived", data.get("isArchived", False))),
+                archive_revision=int(meta.get("archiveRevision", data.get("archiveRevision", 0)) or 0),
+                archived_at=float(meta.get("archivedAt", data.get("archivedAt", 0)) or 0),
                 sidebar_color=str(meta.get("sidebarColor", data.get("sidebarColor", "")) or ""),
                 auto_commit=data.get("autoCommit", False),
                 auto_commit_push=data.get("autoCommitPush", False),
@@ -455,6 +506,8 @@ class SessionStore:
                 history_root_id=data.get("historyRootId"),
                 history_source_id=data.get("historySourceId"),
                 history_request_id=data.get("historyRequestId"),
+                history_archive_required=bool(data.get("historyArchiveRequired", False)),
+                history_archive_completed=bool(meta.get("historyArchiveCompleted", data.get("historyArchiveCompleted", False))),
                 followup_suggestions_config=dict(data.get("followupSuggestionsConfig") or {}) if isinstance(data.get("followupSuggestionsConfig"), dict) else {},
             )
             known_fields = session.to_dict().keys()

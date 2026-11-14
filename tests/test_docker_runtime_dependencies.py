@@ -21,7 +21,7 @@ class DockerRuntimeDependencyTests(unittest.TestCase):
         )
 
     def test_qwen_cli_and_supported_node_runtime_are_built_in(self) -> None:
-        self.assertIn("FROM node:20-bookworm-slim AS node-runtime", self.dockerfile)
+        self.assertIn("FROM node:24.10.0-bookworm-slim AS node-runtime", self.dockerfile)
         install_at = self.dockerfile.index('"@qwen-code/qwen-code@${QWEN_CODE_VERSION}"')
         probe_at = self.dockerfile.index("qwen --version")
         self.assertGreater(probe_at, install_at)

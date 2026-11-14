@@ -62,6 +62,47 @@ for (const width of [1300, 390]) test(`three blocks share edit, order and undo w
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
 });
 
+test('document views preserve edits, selection, undo and original send text', async ({ page }) => {
+  await mount(page);
+  await page.locator('.chat-textarea').fill('# 项目计划\n\n第一段');
+  await page.getByRole('button', { name: '展开编辑消息和文本块' }).click();
+  const panel = page.getByRole('dialog', { name: '展开编辑消息' });
+  const editor = panel.getByRole('textbox', { name: '编辑主消息' });
+  await expect(panel.getByRole('navigation', { name: '消息文本块' })).toHaveCount(0);
+  await editor.press('Control+End');
+  await panel.getByRole('button', { name: '对照', exact: true }).click();
+  const preview = panel.getByRole('region', { name: '消息排版预览' });
+  await expect(preview.getByRole('heading', { name: '项目计划' })).toBeVisible();
+  await editor.press('Enter'); await editor.type('补充');
+  await expect(preview).toContainText('补充');
+  await panel.getByRole('button', { name: '预览', exact: true }).click();
+  await expect(editor).toBeHidden();
+  await panel.getByRole('button', { name: '编辑', exact: true }).click();
+  await editor.type('细节');
+  await expect(editor).toHaveText('# 项目计划第一段补充细节');
+  await panel.getByRole('button', { name: '加粗', exact: true }).click();
+  await expect(editor).toContainText('**重点内容**');
+  await panel.getByRole('button', { name: '撤销本块' }).click();
+  await expect(editor).not.toContainText('重点内容');
+  await panel.getByRole('button', { name: '返回输入框' }).click();
+  await expect(page.locator('.chat-textarea')).toHaveValue('# 项目计划\n\n第一段\n补充细节');
+  expect(await page.evaluate(() => (window as any).composerFixture.sent)).toEqual([]);
+});
+
+test('draft preview renders HTML as text and never loads embedded resources', async ({ page }) => {
+  await mount(page);
+  await page.locator('.chat-textarea').fill('# 预览\n<img src="https://example.test/private" onerror="window.previewExecuted=true">\n![截图](https://example.test/image.png)\n\n```html\n<button>代码示例</button>\n```\n\n| 项目 | 状态 |\n| --- | --- |\n| 编辑器 | 完成 |');
+  await page.getByRole('button', { name: '展开编辑消息和文本块' }).click();
+  await page.getByRole('button', { name: '预览', exact: true }).click();
+  const preview = page.getByRole('region', { name: '消息排版预览' });
+  await expect(preview.getByRole('heading', { name: '预览' })).toBeVisible();
+  await expect(preview).toContainText('<img src=');
+  await expect(preview.locator('img, script, iframe')).toHaveCount(0);
+  await expect(preview.locator('pre code')).toHaveText('<button>代码示例</button>');
+  await expect(preview.getByRole('cell', { name: '完成' })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).previewExecuted)).toBeUndefined();
+});
+
 test('packing is reversible at 4000/6000 boundaries and restored text stays editable', async ({ page }) => {
   await mount(page);
   const input = page.locator('.chat-textarea');

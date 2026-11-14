@@ -73,6 +73,13 @@ class ExternalHarnessNativeTests(unittest.TestCase):
                 self.assertEqual(model.errors, [])
         self.run_case(check)
 
+    @unittest.skipUnless(os.environ.get("AGENT_WITH_U_HARNESS_EXTERNAL") == "1",
+                         "Image-default runtime check is Docker-only")
+    def test_docker_default_cli_without_backend_path_can_resume(self) -> None:
+        # 复用同一续聊场景，但移除 setUp 的显式 CLI 路径接缝，验证镜像默认发现路径。
+        with patch("tests.test_harness_image_turn.create_client", create_client):
+            self.test_text_initialization_and_native_resume()
+
     def test_image_admission_resume_and_no_remote_delete(self) -> None:
         async def check():
             with ImageWorkspace() as workspace, LocalImageModel(files_mode="quota") as model:

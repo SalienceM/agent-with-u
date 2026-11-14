@@ -307,6 +307,9 @@ class Session:
     favorite_revision: int = 0
     is_private: bool = False
     privacy_revision: int = 0
+    is_archived: bool = False
+    archive_revision: int = 0
+    archived_at: float = 0
     sidebar_color: str = ""
     # ★ 自动 AI commit + push：对话/Loop 结束时自动 stage-all → AI 生成 message → commit → push
     auto_commit: bool = False
@@ -329,6 +332,8 @@ class Session:
     history_root_id: Optional[str] = None
     history_source_id: Optional[str] = None
     history_request_id: Optional[str] = None
+    history_archive_required: bool = False
+    history_archive_completed: bool = False
     # 未识别持久字段仅供原样写回，绝不加入跨节点/UI 投影。
     persisted_extra: dict = field(default_factory=dict, repr=False)
 
@@ -384,6 +389,9 @@ class Session:
             "favoriteRevision": self.favorite_revision,
             "isPrivate": self.is_private,
             "privacyRevision": self.privacy_revision,
+            "isArchived": self.is_archived,
+            "archiveRevision": self.archive_revision,
+            "archivedAt": self.archived_at,
             "sidebarColor": self.sidebar_color,
             "skipPermissions": self.skip_permissions,
             "autoContinue": self.auto_continue,
@@ -394,6 +402,8 @@ class Session:
             "historyRootId": self.history_root_id,
             "historySourceId": self.history_source_id,
             "historyRequestId": self.history_request_id,
+            "historyArchiveRequired": self.history_archive_required,
+            "historyArchiveCompleted": self.history_archive_completed,
             **self.collaboration_meta(),
         }
 
@@ -424,6 +434,9 @@ class Session:
             "favoriteRevision": self.favorite_revision,
             "isPrivate": self.is_private,
             "privacyRevision": self.privacy_revision,
+            "isArchived": self.is_archived,
+            "archiveRevision": self.archive_revision,
+            "archivedAt": self.archived_at,
             "sidebarColor": self.sidebar_color,
             "autoCommit": self.auto_commit,
             "autoCommitPush": self.auto_commit_push,
@@ -431,6 +444,8 @@ class Session:
             "historyRootId": self.history_root_id,
             "historySourceId": self.history_source_id,
             **self.collaboration_meta(),
+            "historyArchiveRequired": self.history_archive_required,
+            "historyArchiveCompleted": self.history_archive_completed,
         }
 
 

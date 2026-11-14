@@ -29,4 +29,15 @@ deploy/docker-compose*.yml
 !docs/session-scheduled-prompts.md
 !docs/session-scheduled-prompts-release.md
 LICENSE
-!build/deepseek-harness/bridge/THIRD_PARTY_NOTICES.md
+
+# 镜像从源码准备 Harness，不携带宿主缓存/测试输出/桌面制品。
+build/
+dist/
+.qa/
+.agentwithu-kit-runs/
+node_modules/
+**/node_modules/
+src-tauri/target/
+src-tauri/binaries/
+.agents/
+.claude/

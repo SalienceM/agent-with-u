@@ -1,4 +1,4 @@
-"""同目录续建：旧 Session 不变，新 Session 的来源字段就是持久回执。"""
+"""同目录续建：保留旧正文并归档，新 Session 的来源字段就是持久回执。"""
 from __future__ import annotations
 
 import asyncio
@@ -37,10 +37,69 @@ def fresh_session(source: Session, sid: str, request: str, appearance: dict[str,
     result.history_root_id = source.history_root_id or source.id
     result.history_source_id = source.id
     result.history_request_id = request
+    result.history_archive_required = True
     return result
 
 
 class SessionHistoryBridge:
+    def _require_session_conversation(self, session_id: str) -> None:
+        meta = self._session_store.get_meta(session_id) or {}
+        if meta.get("isArchived"):
+            raise ValueError("此会话已归档，只能查看历史；恢复归档后才能继续对话。")
+        lock = getattr(self, "_session_renew_locks", {}).get(session_id)
+        if lock and lock.locked() or meta.get("historyArchiveRequired") and not meta.get("historyArchiveCompleted"):
+            raise ValueError("新会话与归档状态正在核对，请稍后再试。")
+
+    def _publish_archive(self, session_id: str) -> dict:
+        active = self._active_sessions.get(session_id)
+        if active:
+            self._session_store.update_meta(active)
+        meta = self._session_store.get_meta(session_id) or {}
+        self._emit_session_updated({"type": "session_archived", "sessionId": session_id,
+                                    "summary": {key: value for key, value in meta.items() if not key.startswith('_')}})
+        return meta
+
+    async def _commit_archive_confirmed(self, session_id: str, **kwargs: Any) -> dict:
+        # 线程写入不能随 RPC 取消而被终止；确认落盘前不能释放来源的对话互斥锁。
+        task = asyncio.create_task(asyncio.to_thread(self._session_store.commit_archive, session_id, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            result = await task
+            if result['status'] == 'ok':
+                self._publish_archive(session_id)
+            raise
+
+    async def _finish_renewal_archive(self, source_id: str, candidate: Session) -> None:
+        if not candidate.history_archive_required or candidate.history_archive_completed:
+            return
+        busy = self._session_destroy_busy_reason(source_id)
+        if busy or self._has_native_session_activity(source_id):
+            raise ValueError(busy or "原生执行尚未结束，不能归档")
+        await self._commit_archive_confirmed(source_id, archived=True,
+                                             request_id=f"renew-{candidate.id}", renewal_id=candidate.id)
+        candidate.history_archive_completed = True
+        self._publish_archive(source_id)
+
+    def _rpc_sessionArchiveStatus(self, session_id: str) -> str:
+        self._require_session_access(session_id)
+        meta = self._session_store.get_meta(session_id) or {}
+        return json.dumps({"status": "ok", "session": {key: value for key, value in meta.items() if not key.startswith('_')}}, ensure_ascii=False)
+
+    async def _rpc_sessionArchiveRestore(self, session_id: str, expected_revision: int, request_id: str) -> str:
+        self._require_session_access(session_id)
+        self._window_guard(session_id)
+        renewal_id(self._current_owner_id(), session_id, request_id)  # 同样严格校验回执 ID。
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("归档版本无效")
+        locks = self.__dict__.setdefault("_session_renew_locks", {})
+        async with locks.setdefault(session_id, asyncio.Lock()):
+            result = await self._commit_archive_confirmed(session_id, archived=False,
+                                                           expected_revision=expected_revision, request_id=request_id)
+            if result['status'] == 'ok':
+                self._publish_archive(session_id)
+            return json.dumps({**result, "session": json.loads(self._rpc_sessionArchiveStatus(session_id))["session"]}, ensure_ascii=False)
+
     def _renewal_existing(self, session_id: str, request_id: str) -> Session | None:
         owner = self._current_owner_id()
         sid = renewal_id(owner, session_id, request_id)
@@ -62,6 +121,7 @@ class SessionHistoryBridge:
             existing = self._renewal_existing(session_id, request_id)
             if existing:
                 self._session_store.update_meta(existing)
+                await self._finish_renewal_archive(session_id, existing)
                 await asyncio.to_thread(self._session_store._save_index_sync)
                 if existing.id not in self._active_sessions:
                     self._active_sessions[existing.id] = existing
@@ -71,6 +131,8 @@ class SessionHistoryBridge:
             source = self._active_sessions.get(session_id) or self._session_store.load(session_id)
             if not source:
                 raise ValueError("原会话不存在")
+            if (self._session_store.get_meta(session_id) or {}).get("isArchived"):
+                return json.dumps({"status": "error", "message": "此会话已归档，请先恢复归档或切换到新会话。"}, ensure_ascii=False)
             if source.session_type != "normal" or source.relation_kind or source.workspace_id:
                 return json.dumps({"status": "error", "message": "此入口用于普通对话；LOOP 和协作工作区请使用各自的新建入口。"}, ensure_ascii=False)
             busy = self._session_destroy_busy_reason(session_id)
@@ -81,7 +143,7 @@ class SessionHistoryBridge:
             candidate = fresh_session(source, sid, request_id, self._session_store.get_meta(session_id) or {})
             # 先完整落盘，再发布/切换。保存排在旧会话尚未完成的普通写入之后。
             await self._session_store.save_confirmed(candidate)
-            await asyncio.to_thread(self._session_store._save_index_sync)
+            await self._finish_renewal_archive(session_id, candidate)
             self._active_sessions[candidate.id] = candidate
             self._emit_session_updated({"type": "session_created", "sessionId": candidate.id,
                                         "summary": candidate.meta_dict()})
@@ -98,7 +160,7 @@ class SessionHistoryBridge:
             index = json.loads(self._session_store._index_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             index = []
-        indexed = any(row.get("id") == existing.id for row in index)
+        indexed = any(row.get("id") == existing.id and (not existing.history_archive_required or row.get("historyArchiveCompleted")) for row in index)
         lock = getattr(self, "_session_renew_locks", {}).get(session_id)
         return json.dumps({"status": "succeeded" if indexed else "pending" if lock and lock.locked() else "incomplete",
                            **({"session": existing.meta_dict()} if indexed else {})}, ensure_ascii=False)

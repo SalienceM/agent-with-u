@@ -49,11 +49,15 @@ class SessionHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(new.token_usage)
             self.assertEqual(new.history_root_id, source.id)
             self.assertEqual(new.history_source_id, source.id)
-            self.assertEqual(events[0]['type'], 'session_created')
+            self.assertEqual([event['type'] for event in events], ['session_archived', 'session_created'])
+            self.assertTrue(store.load(source.id).is_archived)
+            self.assertFalse(new.is_archived)
+            self.assertTrue(new.history_archive_completed)
             reopened = SessionStore()
             try:
                 self.assertEqual(reopened.load(new.id).history_source_id, source.id)
                 self.assertEqual(len(reopened.load(source.id).messages), 1)
+                self.assertTrue(reopened.load(source.id).is_archived)
                 self.assertEqual(len(reopened.list()), 2)
             finally:
                 _stop_store(reopened)
@@ -64,7 +68,7 @@ class SessionHistoryTests(unittest.IsolatedAsyncioTestCase):
             replies = await asyncio.gather(*(bridge._rpc_sessionRenew(source.id, 'same') for _ in range(3)))
             self.assertEqual(len({json.loads(r)['session']['id'] for r in replies}), 1)
             self.assertEqual(len(store.list()), 2)
-            self.assertEqual(len(events), 1)
+            self.assertEqual(len(events), 2)
             with patch.object(store, 'save_confirmed', side_effect=AssertionError('status wrote')):
                 status = json.loads(bridge._rpc_sessionRenewStatus(source.id, 'same'))
                 self.assertEqual(status['status'], 'succeeded')
@@ -114,15 +118,99 @@ class SessionHistoryTests(unittest.IsolatedAsyncioTestCase):
             self.prepare(bridge, source)
             store._save_index_sync()
             before = store._session_path(source.id).read_bytes()
-            with patch.object(store, '_save_index_sync', side_effect=OSError('index unavailable')):
+            with patch.object(store, 'commit_archive', side_effect=OSError('index unavailable')):
                 with self.assertRaises(OSError): await bridge._rpc_sessionRenew(source.id, 'partial')
                 self.assertEqual(json.loads(bridge._rpc_sessionRenewStatus(source.id, 'partial'))['status'], 'incomplete')
             self.assertEqual(events, [])
             result = json.loads(await bridge._rpc_sessionRenew(source.id, 'partial'))
             self.assertEqual(result['status'], 'succeeded')
             self.assertEqual(len(store.list()), 2)
-            self.assertEqual(len(events), 1)
+            self.assertEqual(len(events), 2)
             self.assertEqual(store._session_path(source.id).read_bytes(), before)
+
+    async def test_archive_restore_cas_stale_saves_and_old_renewal_receipt(self):
+        with _fixture() as (store, source, bridge, events):
+            self.prepare(bridge, source)
+            stale = copy.deepcopy(source)
+            result = json.loads(await bridge._rpc_sessionRenew(source.id, 'archive'))
+            with self.assertRaisesRegex(ValueError, '已归档'):
+                bridge._check_chat_turn_allowed(source.id)
+            store.save(stale, async_=False)
+            self.assertTrue(store.load(source.id).is_archived)
+            with patch.object(store, 'commit_archive', side_effect=AssertionError('read wrote')):
+                self.assertTrue(json.loads(bridge._rpc_sessionArchiveStatus(source.id))['session']['isArchived'])
+            conflict = json.loads(await bridge._rpc_sessionArchiveRestore(source.id, 0, 'wrong-version'))
+            self.assertEqual(conflict['status'], 'conflict')
+            revision = store.get_meta(source.id)['archiveRevision']
+            restored = json.loads(await bridge._rpc_sessionArchiveRestore(source.id, revision, 'restore'))
+            self.assertFalse(restored['session']['isArchived'])
+            self.assertEqual(json.loads(await bridge._rpc_sessionArchiveRestore(source.id, revision, 'restore')), restored)
+            store.save(stale, async_=False)
+            self.assertFalse(store.load(source.id).is_archived)
+            again = json.loads(await bridge._rpc_sessionRenew(source.id, 'archive'))
+            self.assertEqual(again['session']['id'], result['session']['id'])
+            self.assertFalse(store.load(source.id).is_archived, 'old receipt cannot re-archive a restored session')
+            bridge._current_owner_id = lambda: 'foreign'
+            with self.assertRaises(PermissionError): await bridge._rpc_sessionArchiveRestore(source.id, revision, 'foreign')
+            with self.assertRaises(PermissionError): bridge._rpc_sessionArchiveStatus(source.id)
+
+    async def test_pending_renewal_blocks_new_turns_and_failed_archive_does_not_claim_success(self):
+        with _fixture() as (store, source, bridge, events):
+            self.prepare(bridge, source)
+            entered, release = asyncio.Event(), asyncio.Event()
+            save = store.save_confirmed
+            async def slow_save(candidate):
+                entered.set()
+                await release.wait()
+                await save(candidate)
+            with patch.object(store, 'save_confirmed', side_effect=slow_save):
+                task = asyncio.create_task(bridge._rpc_sessionRenew(source.id, 'pending'))
+                await entered.wait()
+                with self.assertRaisesRegex(ValueError, '正在核对'):
+                    bridge._check_chat_turn_allowed(source.id)
+                release.set()
+                await task
+            self.assertTrue(store.get_meta(source.id)['isArchived'])
+
+    async def test_archived_queue_is_not_claimed_or_discarded(self):
+        from src.backend.sequence_scheduler import SequenceScheduler
+        from src.backend.chat_extras_store import ChatExtras, SeqTask
+        with _fixture() as (store, source, bridge, events):
+            self.prepare(bridge, source)
+            await bridge._rpc_sessionRenew(source.id, 'queued')
+            extras = ChatExtras(session_id=source.id, seq_auto=True, seq_tasks=[SeqTask(id='queued', text='keep')])
+            bridge._chat_extras_get = lambda _sid: extras
+            bridge._start_chat_turn = Mock(side_effect=AssertionError('archived session started'))
+            await SequenceScheduler(bridge)._drain(source.id)
+            self.assertEqual(extras.seq_tasks[0].status, 'pending')
+            bridge._start_chat_turn.assert_not_called()
+
+    async def test_cancelling_during_archive_write_keeps_turn_guard_until_disk_settles(self):
+        import threading
+        with _fixture() as (store, source, bridge, events):
+            self.prepare(bridge, source)
+            entered, release = asyncio.Event(), threading.Event()
+            loop = asyncio.get_running_loop()
+            commit = store.commit_archive
+            def slow_commit(*args, **kwargs):
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(5):
+                    raise RuntimeError('fixture timeout')
+                return commit(*args, **kwargs)
+            with patch.object(store, 'commit_archive', side_effect=slow_commit):
+                task = asyncio.create_task(bridge._rpc_sessionRenew(source.id, 'cancel'))
+                await entered.wait()
+                task.cancel()
+                await asyncio.sleep(0)
+                try:
+                    with self.assertRaisesRegex(ValueError, '正在核对'):
+                        bridge._require_session_conversation(source.id)
+                finally:
+                    release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertTrue(store.get_meta(source.id)['isArchived'])
+            self.assertEqual(json.loads(bridge._rpc_sessionRenewStatus(source.id, 'cancel'))['status'], 'succeeded')
 
     async def test_dsh_location_is_read_only_and_does_not_load_transcript(self):
         with _fixture() as (store, source, bridge, events):

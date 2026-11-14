@@ -6,9 +6,34 @@
 # 构建：docker compose -f deploy/docker-compose.example.yml build
 # 单独构建：docker build -f deploy/Dockerfile -t agent-with-u-backend .
 
-FROM node:20-bookworm-slim AS node-runtime
+FROM node:24.10.0-bookworm-slim AS node-runtime
 
-FROM python:3.11-slim
+# 干净 Git checkout 也能构建；不 COPY 开发机被忽略的 build/ 制品。
+FROM python:3.11-slim-bookworm AS harness-source
+COPY --from=node-runtime /usr/local/ /usr/local/
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates build-essential \
+    && pip install --no-cache-dir uv==0.11.23 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/awu-harness
+COPY deploy/harness-adapter/package.json deploy/harness-adapter/package-lock.json ./
+RUN npm ci
+WORKDIR /work/project
+COPY deploy/deepseek-harness.lock.json deploy/deepseek-harness.build-linux.json deploy/deepseek-harness.external.json ./deploy/
+RUN git init /opt/harness-source \
+    && git -C /opt/harness-source fetch --depth 1 https://github.com/deepseek-ai/deepseek-harness \
+       "$(python -c "import json; print(json.load(open('deploy/deepseek-harness.lock.json'))['commit'])")" \
+    && git -C /opt/harness-source checkout --detach FETCH_HEAD
+COPY src ./src
+COPY scripts ./scripts
+COPY tools/deepseek-harness ./tools/deepseek-harness
+COPY frontend/src/types/harnessImageContract.json ./frontend/src/types/harnessImageContract.json
+
+FROM harness-source AS harness-build
+RUN python scripts/build_docker_harness.py --source /opt/harness-source \
+    --modules /opt/awu-harness/node_modules --node /usr/local/bin/node \
+    && npm prune --omit=dev --prefix /opt/awu-harness
+
+FROM python:3.11-slim-bookworm
 
 ARG AGENT_WITH_U_BUILD_ID=dev
 ARG AGENT_WITH_U_VERSION=dev
@@ -52,18 +77,14 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY src ./src
 COPY skills ./skills
 
-# Harness 使用同源固定制品，不依赖上面的系统 Node，不在聊天时下载。
-COPY build/deepseek-harness/wheels/*manylinux_2_28_x86_64.whl /tmp/harness-wheels/
-COPY build/deepseek-harness/wheels/deepseek_harness_sdk-0.2.1rc3-py3-none-any.whl /tmp/harness-wheels/
-COPY deploy/requirements-harness.txt ./deploy/requirements-harness.txt
-COPY deploy/deepseek-harness.lock.json deploy/deepseek-harness.build-linux.json ./deploy/
+# 构建期准备固定 CLI + 轻量 SDK/桥，聊天时不安装、不下载，也不修改用户 Backend。
+COPY --from=harness-build /opt/awu-harness /opt/awu-harness
+COPY --from=harness-build /work/project/build/deepseek-harness ./build/deepseek-harness
 COPY deploy/deepseek-harness.external.json ./deploy/deepseek-harness.external.json
-COPY scripts/prepare_deepseek_harness.py ./scripts/prepare_deepseek_harness.py
-COPY build/deepseek-harness/bridge ./build/deepseek-harness/bridge
-COPY build/deepseek-harness/bundle-manifest.json ./build/deepseek-harness/bundle-manifest.json
-RUN python scripts/prepare_deepseek_harness.py --verify-staged /tmp/harness-wheels --platform linux-x64 \
-    && pip install --no-index --no-deps --find-links /tmp/harness-wheels -r deploy/requirements-harness.txt \
-    && python -c "from src.backend.deepseek_harness_distribution import verify_bundle; verify_bundle()"
+ENV PATH="/opt/awu-harness/node_modules/.bin:${PATH}" \
+    AGENT_WITH_U_HARNESS_EXTERNAL=1
+RUN pip install --no-index --no-deps ./build/deepseek-harness/wheels/*.whl \
+    && python -c "import src.ws_main; from src.backend.deepseek_harness_distribution import verify_adapter; verify_adapter(); from src.backend.deepseek_harness_cli import resolve_external_cli; resolve_external_cli()"
 
 # 数据目录（compose 里把宿主目录 bind-mount 到这里）
 ENV AGENT_WITH_U_DATA_ROOT=/app/data

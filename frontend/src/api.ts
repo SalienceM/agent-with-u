@@ -1423,6 +1423,7 @@ class Conn {
   async request(method: string, params: any[], timeoutMs?: number): Promise<any> {
     const strictSession = ['sessionFavoriteGet', 'sessionFavoriteSet', 'sessionPrivacyGet', 'sessionPrivacySet', 'deleteSession', 'destroySession', 'projectBufferReply', 'syncTransferCommit',
       'sessionRenew', 'sessionRenewStatus', 'sessionHistory', 'sessionNativeLogLocation',
+      'sessionArchiveRestore', 'sessionArchiveStatus',
       'harnessImageCapabilities', 'harnessImageSubmit', 'harnessImageQueue', 'harnessImageStatus', 'composerSubmit', 'composerStatus'].includes(method);
     const deadline = Date.now() + (timeoutMs || 10000), requestEpoch = relayIdentityEpoch, socket = this.ws;
     if (strictSession) {
@@ -2695,6 +2696,12 @@ async function sessionHistoryCall(sessionId: string, execKey: string | undefined
 }
 
 export const api = {
+  sessionArchiveRestore(sessionId: string, expectedRevision: number, requestId: string, execKey?: string) {
+    return sessionHistoryCall(sessionId, execKey, 'sessionArchiveRestore', [expectedRevision, requestId]);
+  },
+  sessionArchiveStatus(sessionId: string, execKey?: string) {
+    return sessionHistoryCall(sessionId, execKey, 'sessionArchiveStatus');
+  },
   sessionRenew(sessionId: string, requestId: string, execKey?: string) {
     return sessionHistoryCall(sessionId, execKey, 'sessionRenew', [requestId]);
   },

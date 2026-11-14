@@ -243,12 +243,13 @@ def create_client(*, config: Any, owner: SyncOwner, launch_args: tuple[str, ...]
                 args = [str(selected), "--profile", self.config.profile]
                 for overlay in self.config.patches:
                     args.extend(("--patch", overlay))
-            elif self.config.dsh_bin or getattr(sys, "frozen", False):
+            elif (self.config.dsh_bin or getattr(sys, "frozen", False)
+                  or env.get("AGENT_WITH_U_HARNESS_EXTERNAL") == "1"):
                 from .deepseek_harness_cli import resolve_external_cli
                 selected = resolve_external_cli(self.config.dsh_bin, environment=env)
                 args = list(selected.argv(self.config.profile, self.config.patches))
             else:
-                # 旧源码/Docker 配套模式；冻结默认绝不进入这一分支。
+                # 旧源码配套模式；冻结与显式启用外部 CLI 的镜像不进入此分支。
                 from .deepseek_harness_distribution import verify_bundle
                 require_locked_versions(runtime=True)
                 verify_bundle()

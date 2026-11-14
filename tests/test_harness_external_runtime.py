@@ -121,16 +121,33 @@ class ExternalCliTests(unittest.TestCase):
 
 
 class ExternalPackagingTests(unittest.TestCase):
-    def test_docker_retains_pair_and_receives_new_lightweight_contract(self) -> None:
+    def test_docker_builds_adapter_without_host_generated_inputs(self) -> None:
         dockerfile = (Path(__file__).resolve().parents[1] / "deploy/Dockerfile").read_text(encoding="utf-8")
         self.assertIn("COPY deploy/deepseek-harness.external.json ./deploy/deepseek-harness.external.json", dockerfile)
-        self.assertIn("--verify-staged /tmp/harness-wheels --platform linux-x64", dockerfile)
-        self.assertIn("verify_bundle()", dockerfile)
+        self.assertNotIn("COPY build/deepseek-harness", dockerfile)
+        self.assertIn("COPY --from=harness-build", dockerfile)
+        self.assertIn("verify_adapter()", dockerfile)
+        self.assertIn("resolve_external_cli()", dockerfile)
+
+    def test_docker_external_mode_fails_closed_without_bundled_fallback(self) -> None:
+        owner = Mock()
+        config = SimpleNamespace(env={}, dsh_bin=None)
+        with patch.dict(os.environ, {"AGENT_WITH_U_HARNESS_EXTERNAL": "1"}), \
+                patch.object(sys, "frozen", False, create=True), \
+                patch.object(distribution, "verify_bundle") as bundled, \
+                patch.object(cli, "resolve_external_cli", side_effect=cli.HarnessDependencyError("cli_missing")) as external:
+            client = sdk.create_client(config=config, owner=owner)
+            with self.assertRaises(cli.HarnessDependencyError):
+                client.start()
+        external.assert_called_once()
+        bundled.assert_not_called()
+        owner.spawn.assert_not_called()
 
     def test_source_default_keeps_original_verification_and_no_external_discovery(self) -> None:
         owner = Mock()
         config = SimpleNamespace(env={}, dsh_bin=None)
-        with patch.object(sys, "frozen", False, create=True), \
+        with patch.dict(os.environ, {"AGENT_WITH_U_HARNESS_EXTERNAL": "0"}), \
+                patch.object(sys, "frozen", False, create=True), \
                 patch.object(distribution, "verify_bundle", side_effect=RuntimeError("paired-resource-check")) as legacy, \
                 patch.object(cli, "resolve_external_cli") as external:
             client = sdk.create_client(config=config, owner=owner)
