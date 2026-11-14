@@ -11,14 +11,19 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
       try { frame = JSON.parse(String(message)); } catch { server.send(message); return; }
       if (frame.method === 'seqtaskGet') {
         socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify({ status: 'ok', seqTasks: [], seqAuto: false }) }));
-      } else if (frame.method === 'sendMessage') {
-        const payload = JSON.parse(frame.params[0]);
+      } else if (frame.method === 'composerSubmit' || frame.method === 'sendMessage') {
+        const payload = JSON.parse(frame.params[frame.method === 'composerSubmit' ? 1 : 0]);
         sent.push(payload);
+        if (frame.method === 'composerSubmit') {
+          socket.send(JSON.stringify({ id: frame.id, result: JSON.stringify({ ...payload, revision: 1, state: 'accepted' }) }));
+        }
         finish = () => {
           for (const type of ['text_delta', 'done']) socket.send(JSON.stringify({ event: 'streamDelta', data: JSON.stringify({
             sessionId: payload.sessionId, messageId: payload.messageId, type, text: type === 'text_delta' ? '隔离测试完成' : '',
           }) }));
         };
+      } else if (['seqtaskAdd', 'steerMessage', 'redirectMessage', 'harnessImageSubmit', 'harnessImageQueue'].includes(frame.method)) {
+        throw new Error(`Unexpected model write in Kit fixture: ${frame.method}`);
       } else server.send(message);
     });
   });
@@ -30,7 +35,14 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
   await openSidebar();
   await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).first().click();
   const pane = page.locator('[data-session-tab-panel]:visible');
-  const optIn = pane.getByRole('switch', { name: '本次允许 Kit 代确认' });
+  const optIn = page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true });
+  const enableDelegation = async () => {
+    await pane.getByRole('button', { name: '更多输入工具', exact: true }).click();
+    const section = page.getByRole('dialog', { name: '更多输入工具', exact: true }).locator('details:not([open]) > summary').filter({ hasText: '确认与提醒' });
+    if (await section.count()) await section.click();
+    await page.getByRole('dialog', { name: '更多输入工具', exact: true }).getByRole('switch', { name: '本次允许 Kit 代确认' }).click();
+    await page.keyboard.press('Escape');
+  };
   const input = pane.locator('.chat-textarea');
   await expect(optIn).not.toBeChecked();
   await expect(optIn).toBeEnabled();
@@ -42,7 +54,7 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
   finish!();
   await expect(optIn).toBeEnabled();
 
-  await optIn.click();
+  await enableDelegation();
   await expect(optIn).toBeChecked();
   await expect(optIn).toContainText('仅本次');
   await input.fill('按顺序打包并发布，请核对本次发布计划');
@@ -61,15 +73,15 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
   expect(sent[2].kitApprovalDelegation).toBe(false);
   finish!();
   await expect(optIn).toBeEnabled();
-  await optIn.click();
+  await enableDelegation();
   await openSidebar();
   await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).nth(1).click();
-  await expect(optIn).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', checked: true, includeHidden: true })).toHaveCount(0);
   await openSidebar();
   await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).first().click();
-  await expect(optIn).not.toBeChecked();
-  await optIn.click();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', checked: true, includeHidden: true })).toHaveCount(0);
+  await enableDelegation();
   await page.reload();
-  await expect(optIn).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', checked: true, includeHidden: true })).toHaveCount(0);
   expect(sent).toHaveLength(3);
 });

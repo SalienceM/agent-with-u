@@ -17,7 +17,7 @@ async function mount(page: Page, width: number, dark: boolean) {
     document.body.style.cssText = 'margin:0;font:14px "Segoe UI","Microsoft Yahei",sans-serif';
     const root = document.getElementById('root')!;
     root.style.cssText = `height:100vh;display:flex;flex-direction:column;justify-content:flex-end;color:${dark ? '#dbe2ed' : '#273244'};background:${dark ? 'linear-gradient(145deg,#33433c,#1a2630 60%,#19212c)' : 'linear-gradient(145deg,#e7ede4,#e7edf3 60%,#f4f6fa)'};
-      --theme-bg:${dark ? '#10171f' : '#ffffff'};--theme-bg-secondary:${dark ? '#18212b' : '#f7f9fc'};--theme-bg-tertiary:${dark ? '#232f3e' : '#ecf0f6'};--theme-input-bg:${dark ? '#151e29' : '#f9fafc'};--theme-border:${dark ? '#2a3645' : '#dce3ed'};--theme-text:${dark ? '#dbe2ed' : '#273244'};--theme-text-muted:${dark ? '#98a7bc' : '#63738a'};--theme-accent:${dark ? '#76a4ff' : '#3975db'};--theme-accent-bg:${dark ? '#76a4ff18' : '#3975db12'};`;
+      --theme-bg:${dark ? '#10171f' : '#ffffff'};--theme-panel-solid:${dark ? '#18212b' : '#f7f9fc'};--theme-bg-secondary:${dark ? '#18212b88' : '#f7f9fc88'};--theme-bg-tertiary:${dark ? '#232f3e' : '#ecf0f6'};--theme-input-bg:${dark ? '#151e29' : '#f9fafc'};--theme-border:${dark ? '#2a3645' : '#dce3ed'};--theme-text:${dark ? '#dbe2ed' : '#273244'};--theme-text-muted:${dark ? '#98a7bc' : '#63738a'};--theme-accent:${dark ? '#76a4ff' : '#3975db'};--theme-accent-bg:${dark ? '#76a4ff18' : '#3975db12'};`;
     const f = { pushed: (_value: any) => {}, sent: [] as any[] };
     (window as any).presentation = f;
     api.onSessionConnectionStatus = (_session, callback) => { callback(true); return () => {}; };
@@ -34,6 +34,7 @@ async function mount(page: Page, width: number, dark: boolean) {
       return React.createElement(ChatInput, { sessionId: 'ui-fixture', historyKey: 'ui-fixture', backends: [{ id: 'api', type: 'openai-compatible' }], activeBackendId: 'api',
         isStreaming: false, isMobile: width < 500, skipPermissions: true, onSend: (...args: any[]) => { f.sent.push(args); }, onAbort: () => {}, onAdjustFontSize: () => {},
         onOpenOpinions: () => setReview(true),
+        realtimeVoice: { sessionId: 'ui-fixture', backendLabel: 'fixture', voice: '', rate: 1, onSend: () => {} },
         workflowTools: React.createElement(React.Fragment, null,
           React.createElement(ProjectTasksPanel, { session: 'ui-fixture', executor: 'local', backendId: 'api', backends: [] }),
           React.createElement(RoleReviewPanel, { session: 'ui-fixture', executor: 'local', open: review, onOpen: () => setReview(true), onClose: () => setReview(false), onReference: () => {} }),
@@ -44,26 +45,45 @@ async function mount(page: Page, width: number, dark: boolean) {
   }, { dark, width });
 }
 
-for (const width of [1366, 390]) for (const dark of [true, false]) test(`compact composer surface ${width} ${dark ? 'dark' : 'light'}`, async ({ page }, info) => {
+for (const width of [1366, 840, 390]) for (const dark of [true, false]) test(`compact composer surface ${width} ${dark ? 'dark' : 'light'}`, async ({ page }, info) => {
   await mount(page, width, dark);
-  await expect(page.getByRole('button', { name: '交互状态', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '交互状态', exact: true })).not.toBeVisible();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认' })).not.toBeVisible();
+  await expect(page.getByRole('switch', { name: '影子续写建议' })).not.toBeVisible();
+  await expect(page.getByRole('button', { name: '建议模型设置', exact: true })).not.toBeVisible();
+  await expect(page.getByRole('button', { name: '开启实时语音对话' })).not.toBeVisible();
   await expect(page.getByRole('button', { name: '核对问答状态' })).not.toBeVisible();
   await expect(page.getByLabel('提醒 Kit 待确认')).not.toBeVisible();
   await expect(page.getByRole('button', { name: '查看角色评议' })).toHaveCount(0);
-  const bar = page.getByLabel('会话协作工具');
+  const bar = page.getByLabel('输入工具栏', { exact: true });
   const box = await bar.boundingBox();
   expect(box!.height).toBeLessThan(44);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.locator('.awu-composer').screenshot({ path: info.outputPath('composer.png') });
+  await page.getByRole('button', { name: '更多输入工具', exact: true }).click();
+  const more = page.getByRole('dialog', { name: '更多输入工具', exact: true });
+  await expect(more.getByRole('button', { name: '转为文本附件' })).toBeVisible();
+  await expect(more).toContainText('随消息一起发送');
+  await expect(more.getByRole('button', { name: '开启实时语音对话' })).not.toBeVisible();
+  const moreBounds = await more.boundingBox();
+  expect(moreBounds!.x).toBeGreaterThanOrEqual(0); expect(moreBounds!.x + moreBounds!.width).toBeLessThanOrEqual(width);
+  expect(moreBounds!.y).toBeGreaterThanOrEqual(0);
+  await more.screenshot({ path: info.outputPath('more-tools.png') });
+  await more.locator('summary').filter({ hasText: '确认与提醒' }).click();
+  await expect(more.getByRole('button', { name: '开启实时语音对话' })).toBeVisible();
   await page.getByRole('button', { name: '交互状态', exact: true }).click();
   const panel = page.getByRole('dialog', { name: '交互状态' });
   await expect(panel).toBeVisible();
+  await expect(more).not.toBeVisible();
   const bounds = await panel.boundingBox();
   expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
   await page.keyboard.press('Escape'); await expect(panel).not.toBeVisible();
+  await expect(page.getByRole('button', { name: '更多输入工具', exact: true })).toBeFocused();
+  await page.getByRole('button', { name: '更多输入工具', exact: true }).click();
   await page.getByRole('button', { name: 'Kit 提醒设置', exact: true }).click();
   await page.getByLabel('提醒 Kit 待确认').uncheck();
-  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认' })).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true })).not.toBeChecked();
+  await page.keyboard.press('Escape');
   await page.locator('.chat-textarea').fill('保留我的草稿');
   await page.getByRole('button', { name: '分支副本与合并' }).click();
   await expect(page.getByRole('dialog', { name: '分支副本', exact: true })).toBeVisible();
@@ -97,6 +117,37 @@ for (const width of [1366, 390]) for (const dark of [true, false]) test(`documen
   await expect(panel.getByRole('button', { name: '返回输入框' })).toBeFocused();
   await page.keyboard.press('Escape');
   await expect(page.locator('.chat-textarea')).toBeFocused();
+});
+
+test('menu actions preserve text selection and authorization stays explicit when the menu closes', async ({ page }) => {
+  await mount(page, 840, true);
+  const input = page.locator('.chat-textarea');
+  const moreButton = page.getByRole('button', { name: '更多输入工具', exact: true });
+  await input.fill('前言 详细资料 后记');
+  await input.evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(3, 7));
+  await moreButton.click();
+  await page.getByRole('button', { name: '转为文本附件', exact: true }).click();
+  await expect(input).toHaveValue('前言  后记');
+  await expect(page.getByText('selected-text-1.txt', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '撤销文本收纳 / 恢复' }).click();
+  await expect(input).toHaveValue('前言 详细资料 后记');
+  await moreButton.click();
+  await page.getByRole('dialog', { name: '更多输入工具', exact: true }).locator('summary').filter({ hasText: '回复辅助' }).click();
+  await page.getByRole('button', { name: '建议模型设置', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: '更多输入工具', exact: true })).not.toBeVisible();
+  await expect(page.getByRole('dialog', { name: '建议模型设置', exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(moreButton).toBeFocused();
+  await expect(input).toHaveValue('前言 详细资料 后记');
+  await moreButton.click();
+  await page.getByRole('dialog', { name: '更多输入工具', exact: true }).locator('summary').filter({ hasText: '确认与提醒' }).click();
+  await page.getByRole('switch', { name: '本次允许 Kit 代确认' }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('button', { name: '取消本次 Kit 代确认' })).toBeVisible();
+  await page.getByRole('button', { name: '取消本次 Kit 代确认' }).click();
+  await expect(page.getByRole('button', { name: '取消本次 Kit 代确认' })).toHaveCount(0);
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true })).not.toBeChecked();
+  expect(await page.evaluate(() => (window as any).presentation.sent)).toEqual([]);
 });
 
 test('new question opens compact panel without stealing draft focus; collapsing and reopening preserves answer', async ({ page }, info) => {

@@ -157,7 +157,7 @@ test('Markdown is text; # and Slash menus work in expanded editor without sendin
   await expect(page.getByRole('listbox', { name: '选择评议角色' })).toBeVisible();
   await expect(page.getByRole('option', { name: '#审查者', exact: true })).toBeVisible();
   await editor.press('Tab');
-  await expect(editor).toHaveText('');
+  await expect(editor.locator('.cm-placeholder')).toBeVisible();
   await editor.fill('/hel'); await editor.press('Tab'); await expect(editor).toHaveText('/help ');
   expect(await page.evaluate(() => (window as any).reviewFixture.sent)).toEqual([]);
   await editor.fill('@proof'); await expect(page.getByRole('dialog', { name: '引用文件或目录' })).toBeVisible();
@@ -182,7 +182,9 @@ test('lost review reply cannot resubmit after Session switching; status does not
 });
 
 test('role library edits and archives without model calls', async ({ page }) => {
-  await mount(page); await page.getByRole('button', { name: '维护角色库' }).click();
+  await mount(page);
+  await page.getByRole('button', { name: '更多输入工具', exact: true }).click();
+  await page.getByRole('button', { name: '角色库', exact: true }).click();
   const library = page.getByRole('dialog', { name: '角色库' });
   await library.getByRole('button', { name: '审查者', exact: true }).click();
   await library.getByLabel('角色名称', { exact: true }).fill('证据审查');
@@ -223,8 +225,10 @@ test('cached history stays selected across new batches; @ opinion selector prese
 
 test('role selection clears Kit opt-in and explicit rejection preserves editable draft', async ({ page }) => {
   await mount(page);
-  const opt = page.getByRole('switch', { name: '本次允许 Kit 代确认' });
-  await opt.click(); await choose(page, '#审', '审查者');
+  await page.getByRole('button', { name: '更多输入工具', exact: true }).click();
+  await page.getByRole('dialog', { name: '更多输入工具', exact: true }).locator('summary').filter({ hasText: '确认与提醒' }).click();
+  const opt = page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true });
+  await opt.click(); await page.keyboard.press('Escape'); await choose(page, '#审', '审查者');
   await expect(opt).toBeDisabled(); await expect(opt).not.toBeChecked();
   await page.evaluate(async () => {
     const { api } = await import('/tests/engine/chat-kit-feedback-harness.ts');
