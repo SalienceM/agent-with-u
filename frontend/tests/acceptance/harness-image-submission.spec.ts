@@ -84,7 +84,10 @@ test('attachments, acceptance and completion have no extra image guidance or con
 
 test('slow receipts preserve later edits without restoring or resending; grants stay cleared', async ({ page }) => {
   const f = await setup(page); const { pane, input, preview } = await draftImage(page);
-  await pane.getByRole('switch', { name: '本次允许 Kit 代确认' }).click();
+  await pane.getByRole('button', { name: '更多输入工具', exact: true }).click();
+  await page.getByRole('dialog', { name: '更多输入工具', exact: true }).locator('summary').filter({ hasText: '确认与提醒' }).click();
+  await page.getByRole('switch', { name: '本次允许 Kit 代确认' }).click();
+  await page.keyboard.press('Escape');
   expect(f.methods.filter(m => m === 'harnessImageCapabilities')).toHaveLength(0);
   await input.press('Enter'); await expect.poll(() => f.writes.length).toBe(1);
   await expect(input).toHaveValue('原图片草稿'); await expect(preview).toHaveCount(1);
@@ -95,7 +98,7 @@ test('slow receipts preserve later edits without restoring or resending; grants 
   await expect(pane.getByTestId('harness-image-status')).toHaveCount(0);
   await expect(input).toHaveValue('等待时的新编辑');
   await expect(preview).toHaveCount(1);
-  await expect(pane.getByRole('switch', { name: '本次允许 Kit 代确认' })).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true })).not.toBeChecked();
   const storage = await page.evaluate(() => JSON.stringify(localStorage));
   expect(storage).not.toContain(png.toString('base64')); expect(f.writes).toHaveLength(1);
 });

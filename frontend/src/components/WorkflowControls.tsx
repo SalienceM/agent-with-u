@@ -1,5 +1,19 @@
-import React, { forwardRef, useContext, useLayoutEffect, useRef, useState } from 'react';
+import React, { createContext, forwardRef, useContext, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { AppModalPortal, AppModalVisibilityContext, WorkbenchInteractionContext } from './AppModalPortal';
+
+// 只移动入口，控制器和弹层保持挂载，待回答问题不会因“更多”关闭而丢失。
+export const WorkflowOverflowContext = createContext<{
+  container: HTMLElement | null;
+  anchor: React.RefObject<HTMLButtonElement>;
+  close: () => void;
+} | null>(null);
+
+export const WorkflowOverflowItem: React.FC<{ attention?: boolean; children: React.ReactNode }> = ({ attention, children }) => {
+  const overflow = useContext(WorkflowOverflowContext);
+  if (!overflow || attention) return <>{children}</>;
+  return overflow.container ? createPortal(children, overflow.container) : null;
+};
 
 type IconName = 'branch' | 'review' | 'bell' | 'question' | 'more' | 'close' | 'refresh' | 'spark' | 'shield' | 'expand' | 'plus' | 'role' | 'clear' | 'settings' | 'block' | 'camera';
 const paths: Record<IconName, React.ReactNode> = {
@@ -55,36 +69,47 @@ export const WorkflowEmptyState: React.FC<{ icon: IconName; title: string; child
 
 /** 轻量非模态浮层；定位约束在视口内，面板状态保留，自动提示不抢草稿焦点。 */
 export const WorkflowPopover: React.FC<{ label: string; title: string; icon: IconName; open: boolean; onOpenChange: (open: boolean) => void;
-  children: React.ReactNode; badge?: string | number; warning?: boolean; width?: number }> = ({ label, title, icon, open, onOpenChange, children, badge, warning, width = 380 }) => {
-  const trigger = useRef<HTMLButtonElement>(null), panel = useRef<HTMLDivElement>(null);
+  children: React.ReactNode; badge?: string | number; warning?: boolean; width?: number; triggerRef?: React.RefObject<HTMLButtonElement> }> = ({ label, title, icon, open, onOpenChange, children, badge, warning, width = 380, triggerRef }) => {
+  const localTrigger = useRef<HTMLButtonElement>(null), panel = useRef<HTMLDivElement>(null);
+  const trigger = triggerRef || localTrigger;
+  const overflow = useContext(WorkflowOverflowContext);
+  const attention = !!warning || !!badge;
+  const focusTrigger = () => {
+    const target = trigger.current?.getClientRects().length ? trigger.current : overflow?.anchor.current;
+    target?.focus();
+  };
   const visible = useContext(AppModalVisibilityContext), frozen = useContext(WorkbenchInteractionContext);
   const [position, setPosition] = useState<React.CSSProperties>({ visibility: 'hidden' });
   useLayoutEffect(() => {
     if (!open || !visible || frozen) return;
+    overflow?.close();
     const place = () => {
-      const rect = trigger.current?.getBoundingClientRect(); if (!rect) return;
+      const anchor = overflow && !attention ? overflow.anchor.current : trigger.current;
+      const rect = anchor?.getBoundingClientRect(); if (!rect) return;
       const availableWidth = Math.min(width, window.innerWidth - 24);
       const above = rect.top > window.innerHeight / 2;
       setPosition({ width: availableWidth, left: Math.max(12, Math.min(rect.right - availableWidth, window.innerWidth - availableWidth - 12)),
         ...(above ? { bottom: window.innerHeight - rect.top + 8, maxHeight: Math.max(120, rect.top - 24) } : { top: rect.bottom + 8, maxHeight: Math.max(120, window.innerHeight - rect.bottom - 24) }) });
     };
     const outside = (e: PointerEvent) => { if (!panel.current?.contains(e.target as Node) && !trigger.current?.contains(e.target as Node)) onOpenChange(false); };
-    const key = (e: KeyboardEvent) => { if (e.key === 'Escape' && !e.isComposing) { e.preventDefault(); const inside = panel.current?.contains(document.activeElement); onOpenChange(false); if (inside) trigger.current?.focus(); } };
+    const key = (e: KeyboardEvent) => { if (e.key === 'Escape' && !e.isComposing) { e.preventDefault(); const inside = panel.current?.contains(document.activeElement); onOpenChange(false); if (inside) focusTrigger(); } };
     place(); window.addEventListener('resize', place); window.addEventListener('scroll', place, true);
     document.addEventListener('pointerdown', outside); document.addEventListener('keydown', key);
     return () => { window.removeEventListener('resize', place); window.removeEventListener('scroll', place, true); document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', key); };
-  }, [open, visible, frozen, width, onOpenChange]);
+  }, [open, visible, frozen, width, onOpenChange, overflow?.anchor, overflow?.close, attention]);
   return <>
+    <WorkflowOverflowItem attention={attention}>
     <WorkflowButton ref={trigger} tone="quiet" icon={icon} aria-label={label} title={title || label} aria-expanded={open} aria-haspopup="dialog" disabled={frozen}
-      style={{ whiteSpace: 'nowrap', ...(warning ? { color: 'var(--theme-warning, #b7791f)' } : {}) }}
+      style={{ whiteSpace: 'nowrap', ...(overflow && !attention ? { width: '100%', justifyContent: 'flex-start' } : {}), ...(warning ? { color: 'var(--theme-warning, #b7791f)' } : {}) }}
       onClick={() => { onOpenChange(!open); if (!open) requestAnimationFrame(() => panel.current?.focus()); }}>
       {title}{badge != null && <span style={{ minWidth: 16, padding: '0 4px', borderRadius: 5, fontSize: 10, background: 'var(--theme-accent-bg, #4b82f014)', color: 'var(--theme-accent, #4b82f0)' }}>{badge}</span>}
     </WorkflowButton>
+    </WorkflowOverflowItem>
     <AppModalPortal><div ref={panel} role="dialog" aria-label={label} tabIndex={-1} hidden={!open}
       style={{ position: 'fixed', zIndex: 30000, boxSizing: 'border-box', ...position, display: open ? 'block' : 'none', overflow: 'auto', padding: 16,
-        border: '1px solid var(--theme-border, #dce1e8)', borderRadius: 12, background: 'var(--theme-bg-secondary, #fff)', color: 'var(--theme-text, #273244)', boxShadow: '0 12px 40px #0003', font: 'inherit', fontSize: 12, lineHeight: 1.6 }}>
+        border: '1px solid var(--theme-border, #dce1e8)', borderRadius: 12, background: 'var(--theme-panel-solid, var(--theme-bg-secondary, #fff))', color: 'var(--theme-text, #273244)', boxShadow: '0 12px 40px #0003', font: 'inherit', fontSize: 12, lineHeight: 1.6 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10 }}>
-        <strong style={{ fontSize: 13 }}>{label}</strong><WorkflowButton tone="quiet" icon="close" aria-label={`收起${label}`} onClick={() => { onOpenChange(false); trigger.current?.focus(); }} style={{ padding: 4, minHeight: 26 }} />
+        <strong style={{ fontSize: 13 }}>{label}</strong><WorkflowButton tone="quiet" icon="close" aria-label={`收起${label}`} onClick={() => { onOpenChange(false); focusTrigger(); }} style={{ padding: 4, minHeight: 26 }} />
       </div>{children}
     </div></AppModalPortal>
   </>;

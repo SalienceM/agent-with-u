@@ -1243,8 +1243,8 @@ Workspace Kits are Session-level standard accessories stored separately in
   `waiting_approval`. Formal publishing cannot start until `kitCapabilityRespond` records
   a human approval, a scoped run-button human approval, or a validated one-run chat delegation bound to the plan fingerprint.
   ChatInput's default-off `kitApprovalDelegation` send field is the only chat opt-in;
-  Its UI is an inline toolbar switch labelled `Kit 代确认`, with a visible `仅本次`
-  state when enabled. Sending, focus/Session/Backend changes, busy/queue transitions
+  Its UI is a default-off switch under the composer's 更多 → 确认与提醒.
+  Enabling it exposes a cancellable `Kit · 仅本次` toolbar indicator. Sending, focus/Session/Backend changes, busy/queue transitions
   and reload clear the composer opt-in; it is never part of a navigation snapshot.
   prose, attachments, generated Kit DSL and model tool arguments cannot grant permission.
   `ChatKitTools` binds this opt-in to one run/chain, owner, Session workspace, capability
@@ -2126,6 +2126,12 @@ keeps that target fixed when the main conversation advances. Advanced context/su
 are collapsed; preparation errors show the batch cause and an explicit new-selection action.
 Role history is a reading view with its own empty state and a return-to-source action, never an
 ordinary chat empty prompt. Review details use the solid theme surface even with wallpaper.
+The composer keeps a single-line toolbar for attachments, expanded editing, model settings
+and 更多. Role tools, screenshot, text packing, suggestions and approval/reminder settings live
+in that opaque, grouped menu. “转为文本附件” explains selected-text/full-draft packing and restore.
+WorkflowOverflowContext moves idle triggers only; controllers, subscriptions and portal panels
+stay mounted. Pending questions, errors, Kit waits and active voice remain directly visible.
+Child settings replace the menu and return keyboard focus to 更多 when their trigger is hidden.
 The composer keeps review history under “更多 → 评议记录”. Only active/unknown batches and
 newly received results get an inline toolbar reminder; reading or dismissing a finished result
 clears its reminder without changing the report. Restored historical disagreements are not alerts.

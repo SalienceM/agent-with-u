@@ -1,4 +1,4 @@
-import React, { useRef, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, memo, useState, useMemo } from 'react';
+import React, { useId, useRef, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, memo, useState, useMemo } from 'react';
 import { ImagePreview } from './ImagePreview';
 import { TextAttachmentPreview } from './TextAttachmentPreview';
 import { ComposerEditor, ComposerTransformUndo } from './ComposerEditor';
@@ -16,7 +16,7 @@ import type { SlashCommand } from '../hooks/useChat';
 import { api, isTauri, onCurrentUserChanged, getExecutors, getCurrentUserProfile, getSessionExecKey, harnessImageScope, harnessImageSubmissions, composerSubmissions } from '../api';
 import { ComposerSubmissionStatus } from './ComposerSubmissionStatus';
 import { RoleLibrary } from './RoleLibrary';
-import { WorkflowButton, WorkflowIcon, WorkflowPopover } from './WorkflowControls';
+import { WorkflowButton, WorkflowIcon, WorkflowPopover, WorkflowOverflowContext } from './WorkflowControls';
 import { imageReceiptLabel, type ChatSendResult, type ImageDraftContext } from '../utils/harnessImageSubmission';
 import { handoffParticipants, handoffScope } from '../utils/workbenchHandoffState';
 import { isSkillCommand, slashQuery, skillInvocation, suggestedSlashCommand, type SkillInvocation, type SkillCommand } from '../utils/skillCommands';
@@ -257,6 +257,11 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
   const editorOpenRef = useRef(editorOpen); editorOpenRef.current = editorOpen;
   const [roleLibraryOpen, setRoleLibraryOpen] = useState(false);
   const [moreToolsOpen, setMoreToolsOpen] = useState(false);
+  const packHelpId = useId();
+  const moreToolsTriggerRef = useRef<HTMLButtonElement>(null);
+  const [workflowMenuContainer, setWorkflowMenuContainer] = useState<HTMLDivElement | null>(null);
+  const [suggestionMenuContainer, setSuggestionMenuContainer] = useState<HTMLDivElement | null>(null);
+  const closeMoreTools = useCallback(() => setMoreToolsOpen(false), []);
   useEffect(() => setMoreToolsOpen(false), [sessionId, execKey]);
   useEffect(() => { setRoleLibraryOpen(false); }, [sessionId, execKey]);
   const imageScope = harnessImageScope(sessionId || '', execKey || getSessionExecKey(sessionId) || '');
@@ -2076,107 +2081,110 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(({
           </div>
         </div>
       )}
-      {/* 常用工具保持紧凑；低频操作按需展开。 */}
-      <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-        {!isMobile && <ToolbarBtn
-          icon="⚡"
-          title="跳过确认"
-          active={skipPermissions}
-          compact={isMobile}
-          onClick={() => onSkipPermissionsChange?.(!skipPermissions)}
-        />}
-        {!isMobile && runtimeConfigurable && (
-          <ToolbarBtn
-            icon="⚙"
-            title={`切换本 Session 模型${activeBackend?.type === 'codex-office' ? ' / 推理档位' : ''}（当前：${formatRuntimeLabel(activeBackend, sessionRuntime)}）`}
-            active={showRuntimePicker}
-            compact={isMobile}
-            onClick={() => { if (!showRuntimePicker) onRefreshBackends?.(); setShowRuntimePicker((value) => !value); }}
-          />
-        )}
-        <ToolbarBtn
-          icon="＋"
-          title="添加附件（图片或文本文件）"
-          compact={isMobile}
-          onClick={() => attachmentInputRef.current?.click()}
-        />
+      {roleLibraryOpen && sessionId && <RoleLibrary session={sessionId} executor={imageScope.executor} backends={backends || []} backendId={activeBackendId} onClose={() => setRoleLibraryOpen(false)} />}
+      {/* 常用入口单行；低频入口移入菜单，只有实际待办和运行状态回到工具栏。 */}
+      <div aria-label="输入工具栏" style={{ display: 'flex', gap: 4, marginBottom: 6, alignItems: 'center', flexWrap: 'nowrap', minWidth: 0 }}>
+        <ToolbarBtn icon="＋" title="添加附件（图片或文本文件）" compact={isMobile} onClick={() => attachmentInputRef.current?.click()} />
         <ToolbarBtn icon="⛶" title="展开编辑消息和文本块" compact={isMobile} onClick={() => openComposer()} />
-        <ToolbarBtn icon="#" title="维护角色库" compact={isMobile} onClick={() => setRoleLibraryOpen(true)} />
-        {roleLibraryOpen && sessionId && <RoleLibrary session={sessionId} executor={imageScope.executor} backends={backends || []} backendId={activeBackendId} onClose={() => setRoleLibraryOpen(false)} />}
-        {!isImageBackend && <button type="button" role="switch" aria-label="本次允许 Kit 代确认"
-          aria-checked={kitApprovalDelegation} disabled={isStreaming || seqCount > 0 || roleReview.review.roles.length > 0}
-          onClick={() => { kitApprovalDelegationRef.current = !kitApprovalDelegationRef.current; setKitApprovalDelegation(kitApprovalDelegationRef.current); }}
-          title={isStreaming || seqCount > 0 ? '等待当前轮和队列结束后，可为一次直接发送开启 Kit 代确认' :
-            '仅授权本次发送所选的一个 Kit 运行/链，6 小时内有效。Agent 必须核对冻结计划；发送后自动关闭，不继承到队列、语音或下次发送。'}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap',
-            minHeight: isMobile ? 44 : 'var(--ui-control-height, 28px)', padding: '3px 8px', borderRadius: 8,
-            border: `1px solid ${kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
-            background: kitApprovalDelegation ? 'var(--theme-accent-bg)' : 'transparent',
-            color: kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
-            fontSize: 11, cursor: isStreaming || seqCount > 0 ? 'not-allowed' : 'pointer',
-            opacity: isStreaming || seqCount > 0 ? .5 : 1 }}>
-          <span aria-hidden="true" style={{ width: 22, height: 12, borderRadius: 8, display: 'inline-flex',
-            alignItems: 'center', padding: 2, boxSizing: 'border-box',
-            background: kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-text-muted)' }}>
-            <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#fff',
-              transform: kitApprovalDelegation ? 'translateX(10px)' : 'none', transition: 'transform .12s' }} />
-          </span>
-          Kit 代确认{kitApprovalDelegation && <span style={{ fontWeight: 650 }}> · 仅本次</span>}
-        </button>}
-        <button type="button" role="switch" aria-label="影子续写建议" aria-checked={followup.enabled}
-          disabled={followup.saving} onClick={() => void followup.toggle()}
-          title={followup.notice || '仅为后续成功回答生成一条建议，独立调用计费；Tab 接受，仅填草稿。默认关闭。'}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minHeight: isMobile ? 44 : 30, padding: '3px 8px', borderRadius: 8, fontSize: 11,
-            border: '1px solid var(--theme-border)', background: followup.enabled ? 'var(--theme-accent-bg)' : 'transparent',
-            color: followup.enabled ? 'var(--theme-accent)' : 'var(--theme-text-muted)', cursor: 'pointer' }}>
-          <WorkflowIcon name="spark" size={14} />影子建议{followup.saving ? ' · 保存中' : followup.enabled ? ' · 开' : ''}
-        </button>
-        <FollowupSettings key={draftKey} config={followup.config} supported={followup.configSupported} saving={followup.saving} notice={followup.notice}
-          executor={imageScope.executor} backends={backends} backendId={activeBackendId} sessionRuntime={sessionRuntime} onSave={followup.saveConfig} />
-        <WorkflowPopover label="更多输入工具" title={isMobile ? '' : '更多'} icon="more" open={moreToolsOpen} onOpenChange={setMoreToolsOpen} width={300}>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 10 }}>
-            {onOpenOpinions && <WorkflowButton icon="review" onClick={() => { setMoreToolsOpen(false); openOpinionSelector(); }}>评议记录</WorkflowButton>}
-            {isMobile && <WorkflowButton icon="shield" aria-pressed={skipPermissions} onClick={() => onSkipPermissionsChange?.(!skipPermissions)}>跳过执行确认{skipPermissions ? ' · 开' : ' · 关'}</WorkflowButton>}
-            {isMobile && runtimeConfigurable && <WorkflowButton icon="settings" onClick={() => { onRefreshBackends?.(); setMoreToolsOpen(false); setShowRuntimePicker(true); }}>模型与推理设置</WorkflowButton>}
-        {onAdjustFontSize && (
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 2 }}
-            title={`对话字号${fontSize ? ` ${fontSize}px` : ''}（A− / A+ 调整，全局生效）`}>
-            <ToolbarBtn icon="A−" title="缩小对话字号" compact={isMobile} onClick={() => onAdjustFontSize(-1)} />
-            <ToolbarBtn icon="A+" title="放大对话字号" compact={isMobile} onClick={() => onAdjustFontSize(1)} />
-          </div>
-        )}
-        <WorkflowButton icon="block" aria-label="将选中正文收纳为文本块" onClick={() => {
-          const el = ref.current; if (!el?.value || composingRef.current) return;
-          saveSessionDraft(el.value);
-          const start = el.selectionStart === el.selectionEnd ? 0 : el.selectionStart, end = el.selectionStart === el.selectionEnd ? el.value.length : el.selectionEnd;
-          const content = el.value.slice(start, end);
-          composerDrafts.pack(draftKeyRef.current, { id: uuid(), name: `selected-text-${textAttachmentsRef.current.length + 1}.txt`, content, size: content.length, source: 'input' }, start, end);
-          applyComposerDraft(); setMoreToolsOpen(false);
-        }}>收纳正文为文本块</WorkflowButton>
-            <WorkflowButton icon="clear" onClick={() => { setMoreToolsOpen(false); handleCompact(); }}>新会话 · 同目录</WorkflowButton>
+        {!isMobile && runtimeConfigurable && <ToolbarBtn icon="⚙"
+          title={`切换本 Session 模型${activeBackend?.type === 'codex-office' ? ' / 推理档位' : ''}（当前：${formatRuntimeLabel(activeBackend, sessionRuntime)}）`}
+          active={showRuntimePicker} onClick={() => { if (!showRuntimePicker) onRefreshBackends?.(); setShowRuntimePicker(value => !value); }} />}
+        <WorkflowPopover label="更多输入工具" title="更多" icon="more" open={moreToolsOpen} onOpenChange={setMoreToolsOpen} triggerRef={moreToolsTriggerRef} width={340}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <section aria-label="编辑与引用" style={composerMenuSectionStyle}>
+              <div style={composerMenuHeadingStyle}>编辑与引用</div>
+              <WorkflowButton tone="quiet" icon="block" style={composerMenuActionStyle} aria-label="转为文本附件" aria-describedby={packHelpId} onClick={() => {
+                const el = ref.current; if (!el?.value || composingRef.current) { showAttachmentNotice('请先在输入框中输入或选中文字。', 'info'); setMoreToolsOpen(false); ref.current?.focus(); return; }
+                saveSessionDraft(el.value);
+                const start = el.selectionStart === el.selectionEnd ? 0 : el.selectionStart, end = el.selectionStart === el.selectionEnd ? el.value.length : el.selectionEnd;
+                const content = el.value.slice(start, end);
+                composerDrafts.pack(draftKeyRef.current, { id: uuid(), name: `selected-text-${textAttachmentsRef.current.length + 1}.txt`, content, size: content.length, source: 'input' }, start, end);
+                applyComposerDraft(); setMoreToolsOpen(false);
+              }}>转为文本附件</WorkflowButton>
+              <p id={packHelpId} style={{ margin: '0 10px 6px 32px', color: 'var(--theme-text-muted)', fontSize: 11, lineHeight: 1.6 }}>
+                将选中文字（未选中则取全文）变成可编辑的文本附件，随消息一起发送。适合长资料，可恢复到输入框。
+              </p>
+              <WorkflowButton tone="quiet" style={composerMenuActionStyle} icon="role" onClick={() => { setMoreToolsOpen(false); setRoleLibraryOpen(true); }}>角色库</WorkflowButton>
+              {onOpenOpinions && <WorkflowButton tone="quiet" style={composerMenuActionStyle} icon="review" onClick={() => { setMoreToolsOpen(false); openOpinionSelector(); }}>评议记录</WorkflowButton>}
+              {isTauri() && <WorkflowButton tone="quiet" style={composerMenuActionStyle} icon="camera" disabled={screenshotBusy}
+                onClick={() => { setMoreToolsOpen(false); void handleScreenshot(); }}>{screenshotBusy ? '等待截图…' : '截图并添加附件'}</WorkflowButton>}
+              {onAdjustFontSize && <div style={{ display: 'flex', alignItems: 'center', paddingLeft: 10, gap: 4 }}>
+                <span style={{ flex: 1, fontSize: 12, color: 'var(--theme-text-muted)' }}>对话字号{fontSize ? ` · ${fontSize}px` : ''}</span>
+                <ToolbarBtn icon="A−" title="缩小对话字号" onClick={() => onAdjustFontSize(-1)} />
+                <ToolbarBtn icon="A+" title="放大对话字号" onClick={() => onAdjustFontSize(1)} />
+              </div>}
+            </section>
+            <details key={`suggestions:${sessionId}:${execKey}:${draftKey}`}>
+              <summary style={composerMenuSummaryStyle}>回复辅助<span style={{ float: 'right', color: 'var(--theme-text-muted)', fontSize: 11 }}>{followup.enabled ? '已开启建议' : '默认关闭'}</span></summary>
+              <div style={composerMenuSectionStyle}>
+                <button type="button" role="switch" aria-label="影子续写建议" aria-checked={followup.enabled}
+                  disabled={followup.saving} onClick={() => void followup.toggle()}
+                  title={followup.notice || '仅为后续成功回答生成一条建议，独立调用计费；Tab 接受，仅填草稿。默认关闭。'}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minHeight: isMobile ? 44 : 30, padding: '3px 8px', borderRadius: 8, fontSize: 11,
+                    border: '1px solid var(--theme-border)', background: followup.enabled ? 'var(--theme-accent-bg)' : 'transparent',
+                    color: followup.enabled ? 'var(--theme-accent)' : 'var(--theme-text-muted)', cursor: 'pointer' }}>
+                  <WorkflowIcon name="spark" size={14} />下一步建议{followup.saving ? ' · 保存中' : followup.enabled ? ' · 开' : ''}
+                </button>
+                <p style={{ margin: '4px 10px', color: 'var(--theme-text-muted)', fontSize: 11 }}>回答后生成下一步建议；独立调用计费，采纳只填入草稿。</p>
+                <div ref={setSuggestionMenuContainer} style={composerMenuSectionStyle} />
+              </div>
+            </details>
+            <details key={`permissions:${sessionId}:${execKey}:${draftKey}`}>
+              <summary style={composerMenuSummaryStyle}>确认与提醒</summary>
+              <div style={composerMenuSectionStyle}>
+                <WorkflowButton tone="quiet" style={composerMenuActionStyle} icon="shield" aria-pressed={skipPermissions}
+                  onClick={() => onSkipPermissionsChange?.(!skipPermissions)}>跳过执行确认 · {skipPermissions ? '开' : '关'}</WorkflowButton>
+                {!isImageBackend && <button type="button" role="switch" aria-label="本次允许 Kit 代确认"
+                  aria-checked={kitApprovalDelegation} disabled={isStreaming || seqCount > 0 || roleReview.review.roles.length > 0}
+                  onClick={() => { kitApprovalDelegationRef.current = !kitApprovalDelegationRef.current; setKitApprovalDelegation(kitApprovalDelegationRef.current); }}
+                  title={isStreaming || seqCount > 0 ? '等待当前轮和队列结束后，可为一次直接发送开启 Kit 代确认' :
+                    '仅授权本次发送所选的一个 Kit 运行/链，6 小时内有效。Agent 必须核对冻结计划；发送后自动关闭，不继承到队列、语音或下次发送。'}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap',
+                    minHeight: isMobile ? 44 : 'var(--ui-control-height, 28px)', padding: '3px 8px', borderRadius: 8,
+                    border: `1px solid ${kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-border)'}`,
+                    background: kitApprovalDelegation ? 'var(--theme-accent-bg)' : 'transparent',
+                    color: kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                    fontSize: 11, cursor: isStreaming || seqCount > 0 ? 'not-allowed' : 'pointer',
+                    opacity: isStreaming || seqCount > 0 ? .5 : 1 }}>
+                  <span aria-hidden="true" style={{ width: 22, height: 12, borderRadius: 8, display: 'inline-flex',
+                    alignItems: 'center', padding: 2, boxSizing: 'border-box',
+                    background: kitApprovalDelegation ? 'var(--theme-accent)' : 'var(--theme-text-muted)' }}>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#fff',
+                      transform: kitApprovalDelegation ? 'translateX(10px)' : 'none', transition: 'transform .12s' }} />
+                  </span>
+                  Kit 代确认{kitApprovalDelegation && <span style={{ fontWeight: 650 }}> · 仅本次</span>}
+                </button>}
+                <div ref={setWorkflowMenuContainer} style={composerMenuSectionStyle} />
+              </div>
+            </details>
+            <section aria-label="会话设置" style={composerMenuSectionStyle}>
+              <div style={composerMenuHeadingStyle}>会话设置</div>
+              {isMobile && runtimeConfigurable && <WorkflowButton tone="quiet" style={composerMenuActionStyle} icon="settings"
+                onClick={() => { onRefreshBackends?.(); setMoreToolsOpen(false); setShowRuntimePicker(true); }}>模型与推理设置</WorkflowButton>}
+              <WorkflowButton tone="quiet" style={composerMenuActionStyle} icon="clear" onClick={() => { setMoreToolsOpen(false); handleCompact(); }}>新会话 · 同目录</WorkflowButton>
+            </section>
           </div>
         </WorkflowPopover>
-        {workflowTools && <div aria-label="会话协作工具" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 4, minWidth: 0 }}>{workflowTools}</div>}
-        {/* 截图按钮:桌面端独有,浏览器无法调起系统截图工具 */}
-        {isTauri() && (
-          <ToolbarBtn
-            icon="📷"
-            title={screenshotBusy ? "等待截图…(选完区域自动加入附件)" : "截图(系统截图工具)"}
-            active={screenshotBusy}
-            compact={isMobile}
-            onClick={handleScreenshot}
-            loading={screenshotBusy}
-          />
-        )}
-        {realtimeVoice && (
-          <RealtimeVoiceBar
-            {...realtimeVoice}
-            isStreaming={isStreaming}
-            isFocused={isFocused}
-            onAbort={onAbort}
-            compact
-          />
-        )}
+        <div aria-label="会话协作工具" style={{ display: 'flex', alignItems: 'center', flex: 1, gap: 4, minWidth: 0, overflowX: 'auto', flexWrap: 'nowrap' }}>
+          {kitApprovalDelegation && <WorkflowButton tone="quiet" icon="shield" aria-label="取消本次 Kit 代确认" title="仅本次发送允许 Kit 代确认，点击取消"
+            style={{ whiteSpace: 'nowrap', flexShrink: 0, color: 'var(--theme-accent)' }} onClick={() => { kitApprovalDelegationRef.current = false; setKitApprovalDelegation(false); }}>Kit · 仅本次 ×</WorkflowButton>}
+          <WorkflowOverflowContext.Provider value={{ container: suggestionMenuContainer, anchor: moreToolsTriggerRef, close: closeMoreTools }}>
+            <FollowupSettings key={draftKey} config={followup.config} supported={followup.configSupported} saving={followup.saving} notice={followup.notice}
+              executor={imageScope.executor} backends={backends} backendId={activeBackendId} sessionRuntime={sessionRuntime} onSave={followup.saveConfig} />
+          </WorkflowOverflowContext.Provider>
+          <WorkflowOverflowContext.Provider value={{ container: workflowMenuContainer, anchor: moreToolsTriggerRef, close: closeMoreTools }}>
+            {workflowTools}
+            {realtimeVoice && (
+              <RealtimeVoiceBar
+                {...realtimeVoice}
+                isStreaming={isStreaming}
+                isFocused={isFocused}
+                onAbort={onAbort}
+                compact
+              />
+            )}
+          </WorkflowOverflowContext.Provider>
+        </div>
         {/* ★ 流式进度指示器 */}
         {isStreaming && (
           <div title="模型正在生成；可选择排队、当前轮引导或中断后重引导" style={{
@@ -2594,3 +2602,8 @@ const runtimePrimaryBtnStyle: React.CSSProperties = {
   border: '1px solid var(--theme-accent)', background: 'var(--theme-accent)',
   color: '#fff', fontWeight: 600,
 };
+
+const composerMenuActionStyle: React.CSSProperties = { width: '100%', justifyContent: 'flex-start', textAlign: 'left' };
+const composerMenuSectionStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 2 };
+const composerMenuHeadingStyle: React.CSSProperties = { padding: '0 10px 4px', fontSize: 10, fontWeight: 650, color: 'var(--theme-text-muted)' };
+const composerMenuSummaryStyle: React.CSSProperties = { cursor: 'pointer', padding: '8px 10px', fontSize: 12, borderTop: '1px solid var(--theme-border)', color: 'var(--theme-text)' };

@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useContext, useEffect, useRef, useState } from 'react';
+import { WorkflowOverflowContext, WorkflowOverflowItem } from './WorkflowControls';
 import { api, type TtsStreamAudioEvent } from '../api';
 import {
   ToolAwareSpeechGate,
@@ -141,6 +142,7 @@ export const RealtimeVoiceBar: React.FC<Props> = ({
   compact = false,
 }) => {
   const [active, setActive] = useState(false);
+  const overflow = useContext(WorkflowOverflowContext);
   const [phase, setPhase] = useState<VoicePhase>('idle');
   const [transcript, setTranscript] = useState('');
   const [error, setError] = useState('');
@@ -2251,15 +2253,17 @@ export const RealtimeVoiceBar: React.FC<Props> = ({
 
   if (compact) {
     return (
+      <WorkflowOverflowItem attention={active || phase === 'starting' || phase === 'error'}>
       <div style={compactWrapStyle}>
         <button
           type="button"
-          onClick={() => activeRef.current ? stopConversation() : void startConversation()}
+          onClick={() => { overflow?.close(); activeRef.current ? stopConversation() : void startConversation(); }}
           disabled={!active && isStreaming}
           aria-label={active ? `退出实时语音对话，当前${PHASE_LABELS[phase]}` : '开启实时语音对话'}
           aria-pressed={active}
           style={{
             ...compactToggleStyle,
+            ...(!active && overflow ? { minHeight: 32, gap: 8 } : {}),
             borderColor: active
               ? statusColor
               : phase === 'error' ? 'var(--theme-error, #f85149)' : 'var(--theme-border)',
@@ -2275,6 +2279,7 @@ export const RealtimeVoiceBar: React.FC<Props> = ({
           title={toggleTitle}
         >
           <span aria-hidden="true" style={{ fontSize: 13 }}>{phase === 'error' ? '!' : active ? '■' : '◉'}</span>
+          {!active && overflow && <span>实时语音对话</span>}
           {active && <span aria-hidden="true" style={{ ...compactStatusDotStyle, background: statusColor }} />}
         </button>
         {active && (
@@ -2306,6 +2311,7 @@ export const RealtimeVoiceBar: React.FC<Props> = ({
           </button>
         )}
       </div>
+      </WorkflowOverflowItem>
     );
   }
 

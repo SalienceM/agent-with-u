@@ -155,6 +155,6 @@ export const UserInteractionsPanel: React.FC<{ sessionId: string; runtimeKey?: s
       if (getCurrentUserProfile().userId === owner && (explicitExecutor || getSessionExecKey(sessionId) || '') === executor) setRows(old => mergeInteractions(old, [updated]));
     }} />)}
   </section>;
-  return compact ? <WorkflowPopover label="交互状态" title={pendingCount ? '待回答' : '交互'} icon="question" badge={pendingCount || undefined}
+  return compact ? <WorkflowPopover label="交互状态" title={pendingCount ? '待回答' : '问答与确认'} icon="question" badge={pendingCount || undefined}
     warning={!!pendingCount || !!notice} open={open} onOpenChange={setOpen} width={480}>{content}</WorkflowPopover> : content;
 };

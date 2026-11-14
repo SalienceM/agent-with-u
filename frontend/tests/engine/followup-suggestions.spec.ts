@@ -2,6 +2,13 @@ import { test, expect, type Page } from '@playwright/test';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+async function openToolSection(page: Page, name: string) {
+  const menu = page.getByRole('dialog', { name: '更多输入工具', exact: true });
+  if (!await menu.isVisible()) await page.getByRole('button', { name: '更多输入工具', exact: true }).click();
+  const closed = menu.locator('details:not([open]) > summary').filter({ hasText: name });
+  if (await closed.count()) await closed.click();
+}
+
 async function mount(page: Page, width = 1200) {
   await page.setViewportSize({ width, height: 850 });
   await page.routeWebSocket(/.*/, socket => socket.close());
@@ -32,11 +39,13 @@ async function mount(page: Page, width = 1200) {
         { id: 'light', label: '轻量服务', type: 'openai-compatible', model: 'small-model' }], onAbort: () => {}, onSend: (...args: any[]) => f.sent.push(args) }));
     (window as any).followupFixture = f; f.render();
   });
-  await expect(page.getByRole('switch', { name: '影子续写建议' })).toHaveAttribute('aria-checked', 'false');
+  await expect(page.getByRole('switch', { name: '影子续写建议', includeHidden: true })).toHaveAttribute('aria-checked', 'false');
 }
 async function enable(page: Page) {
-  await page.getByRole('switch', { name: '影子续写建议' }).click();
-  await expect(page.getByRole('switch', { name: '影子续写建议' })).toHaveAttribute('aria-checked', 'true');
+  await openToolSection(page, '回复辅助');
+  await page.getByRole('switch', { name: '影子续写建议', includeHidden: true }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('switch', { name: '影子续写建议', includeHidden: true })).toHaveAttribute('aria-checked', 'true');
 }
 async function emit(page: Page, state: string, id = 'r') {
   await page.evaluate(([state, id]) => (window as any).followupFixture.emit(state, id), [state, id]);
@@ -45,6 +54,7 @@ async function emit(page: Page, state: string, id = 'r') {
 for (const width of [1200, 390]) test(`suggestion model and wait limit save independently without generating (${width}px)`, async ({ page }) => {
   await mount(page, width);
   await page.locator('.chat-textarea').fill('保留原草稿');
+  await openToolSection(page, '回复辅助');
   await page.getByRole('button', { name: '建议模型设置', exact: true }).click();
   const panel = page.getByRole('dialog', { name: '建议模型设置' });
   await panel.getByLabel('建议 Backend').selectOption('light');
@@ -52,7 +62,7 @@ for (const width of [1200, 390]) test(`suggestion model and wait limit save inde
   await panel.getByLabel('建议最长等待').selectOption('120');
   await panel.getByRole('button', { name: '保存建议设置' }).click();
   await expect(panel).toContainText('已保存');
-  await expect(page.getByRole('switch', { name: '影子续写建议' })).toHaveAttribute('aria-checked', 'false');
+  await expect(page.getByRole('switch', { name: '影子续写建议', includeHidden: true })).toHaveAttribute('aria-checked', 'false');
   await expect(page.locator('.chat-textarea')).toHaveValue('保留原草稿');
   expect(await page.evaluate(() => (window as any).followupFixture.settingsCalls)).toEqual([
     { session: 's', config: { backendId: 'light', model: 'tiny-model', reasoningEffort: '', timeoutSeconds: 120 } },
@@ -63,16 +73,19 @@ for (const width of [1200, 390]) test(`suggestion model and wait limit save inde
   await panel.screenshot({ path: path.resolve(`../.qa/followup-model/settings-${width}.png`) });
   await panel.getByRole('button', { name: '收起建议模型设置' }).click();
   await page.evaluate(() => { const f = (window as any).followupFixture; f.session = 'other'; f.render(); });
+  await openToolSection(page, '回复辅助');
   await page.getByRole('button', { name: '建议模型设置', exact: true }).click();
   await expect(panel.getByLabel('建议模型', { exact: true })).toHaveValue('');
   await panel.getByRole('button', { name: '收起建议模型设置' }).click();
   await page.evaluate(() => { const f = (window as any).followupFixture; f.session = 's'; f.render(); });
+  await openToolSection(page, '回复辅助');
   await page.getByRole('button', { name: '建议模型设置', exact: true }).click();
   await expect(panel.getByLabel('建议模型', { exact: true })).toHaveValue('tiny-model');
 });
 
 test('lost suggestion settings receipt retains edits without automatic retry', async ({ page }) => {
   await mount(page);
+  await openToolSection(page, '回复辅助');
   await page.getByRole('button', { name: '建议模型设置', exact: true }).click();
   const panel = page.getByRole('dialog', { name: '建议模型设置' });
   await panel.getByLabel('建议模型', { exact: true }).fill('my-small-model');
@@ -94,7 +107,7 @@ for (const width of [1200, 390]) test(`default off and accept only edits draft (
   else { await page.locator('.chat-textarea').focus(); await page.locator('.chat-textarea').press('Tab'); }
   await expect(page.locator('.chat-textarea')).toHaveValue('请先核对两个目录中不同的文件。');
   expect(await page.evaluate(() => (window as any).followupFixture.sent)).toEqual([]);
-  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认' })).toHaveAttribute('aria-checked', 'false');
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true })).toHaveAttribute('aria-checked', 'false');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
 });
 
@@ -132,7 +145,9 @@ test('Slash menu owns Tab and disabling cancels the active helper', async ({ pag
   await page.locator('.chat-textarea').fill('/hel'); await page.locator('.chat-textarea').press('Tab');
   await expect(page.locator('.chat-textarea')).toHaveValue('/help ');
   await page.locator('.chat-textarea').fill(''); await emit(page, 'generating', 'disable');
-  await page.getByRole('switch', { name: '影子续写建议' }).click(); await emit(page, 'ready', 'disable');
+  await openToolSection(page, '回复辅助');
+  await page.getByRole('switch', { name: '影子续写建议', includeHidden: true }).click();
+  await page.keyboard.press('Escape'); await emit(page, 'ready', 'disable');
   await expect(page.getByLabel('影子建议', { exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).followupFixture.cancelled)).toContain('disable');
 });
@@ -166,11 +181,13 @@ for (const [width, dark] of [[1200, false], [390, true]] as const) test(`combine
   await page.locator('.chat-textarea').dispatchEvent('compositionstart');
   await page.locator('.chat-textarea').dispatchEvent('keydown', { key: 'Enter', code: 'Enter', isComposing: true });
   await page.locator('.chat-textarea').dispatchEvent('compositionend');
-  await page.getByRole('switch', { name: '本次允许 Kit 代确认' }).click();
+  await openToolSection(page, '确认与提醒');
+  await page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true }).click();
+  await page.keyboard.press('Escape');
   await page.evaluate(() => { const f = (window as any).followupFixture; f.session = 'other'; f.render(); });
-  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认' })).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true })).not.toBeChecked();
   await page.evaluate(() => { const f = (window as any).followupFixture; f.session = 's'; f.render(); });
   await expect(page.locator('.chat-textarea')).toHaveValue('原会话编辑草稿');
-  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认' })).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true })).not.toBeChecked();
   expect(await page.evaluate(() => (window as any).followupFixture.sent)).toEqual([]);
 });

@@ -53,6 +53,6 @@ export const KitDelegationStatus: React.FC<{ sessionId: string; executor: string
     {remind && waiting.map(row => <WorkflowButton key={row.id} onClick={() => { setOpen(false); openKitReceipt(executor, row); }}>Kit 等待确认 · 查看步骤</WorkflowButton>)}
     {notice && <span role="status" style={workflowNoticeStyle}>{notice}</span>}
   </div>;
-  return compact ? <WorkflowPopover label="Kit 提醒设置" title="提醒" icon="bell" badge={remind && waiting.length ? waiting.length : undefined}
-    warning={remind && waiting.length > 0} open={open} onOpenChange={setOpen}>{content}</WorkflowPopover> : content;
+  return compact ? <WorkflowPopover label="Kit 提醒设置" title="Kit 提醒" icon="bell" badge={remind && waiting.length ? waiting.length : undefined}
+    warning={!!notice || remind && waiting.length > 0} open={open} onOpenChange={setOpen}>{content}</WorkflowPopover> : content;
 };

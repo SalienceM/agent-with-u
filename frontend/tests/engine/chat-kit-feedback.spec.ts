@@ -1,5 +1,12 @@
 import { test, expect, type Page } from '@playwright/test';
 
+async function openToolSection(page: Page, name: string) {
+  const menu = page.getByRole('dialog', { name: '更多输入工具', exact: true });
+  if (!await menu.isVisible()) await page.getByRole('button', { name: '更多输入工具', exact: true }).click();
+  const closed = menu.locator('details:not([open]) > summary').filter({ hasText: name });
+  if (await closed.count()) await closed.click();
+}
+
 async function mount(page: Page) {
   await page.routeWebSocket(/.*/, socket => socket.close());
   await page.route('**/*', route => {
@@ -34,9 +41,11 @@ async function mount(page: Page) {
 
 test('explicit toggle survives direct send and asynchronous completion; prose does not authorize', async ({ page }) => {
   await mount(page);
-  const opt = page.getByRole('switch', { name: '本次允许 Kit 代确认' });
+  const opt = page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true });
   const input = page.locator('.chat-textarea');
+  await openToolSection(page, '确认与提醒');
   await opt.click();
+  await page.keyboard.press('Escape');
   await input.fill('执行发布 Kit');
   await input.press('Enter');
   await expect.poll(() => page.evaluate(() => (window as any).kitFixture.sent.length)).toBe(1);
@@ -51,22 +60,28 @@ test('explicit toggle survives direct send and asynchronous completion; prose do
 
 test('ordinary pane focus changes preserve opt-in; actual Session and busy changes clear it', async ({ page }) => {
   await mount(page);
-  const opt = page.getByRole('switch', { name: '本次允许 Kit 代确认' });
+  const opt = page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true });
+  await openToolSection(page, '确认与提醒');
   await opt.click();
+  await page.keyboard.press('Escape');
   await expect(opt).toBeChecked();
   await page.evaluate(() => { const f = (window as any).kitFixture; f.props.isFocused = false; f.render(); });
   await expect(opt).toBeChecked();
   await page.evaluate(() => { const f = (window as any).kitFixture; f.props.sessionId = 'another'; f.render(); });
   await expect(opt).not.toBeChecked();
+  await openToolSection(page, '确认与提醒');
   await opt.click();
+  await page.keyboard.press('Escape');
   await page.evaluate(() => { const f = (window as any).kitFixture; f.props.seqCount = 1; f.render(); });
   await expect(opt).not.toBeChecked();
 });
 
 test('image reading and async completion retain frozen opt-in, receipt survives switch reset', async ({ page }) => {
   await mount(page);
-  const opt = page.getByRole('switch', { name: '本次允许 Kit 代确认' });
+  const opt = page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true });
+  await openToolSection(page, '确认与提醒');
   await opt.click();
+  await page.keyboard.press('Escape');
   await page.locator('input[type=file]').setInputFiles({ name: 'image.png', mimeType: 'image/png', buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX6kAAAAASUVORK5CYII=', 'base64') });
   await expect(page.locator('img').first()).toBeVisible();
   await page.locator('.chat-textarea').fill('执行发布');
@@ -74,13 +89,13 @@ test('image reading and async completion retain frozen opt-in, receipt survives 
   const call = await page.evaluate(() => (window as any).kitFixture.sent[0]);
   expect(call[1]).toHaveLength(1); expect(call[3]).toBe(true);
   await page.evaluate(() => (window as any).kitFixture.receipts.accept('local', { id: 'receipt', sessionId: 'fixture', messageId: 'message', revision: 1, status: 'accepted' }));
-  await expect(page.locator('summary')).toContainText('已接收');
+  await expect(page.locator('summary').filter({ hasText: /^Kit 代确认/ })).toContainText('已接收');
   await expect(opt).not.toBeChecked();
   await page.evaluate(() => (window as any).kitFixture.receipts.accept('local', { id: 'receipt', sessionId: 'fixture', messageId: 'message', revision: 2, status: 'bound', runId: 'real-run', stepId: 'publish', runStatus: 'waiting_approval' }));
   await page.getByRole('button', { name: 'Kit 等待确认 · 查看步骤' }).click();
   expect(await page.evaluate(() => (window as any).kitFixture.opened[0])).toMatchObject({ runId: 'real-run', stepId: 'publish' });
   await page.evaluate(() => (window as any).kitFixture.receipts.accept('local', { id: 'receipt', sessionId: 'fixture', messageId: 'message', revision: 3, status: 'used', runId: 'real-run', runStatus: 'succeeded' }));
-  await expect(page.locator('summary')).toContainText('已用于本运行');
+  await expect(page.locator('summary').filter({ hasText: /^Kit 代确认/ })).toContainText('已用于本运行');
   await expect(page.getByRole('button', { name: 'Kit 等待确认 · 查看步骤' })).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).kitFixture.sent.length)).toBe(1);
 });
@@ -95,13 +110,13 @@ test('reminder preference never selects opt-in; unknown is checked read-only', a
   await expect(page.getByRole('button', { name: 'Kit 等待确认 · 查看步骤' })).toHaveCount(0);
   await page.getByLabel('提醒 Kit 待确认').check();
   await expect(page.getByRole('button', { name: 'Kit 等待确认 · 查看步骤' })).toBeVisible();
-  await page.locator('summary').click();
+  await page.locator('summary').filter({ hasText: /^Kit 代确认/ }).click();
   await page.getByRole('button', { name: '核对回执', exact: true }).click();
-  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认' })).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true })).not.toBeChecked();
   expect(await page.evaluate(() => (window as any).kitFixture.sent)).toEqual([]);
   await mount(page);
   await expect(page.getByLabel('提醒 Kit 待确认')).toBeChecked();
-  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认' })).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true })).not.toBeChecked();
 });
 
 test('receipt opens the exact historic run and panel approval advances without chat', async ({ page }) => {

@@ -30,7 +30,14 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
   await openSidebar();
   await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).first().click();
   const pane = page.locator('[data-session-tab-panel]:visible');
-  const optIn = pane.getByRole('switch', { name: '本次允许 Kit 代确认' });
+  const optIn = page.getByRole('switch', { name: '本次允许 Kit 代确认', includeHidden: true });
+  const enableDelegation = async () => {
+    await pane.getByRole('button', { name: '更多输入工具', exact: true }).click();
+    const section = page.getByRole('dialog', { name: '更多输入工具', exact: true }).locator('details:not([open]) > summary').filter({ hasText: '确认与提醒' });
+    if (await section.count()) await section.click();
+    await optIn.click();
+    await page.keyboard.press('Escape');
+  };
   const input = pane.locator('.chat-textarea');
   await expect(optIn).not.toBeChecked();
   await expect(optIn).toBeEnabled();
@@ -42,7 +49,7 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
   finish!();
   await expect(optIn).toBeEnabled();
 
-  await optIn.click();
+  await enableDelegation();
   await expect(optIn).toBeChecked();
   await expect(optIn).toContainText('仅本次');
   await input.fill('按顺序打包并发布，请核对本次发布计划');
@@ -61,14 +68,14 @@ test('Kit delegation is an explicit one-send flag, never inferred or carried to 
   expect(sent[2].kitApprovalDelegation).toBe(false);
   finish!();
   await expect(optIn).toBeEnabled();
-  await optIn.click();
+  await enableDelegation();
   await openSidebar();
   await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).nth(1).click();
   await expect(optIn).not.toBeChecked();
   await openSidebar();
   await page.locator('.awu-sidebar').getByText(/^客户工作会话 \d+$/).first().click();
   await expect(optIn).not.toBeChecked();
-  await optIn.click();
+  await enableDelegation();
   await page.reload();
   await expect(optIn).not.toBeChecked();
   expect(sent).toHaveLength(3);
